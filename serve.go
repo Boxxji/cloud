@@ -2,6 +2,7 @@ package cloud
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -295,6 +296,10 @@ func Serve(specs []MountSpec, enable []string) error {
 	// is not (note.go).
 	app.Authorize(Rule())
 
+	if err := prepareZAPSocket(cfg.ZAPListenAddr); err != nil {
+		return fmt.Errorf("zap socket: %w", err)
+	}
+
 	// Health/metrics listener (HealthListenAddr, default 127.0.0.1:9090). Serves
 	// the liveness/readiness contract (/healthz, /readyz) on a port SEPARATE from
 	// the API, so a saturated API surface never flaps liveness. A bind failure is
@@ -313,10 +318,6 @@ func Serve(specs []MountSpec, enable []string) error {
 		}
 	}()
 	go func() {
-		if strings.HasPrefix(cfg.ZAPListenAddr, "/") || strings.HasSuffix(cfg.ZAPListenAddr, ".sock") {
-			_ = os.MkdirAll(filepath.Dir(cfg.ZAPListenAddr), 0o700)
-			_ = os.Remove(cfg.ZAPListenAddr)
-		}
 		deps.Logger.Info("listening",
 			"http", cfg.ListenAddr,
 			"zap", cfg.ZAPListenAddr,
@@ -360,6 +361,47 @@ func Serve(specs []MountSpec, enable []string) error {
 	// BEFORE teardown means no subsystem is torn down while a request still uses
 	// it. A hook error is joined into the returned error, never fatal to the others.
 	return app.ShutdownWithContext(shutdownCtx)
+}
+
+// zapUnixSocketPath returns the filesystem path for a unix-socket ZAP listener
+// address, or ("", false) for TCP listeners and Linux abstract sockets (@name).
+func zapUnixSocketPath(addr string) (string, bool) {
+	path := strings.TrimPrefix(strings.TrimSpace(addr), "zap://")
+	if path == "" || strings.HasPrefix(path, "@") {
+		return "", false
+	}
+	if strings.HasPrefix(path, "/") || strings.HasPrefix(path, "./") || strings.HasSuffix(path, ".sock") {
+		return path, true
+	}
+	return "", false
+}
+
+// prepareZAPSocket prepares a unix domain socket path before Serve binds it.
+// If the path already exists, it is removed only when os.Lstat reports a unix
+// socket (os.ModeSocket); regular files, directories, and symlinks are never
+// deleted and fail closed.
+func prepareZAPSocket(addr string) error {
+	path, ok := zapUnixSocketPath(addr)
+	if !ok {
+		return nil
+	}
+	info, err := os.Lstat(path)
+	if err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return fmt.Errorf("zap listen path %q exists and is not a unix socket (mode %s)", path, info.Mode())
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove stale zap socket %q: %w", path, err)
+		}
+		return nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("lstat zap socket %q: %w", path, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create zap socket directory for %q: %w", path, err)
+	}
+	return nil
 }
 
 // mountHealth registers /healthz and /readyz on the main zip.App so both the
