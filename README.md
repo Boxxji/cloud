@@ -1,5 +1,7 @@
 # Hanzo Cloud
 
+[![Open in Hanzo](https://hanzo.app/badges/open-in-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/cloud&ref=main&action=open) [![Edit with Hanzo](https://hanzo.app/badges/edit-with-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/cloud&ref=main&action=edit) [![Deploy with Hanzo](https://hanzo.app/badges/deploy-with-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/cloud&ref=main&action=deploy)
+
 The open-source Hanzo Cloud local dev server — one Go binary that runs a
 complete local cloud: a document store, a key/value store, SQL, a task queue,
 functions, secrets, object storage, code search, a gateway edge, feature flags,
