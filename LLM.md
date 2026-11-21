@@ -57,7 +57,7 @@ An app under `apps/<name>` imports zip, the standard library and public modules,
 
 An app is private only when its job is one of:
 
-- **M** moving money or keeping its ledger: billing, commerce, wallets, treasury, tax, x402, payouts, plans and prices, balances. The mechanism is OSS wherever it separates from our price data.
+- **M** moving money or keeping its ledger: billing, commerce, wallets, treasury, tax, payouts, plans and prices, balances. The mechanism is OSS wherever it separates from our price data. Payment protocols (x402 and the other agentic-commerce protocols) are OSS for everyone; only our price data and wallet configuration stay private.
 - **A** operating the platform as SuperAdmin: fleet, host and platform-wide control.
 - **P** our production estate: our cluster's build and deploy plane, our data tier, our forge.
 - **H** one private program: a runtime or a network's onboarding that is not a product anyone else runs.
@@ -208,7 +208,7 @@ Moved here so far: `blueprint`, `template`. The private build deletes its copy a
 | workflow | OSS | durable workflows |
 | world | OSS | live news feed filtered to a project |
 | worlds | PRIVATE | H: relay to a private runtime |
-| x402 | PRIVATE | M: pay-per-request payments |
+| x402 | OSS | pay-per-request payments over HTTP 402; our prices and wallet config stay private behind a seam |
 | zen | OSS | model-serving layer; billing comes in through a seam |
 
 Three more apps have a plugin and no source directory in the private build, because each is an external module: `authz` and `metrics` are OSS modules, `licensing` is private.
