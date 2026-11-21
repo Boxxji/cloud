@@ -72,7 +72,7 @@ An app is private only when its job is one of:
 
 Everything else is OSS. Where an OSS app meets billing, it asks through an interface the private build fills with its billing; this edition's implementation is real, and local mode genuinely has no billing. That interface is the seam, and cutting it is the work, not the verdict.
 
-Moved here so far: `blueprint`, `template`. The private build deletes its copy as each one lands and imports this module's.
+Moved here so far: `blueprint`, `template`, `x402`. The private build deletes its copy as each one lands and imports this module's.
 
 | app | class | reason |
 |---|---|---|
@@ -216,7 +216,16 @@ Moved here so far: `blueprint`, `template`. The private build deletes its copy a
 | workflow | OSS | durable workflows |
 | world | OSS | live news feed filtered to a project |
 | worlds | PRIVATE | H: relay to a private runtime |
-| x402 | OSS | pay-per-request payments over HTTP 402; our prices and wallet config stay private behind a seam |
+| x402 | OSS | MOVED: pay-per-request payments over HTTP 402; our prices and wallet config stay private behind a seam |
 | zen | OSS | model-serving layer; billing comes in through a seam |
 
 Three more apps have a plugin and no source directory in the private build, because each is an external module: `authz` and `metrics` are OSS modules, `licensing` is private.
+
+## x402: charge per request (`apps/x402`)
+
+The protocol is `github.com/hanzoai/commerce/payment/x402` (x402 version 2); this app mounts it on the router and owns no wire of its own. Nothing is priced until the operator says so: `CLOUD_X402_CONFIG` names a JSON file of `facilitator` (an http(s) URL), `assets` (network, token, token EIP-712 name and version, decimals, payee, timeout) and `prices` (`"GET /v1/data": {"amount": "0.01"}`, or a `/*` prefix). With none named the app mounts nothing; a file that does not load stops the start, so a price the process did not understand never leaves its route free. It is first in `Wire()` because its paywall wraps the routes mounted after it.
+
+- Paths are matched the way the router reads them (case folded, `//`, `.`, `..` and a trailing slash cleaned) and HEAD is priced as GET: no other spelling of a priced path is free.
+- A payment settles when the handler has returned and answered below 400, before the response is sent; an error or 4xx/5xx settles nothing and the payment stays usable. Price typed ops, whose failures are returned errors.
+- The facilitator in the file is reached without credentials. A host whose facilitator needs them, or settles on its own books, passes its own `Config.Facilitator`; that, and the prices and payee, are the part the private build keeps.
+- `GET /v1/x402/prices` is the typed op that lists the table. Replay across replicas is the facilitator's to refuse at verify; the paywall's in-flight guard spans one process.

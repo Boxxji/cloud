@@ -20,6 +20,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 
 	luxlog "github.com/luxfi/log"
@@ -28,6 +29,7 @@ import (
 	"github.com/hanzoai/cloud"
 	"github.com/hanzoai/cloud/apps/blueprint"
 	"github.com/hanzoai/cloud/apps/template"
+	"github.com/hanzoai/cloud/apps/x402"
 	"github.com/hanzoai/cloud/cek"
 	"github.com/hanzoai/cloud/clients/principal"
 
@@ -58,6 +60,11 @@ import (
 // cfg.Enabled(name) admits, so a STAGED subsystem is linked but inert until named.
 func Wire() []cloud.MountSpec {
 	return []cloud.MountSpec{
+		// Pay per request over HTTP 402, for the routes an operator prices. It
+		// wraps the routes mounted after it, so it comes first; with no
+		// configuration it mounts nothing and every route is served as before.
+		{Name: "x402", Mount: payments, Description: "Charge per request over HTTP 402 for the routes you price."},
+
 		// Insights feature-flag evaluation seam (no routes; a hot value plane).
 		{Name: "flags", Mount: flags.Mount, Shutdown: flags.Shutdown, OwnsHealth: true, Description: "Feature flags: ship it dark, then turn it on for who you pick."},
 		// Embedded KMS secrets plane /v1/kms/*. OwnsHealth: serves its own
@@ -127,6 +134,28 @@ func logged(name string, mount func(*zip.App, luxlog.Logger) error) cloud.MountF
 	return func(app *zip.App, deps cloud.Deps) error {
 		return mount(app, deps.Logger.New("subsystem", name))
 	}
+}
+
+// payments adapts x402 to cloud.Deps: the operator names a JSON file in
+// CLOUD_X402_CONFIG holding the assets, the prices and the facilitator. With none
+// named nothing is priced and nothing mounts; a file that does not load stops the
+// start, because a price the process did not understand must not leave its route
+// free.
+func payments(app *zip.App, deps cloud.Deps) error {
+	path := os.Getenv("CLOUD_X402_CONFIG")
+	if path == "" {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("x402: %w", err)
+	}
+	defer f.Close()
+	cfg, err := x402.Load(f)
+	if err != nil {
+		return err
+	}
+	return x402.Mount(app, deps.Logger.New("subsystem", "x402"), cfg)
 }
 
 // templates adapts the starter-kit gallery to cloud.Deps: the caller is whoever the
