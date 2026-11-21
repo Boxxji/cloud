@@ -113,7 +113,7 @@ func RegisterOps(app *zip.App, reg *Registry) error {
 	if reg == nil {
 		return fmt.Errorf("admission.RegisterOps: nil Registry")
 	}
-	zip.Get[SnapshotIn, SnapshotOut](app, "/v1/gateway/admission",
+	app.Get[SnapshotIn, SnapshotOut]("/v1/gateway/admission",
 		func(_ context.Context, in *SnapshotIn) (*SnapshotOut, error) {
 			reg.mu.RLock()
 			defer reg.mu.RUnlock()

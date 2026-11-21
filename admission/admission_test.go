@@ -189,7 +189,7 @@ func TestZipMiddlewareAndTypedInspectionOp(t *testing.T) {
 
 	entered := make(chan struct{})
 	proceed := make(chan struct{})
-	app.Group("/v1/work", Middleware(lim)).Post("/run", func(c *zip.Ctx) error {
+	app.Group("/v1/work", Middleware(lim)).Raw(http.MethodPost, "/run", func(c *zip.Ctx) error {
 		select {
 		case entered <- struct{}{}:
 		default:
