@@ -43,7 +43,8 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           set -euo pipefail
-          go build -o /dev/null ./cmd/cloud ./cmd/host
+          go build ./...
+          go vet ./...
 
       - name: Configure git credentials for Go modules
         env:
@@ -62,14 +63,13 @@ jobs:
             echo "GONOSUMDB=github.com/luxfi/*,github.com/hanzoai/*,github.com/hanzos3/*,github.com/zap-proto/*"
           } >> "$GITHUB_ENV"
 
-      - name: Vet and test (CGO_ENABLED=0)
+      - name: Test
         env:
-          CGO_ENABLED: "0"
+          CGO_ENABLED: "1"
           GOWORK: "off"
         run: |
           set -euo pipefail
-          go vet ./...
-          go test ./...
+          scripts/postgres.sh go test -tags 'sqlite_fts5 sqlite_math_functions' ./...
 
   publish:
     needs: check

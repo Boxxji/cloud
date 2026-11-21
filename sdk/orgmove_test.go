@@ -28,6 +28,9 @@ import (
 	"github.com/hanzoai/namespace"
 )
 
+// The stores these tests move are the flags app's.
+func init() { postgres.Declare("flags") }
+
 // padded is a subsystem's open func whose rows weigh something, so the files of stores
 // with more rows are bigger.
 func padded(db *sql.DB) (*sql.DB, error) {

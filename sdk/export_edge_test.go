@@ -36,3 +36,6 @@ func (v *Boundary) RaiseKeyRate(key string, rpm int) {
 	raised.grant = Grant(nil).Policy(0, 0, rpm)
 	k.cache.Put(idOf(key), keyAnswer{claims: &raised})
 }
+
+// PaidReads is the reads price.go declares as the paid unit of work.
+func PaidReads() []string { return paidReads }
