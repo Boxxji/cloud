@@ -23,6 +23,7 @@ make vet      # CGO_ENABLED=0 go vet ./...
 make hooks    # git config core.hooksPath .githooks (public-only pre-push guard)
 ```
 
+- **Public module path**: a build with no credentials and no `GOPRIVATE` resolves every module from the Go proxy and checks it against `go.sum` (the first step of the `check` job runs exactly that). Pin only versions the proxy serves: `curl -s -o /dev/null -w '%{http_code}' https://proxy.golang.org/<module>/@v/<version>.zip` answers 200.
 - **Pure-Go SQLCipher Encryption at Rest (`CGO_ENABLED=0`)**:
   - `Makefile` and `Dockerfile` build with `CGO_ENABLED=0` so the pure-Go SQLite backend (`cek/`) encrypts all SQLite stores under `CLOUD_KMS_MASTER_KEY_REF` (32 random bytes, base64-encoded) with zero C toolchain dependencies.
   - A default `CGO_ENABLED=1` build links unencrypted C SQLite and refuses to start with a master key unless built with `-tags libsqlite3` against `libsqlcipher` (or run explicitly with `CLOUD_DEV_UNENCRYPTED=1`).

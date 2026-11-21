@@ -30,6 +30,21 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # What a stranger runs: no credentials, no GOPRIVATE, every module from the Go
+      # proxy, checked against go.sum. It is first so it sees none of the settings
+      # below. A pin the proxy does not serve fails here, not on someone's laptop.
+      - name: Build with no credentials (public module path)
+        env:
+          GOENV: "off"
+          GOWORK: "off"
+          GOPROXY: https://proxy.golang.org
+          GOSUMDB: sum.golang.org
+          GOFLAGS: -mod=readonly
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          go build -o /dev/null ./cmd/cloud ./cmd/host
+
       - name: Configure git credentials for Go modules
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
