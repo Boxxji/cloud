@@ -79,7 +79,7 @@ type file struct {
 // host with its own Config.Facilitator.
 func Load(r io.Reader) (Config, error) {
 	var f file
-	dec := json.NewDecoder(io.LimitReader(r, 1<<20))
+	dec := json.NewDecoder(r)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&f); err != nil {
 		return Config{}, fmt.Errorf("x402: config: %w", err)

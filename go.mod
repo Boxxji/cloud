@@ -12,7 +12,7 @@ require (
 	github.com/hanzoai/ai v1.833.384
 	github.com/hanzoai/authz v1.10.47
 	github.com/hanzoai/cek v0.2.11
-	github.com/hanzoai/commerce v1.50.245
+	github.com/hanzoai/commerce v1.50.247
 	github.com/hanzoai/decimal v0.1.2
 	github.com/hanzoai/go-openai v1.41.0
 	github.com/hanzoai/goa v1.0.0

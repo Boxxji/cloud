@@ -106,8 +106,8 @@ github.com/hanzoai/authz v1.10.47 h1:ary/mw4lUYRetRlX+Ou61QXh8ig8EbD/ALR9fpg23EU
 github.com/hanzoai/authz v1.10.47/go.mod h1:UaE7uejr8GTgosNO/teyBOItT85/T6+L3hpFPkSOzWE=
 github.com/hanzoai/cek v0.2.11 h1:0qg0Ncf41C/6ArUnixIG+g3noonwz8y/mTIZ3QXirsM=
 github.com/hanzoai/cek v0.2.11/go.mod h1:hNTnyyzExEbicfmolaJlctBz+d7E5Japsd68zS+KYOM=
-github.com/hanzoai/commerce v1.50.245 h1:sEGqJb3P0wT6YXR5wbgwy6ZVo/SWUlGlmZoDJdTiPK4=
-github.com/hanzoai/commerce v1.50.245/go.mod h1:mIqhGzwLwz3AbbJzA68nB6gEHXKDUWWHhHoq4fLqOYQ=
+github.com/hanzoai/commerce v1.50.247 h1:aatQebxhDSpuuC23qMea2x4DJGZSNUr9Ouj5jilpJpE=
+github.com/hanzoai/commerce v1.50.247/go.mod h1:mIqhGzwLwz3AbbJzA68nB6gEHXKDUWWHhHoq4fLqOYQ=
 github.com/hanzoai/csqlite v0.1.2 h1:4DzdgUfKADhzEP66Y30/HwepuBLrwt7NsemJMfrPGl4=
 github.com/hanzoai/csqlite v0.1.2/go.mod h1:H31a/O6VXuklR9UBkgY++bmAK5uzVfXPqU0F6P9Wsos=
 github.com/hanzoai/dbx v1.17.4 h1:Mmz3W0rTPq2Xd+DHJol7lgQJwQ55VLyjzsjr72OZSrk=
