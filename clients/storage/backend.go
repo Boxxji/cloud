@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	s3 "github.com/hanzoai/s3-go"
-	"github.com/hanzoai/s3-go/pkg/credentials"
+	s3 "github.com/hanzos3/go"
+	"github.com/hanzos3/go/pkg/credentials"
 )
 
 // backend is the one S3 endpoint this subsystem talks to, read once from the

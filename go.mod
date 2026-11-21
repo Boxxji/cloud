@@ -7,8 +7,8 @@ go 1.27.1
 require (
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/hanzoai/goa v1.0.0
-	github.com/hanzoai/s3-go v1.0.0
 	github.com/hanzoai/sqlite v0.5.10
+	github.com/hanzos3/go v1.0.3
 	github.com/lib/pq v1.12.3
 	github.com/luxfi/kms v1.11.8
 	github.com/luxfi/log v1.5.0
@@ -57,7 +57,6 @@ require (
 	github.com/hanzoai/csqlite v0.1.2 // indirect
 	github.com/hanzoai/sqlcipher v0.1.1 // indirect
 	github.com/hanzos3/crc64nvme v1.1.2 // indirect
-	github.com/hanzos3/go v1.0.2 // indirect
 	github.com/hanzos3/md5-simd v1.1.3 // indirect
 	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
@@ -71,8 +70,6 @@ require (
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.22 // indirect
 	github.com/miekg/dns v1.1.72 // indirect
-	github.com/minio/crc64nvme v1.1.1 // indirect
-	github.com/minio/md5-simd v1.1.2 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/philhofer/fwd v1.2.0 // indirect
