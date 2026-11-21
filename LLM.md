@@ -53,51 +53,51 @@ make hooks    # git config core.hooksPath .githooks (public-only pre-push guard)
 
 ## Apps: one source each
 
-An app under `apps/<name>` imports `zip`, the standard library and public modules, and nothing of its host: not `github.com/hanzoai/cloud` itself and not another of this repo's packages (`apps/imports_test.go` fails the build on one). It exports `Mount(app *zip.App, ...) error`, taking the router and exactly what it reads from its host, and `apps.Wire()` adapts `cloud.Deps` to that. An app written this way mounts unchanged in any host that hands it those values, which is how the private build runs the same source.
+An app under `apps/<name>` imports zip, the standard library and public modules, and nothing of its host: not `github.com/hanzoai/cloud` itself and not another of this repo's packages (`apps/imports_test.go` fails the build on one). It exports `Mount(app *zip.App, ...) error`, taking the router and exactly what it reads from its host, and `apps.Wire()` adapts `cloud.Deps` to that. An app written this way mounts unchanged in any host that hands it those values, which is how the private build runs the same source.
 
 An app is private only when its job is one of:
 
-- **M** moving or pricing money: billing, commerce, payouts, plans and prices, balances, resale at our prices.
+- **M** moving money or keeping its ledger: billing, commerce, wallets, treasury, tax, x402, payouts, plans and prices, balances. The mechanism is OSS wherever it separates from our price data.
 - **A** operating the platform as SuperAdmin: fleet, host and platform-wide control.
-- **P** our production estate: our cluster's build and deploy plane, our data tier, our private model layer.
+- **P** our production estate: our cluster's build and deploy plane, our data tier, our forge.
 - **H** one private program: a runtime or a network's onboarding that is not a product anyone else runs.
 
-Everything else is OSS. An OSS app that still needs a private package is OSS with a host seam to cut, not private: the seam is the work, not the verdict.
+Everything else is OSS. Where an OSS app meets billing, it asks through an interface the private build fills with its billing; this edition's implementation is real, and local mode genuinely has no billing. That interface is the seam, and cutting it is the work, not the verdict.
 
 Moved here so far: `blueprint`, `template`. The private build deletes its copy as each one lands and imports this module's.
 
 | app | class | reason |
 |---|---|---|
-| account | OSS | API keys and org onboarding; the billing-subject pin moves behind a host seam |
+| account | OSS | API keys and org onboarding; the billing-subject pin is a seam |
 | ad | OSS | paid-ad campaigns over the org's own connected accounts |
 | admin | PRIVATE | A: the SuperAdmin operator console |
 | admission | PRIVATE | A: operator launch control and waitlist for our hosted services |
 | affiliate | PRIVATE | M: partner commission payouts |
 | agents | OSS | autonomous agents for an org |
-| ai | PRIVATE | M: the model API on our upstream vendor accounts, plan caps and spend gates |
+| ai | OSS | the model API; vendor keys, plan caps and spend gates come in through a seam |
 | allowance | PRIVATE | M: plan caps and spend metering |
 | amqp | OSS | AMQP 0-9-1 adapter on the message bus |
 | answer | OSS | researched answers with sources |
 | ask | OSS | plain-language questions answered over an org's own numbers |
 | auditlog | OSS | tamper-evident audit trail (a local twin already ships) |
-| author | PRIVATE | M: royalty payouts to open-source authors |
+| author | OSS | royalty for open-source work; the payout is a seam |
 | auto | OSS | workflows on a schedule or a webhook |
 | base | OSS | managed Base (a local twin already ships) |
 | benchmark | OSS | model benchmark scores |
 | billing | PRIVATE | M: balances, spend and cards |
 | blueprint | OSS | MOVED: template compute-cost estimate and bill of images |
-| books | PRIVATE | M: the double-entry ledger of the platform's own money |
+| books | OSS | double-entry ledger; postings come in through a seam |
 | bot | OSS | a bot doing work on a desktop |
 | campaign | OSS | go-to-market campaigns across paid, organic and email |
 | captable | OSS | cap table |
 | catalog | OSS | one place to browse projects, apps and sites |
-| ci | OSS | CI dashboard |
+| ci | PRIVATE | P: CI dashboard over our forge's estate namespaces |
 | cloudflare | OSS | the org's own Cloudflare account, managed |
 | cms | OSS | CMS content model fixtures |
 | code | OSS | code search and symbols (a local twin already ships) |
 | coding | OSS | autonomous coding runs |
 | commerce | PRIVATE | M: checkout, subscriptions and invoices |
-| company | PRIVATE | M: incorporation sold through our partner accounts |
+| company | OSS | incorporation end to end; partner accounts and payment are seams |
 | compliance | OSS | KYC/KYB records and accreditation; the vendor adapter is a seam |
 | compute | OSS | machines, GPUs and clusters through a configured Visor |
 | content | OSS | marketing content from draft to published |
@@ -108,10 +108,10 @@ Moved here so far: `blueprint`, `template`. The private build deletes its copy a
 | deploy | PRIVATE | A: SuperAdmin control of our CD (sync, roll back) |
 | destination | OSS | events forwarded to ad and analytics tools |
 | dns | OSS | DNS records (a local relay already ships) |
-| domain | PRIVATE | M: domains resold through our registrar account |
+| domain | OSS | domain search and purchase; the registrar account and payment are seams |
 | email | OSS | commercial mail through the org's own provider |
 | engine | OSS | serving-runtime management plane |
-| entitlement | PRIVATE | M: what the plan grants |
+| entitlement | OSS | what the plan grants; the plan lookup is a seam |
 | environment | OSS | what a codebase is before its agent starts |
 | erp | OSS | ERP business model fixtures |
 | esign | OSS | documents out for signature |
@@ -145,7 +145,7 @@ Moved here so far: `blueprint`, `template`. The private build deletes its copy a
 | lsp | OSS | live code intelligence |
 | market | OSS | what trades on each chain |
 | marketing | OSS | lifecycle email drips |
-| marketplace | PRIVATE | M: settlement between orgs |
+| marketplace | OSS | the market between orgs; settlement is a seam |
 | meet | OSS | virtual office rooms |
 | ml | OSS | model serving |
 | mq | OSS | queue and stream admin |
@@ -155,12 +155,12 @@ Moved here so far: `blueprint`, `template`. The private build deletes its copy a
 | o11y | OSS | logs, metrics and traces; in-cluster defaults become config |
 | patent | OSS | who conceived what, and when the machine was asked |
 | patrol | OSS | estate watch: sites, tours, incidents |
-| plan | PRIVATE | M: the plan catalog and its prices |
+| plan | PRIVATE | M: the plan catalog and its prices (the mechanism is OSS once it parts from our price data) |
 | platform | PRIVATE | P: PaaS build and deploy on our cluster and runner pool |
 | plugin | PRIVATE | A: SuperAdmin control of what each host runs |
 | pref | OSS | per-person settings |
-| pricing | PRIVATE | M: our price list and vendor costs |
-| principals | PRIVATE | M: an org as payer or payee, with screening |
+| pricing | PRIVATE | M: our price list and vendor costs (the mechanism is OSS once it parts from our price data) |
+| principals | OSS | an org as payer or payee, with screening; payment facts are seams |
 | projects | OSS | where sites live: create, deploy, roll back |
 | prompt | OSS | versioned prompt library |
 | provider | OSS | connect third-party accounts; vendor client ids become config |
@@ -177,29 +177,29 @@ Moved here so far: `blueprint`, `template`. The private build deletes its copy a
 | sbom | OSS | components inside a container image |
 | search | OSS | one ranked result set over an org's data |
 | security | OSS | secret scanning (a local twin already ships) |
-| seo | PRIVATE | M: a measurement vendor resold at metered prices |
+| seo | OSS | search visibility as data; the vendor account and metering are seams |
 | settings | OSS | per-product org settings |
 | share | OSS | a public URL for a service on your own machine |
 | sites | OSS | published sites |
 | skills | OSS | the skill catalogue an AI client reads |
 | social | OSS | posting to every social account |
 | space | OSS | drives, folders and files |
-| standing | PRIVATE | M: the priced cost of keeping a company |
+| standing | OSS | the cost of keeping a company; prices are data behind a seam |
 | studio | OSS | Studio workflow backend |
 | sync | OSS | data sync between endpoints |
 | task | OSS | boards and work items |
 | tax | PRIVATE | M: payee tax forms for payouts |
 | taxonomy | OSS | the product catalogue's categories and tags |
 | team | OSS | shared documents and files |
-| tel | PRIVATE | M: carrier numbers and calls resold |
+| tel | OSS | numbers, calls and messages; the carrier account and metering are seams |
 | template | OSS | MOVED: starter-kit gallery |
 | tools | OSS | everything an org can call, in one list |
-| train | PRIVATE | M: per-second billing windows and our executor fleet |
+| train | OSS | training jobs and their executor; per-second billing windows come in through a seam |
 | translate | OSS | text translation |
 | transport | OSS | one inbox for the chat apps you connect |
 | treasury | PRIVATE | M: the reserve fund behind payouts |
 | trust | OSS | trust centre |
-| usage | PRIVATE | M: what an org ran and what it cost |
+| usage | OSS | what an org ran and what it cost; the ledger is a seam |
 | validator | PRIVATE | H: one network's validator onboarding program |
 | wallet | PRIVATE | M: key custody for value |
 | web3 | OSS | chain-access surface |
@@ -209,6 +209,6 @@ Moved here so far: `blueprint`, `template`. The private build deletes its copy a
 | world | OSS | live news feed filtered to a project |
 | worlds | PRIVATE | H: relay to a private runtime |
 | x402 | PRIVATE | M: pay-per-request payments |
-| zen | PRIVATE | P: our private model-serving layer |
+| zen | OSS | model-serving layer; billing comes in through a seam |
 
 Three more apps have a plugin and no source directory in the private build, because each is an external module: `authz` and `metrics` are OSS modules, `licensing` is private.
