@@ -12,14 +12,14 @@ require (
 	github.com/lib/pq v1.12.3
 	github.com/luxfi/kms v1.11.8
 	github.com/luxfi/log v1.5.0
-	github.com/luxfi/zapdb v1.10.1
+	github.com/luxfi/zapdb v1.10.6
 	github.com/prometheus/client_golang v1.23.2
 	github.com/valyala/fasthttp v1.72.0
 	github.com/vulcand/oxy/v2 v2.0.0-00010101000000-000000000000
 	github.com/zap-proto/fiber/v3 v3.2.1
 	github.com/zap-proto/go v1.8.3
 	github.com/zap-proto/md v0.1.0
-	github.com/zap-proto/zip v1.37.45
+	github.com/zap-proto/zip v1.37.44
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/trace v1.44.0
 	golang.org/x/crypto v0.54.0
@@ -56,16 +56,17 @@ require (
 	github.com/grandcat/zeroconf v1.0.0 // indirect
 	github.com/hanzoai/csqlite v0.1.2 // indirect
 	github.com/hanzoai/sqlcipher v0.1.1 // indirect
-	github.com/hanzos3/go-sdk v1.0.2 // indirect
+	github.com/hanzos3/crc64nvme v1.1.2 // indirect
+	github.com/hanzos3/go v1.0.2 // indirect
+	github.com/hanzos3/md5-simd v1.1.3 // indirect
 	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/crc32 v1.3.0 // indirect
 	github.com/luxfi/accel v1.2.4 // indirect
 	github.com/luxfi/age v1.6.0 // indirect
-	github.com/luxfi/crypto v1.20.2 // indirect
+	github.com/luxfi/crypto v1.20.13 // indirect
 	github.com/luxfi/mdns v0.1.1 // indirect
 	github.com/luxfi/metric v1.10.0 // indirect
-	github.com/luxfi/pq v1.1.0 // indirect
 	github.com/luxfi/zap v1.2.7 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.22 // indirect
@@ -86,7 +87,7 @@ require (
 	github.com/tinylib/msgp v1.6.4 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/zap-proto/http v0.3.12 // indirect
-	github.com/zap-proto/mcp v1.0.5 // indirect
+	github.com/zap-proto/mcp v1.0.6 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel/metric v1.44.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
