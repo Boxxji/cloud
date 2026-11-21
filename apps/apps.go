@@ -49,24 +49,24 @@ import (
 func Wire() []cloud.MountSpec {
 	return []cloud.MountSpec{
 		// Insights feature-flag evaluation seam (no routes; a hot value plane).
-		{Name: "flags", Mount: flags.Mount, Shutdown: flags.Shutdown, OwnsHealth: true},
+		{Name: "flags", Mount: flags.Mount, Shutdown: flags.Shutdown, OwnsHealth: true, Description: "Feature flags: ship it dark, then turn it on for who you pick."},
 		// Embedded KMS secrets plane /v1/kms/*. OwnsHealth: serves its own
 		// fail-closed /v1/kms/health. Fails closed until CLOUD_KMS_MASTER_KEY_REF.
-		{Name: "kms", Mount: kms.Mount, OwnsHealth: true},
+		{Name: "kms", Mount: kms.Mount, OwnsHealth: true, Description: "Secret custody: your org's secrets sealed at rest."},
 		// Embedded runtime edge (/v1/ingress/*). STAGED — edge listeners stay off
 		// unless the operator names "ingress" in CLOUD_ENABLE.
-		{Name: "ingress", Mount: ingress.Mount, Shutdown: ingress.Shutdown},
+		{Name: "ingress", Mount: ingress.Mount, Shutdown: ingress.Shutdown, Description: "Your edge: automatic TLS certificates and hostname routing."},
 		// /v1/s3/buckets/* + /v1/s3/health. OwnsHealth (real fail-closed probe).
-		{Name: "storage", Mount: storage.Mount, OwnsHealth: true},
+		{Name: "storage", Mount: storage.Mount, OwnsHealth: true, Prefix: "/v1/s3", Description: "Object storage: your buckets and the files in them."},
 		// The /v1/dns forward head: relays the console DNS dashboard to the DNS
 		// control plane under the caller's own validated bearer.
-		{Name: "dns", Mount: dns.Mount},
-		{Name: "code", Mount: code.Mount, Shutdown: code.Shutdown},
-		{Name: "session", Mount: session.Mount, Shutdown: ctxShutdown(session.Shutdown)},
-		{Name: "security", Mount: security.Mount, Shutdown: ctxShutdown(security.Shutdown), OwnsHealth: true},
-		{Name: "exec", Mount: exec.Mount},
-		{Name: "gateway", Mount: gateway.Mount},
-		{Name: "audit", Mount: auditlog.Mount},
+		{Name: "dns", Mount: dns.Mount, Description: "Your DNS records, relayed to the DNS control plane under your own bearer."},
+		{Name: "code", Mount: code.Mount, Shutdown: code.Shutdown, Description: "Search and symbols across your repos, for you and your agents."},
+		{Name: "session", Mount: session.Mount, Shutdown: ctxShutdown(session.Shutdown), Prefix: "/v1/code/sessions", Description: "Live coding-agent runs: list them, watch them, steer them."},
+		{Name: "security", Mount: security.Mount, Shutdown: ctxShutdown(security.Shutdown), OwnsHealth: true, Description: "Secret scanning for your code: submit sources, get findings."},
+		{Name: "exec", Mount: exec.Mount, Description: "The code interpreter: run a snippet in a sandbox and move files."},
+		{Name: "gateway", Mount: gateway.Mount, Description: "Live control of the edge policy your API applies to every request."},
+		{Name: "audit", Mount: auditlog.Mount, Description: "Your org's tamper-evident audit trail."},
 
 		// The local apps. Each is a REAL implementation over the embedded store,
 		// not a relay to a cluster: the dev edition is meant to be a working
@@ -76,15 +76,15 @@ func Wire() []cloud.MountSpec {
 		// Every route in these is a typed op, which is why they need no
 		// per-app integration work: one declaration is simultaneously the REST
 		// route, the OpenAPI schema, the MCP tool and the generated SDK method.
-		{Name: "base", Mount: base.Mount, Shutdown: base.Shutdown},
-		{Name: "kv", Mount: kv.Mount, Shutdown: kv.Shutdown},
-		{Name: "tasks", Mount: tasks.Mount, Shutdown: tasks.Shutdown},
+		{Name: "base", Mount: base.Mount, Shutdown: base.Shutdown, Description: "A document store per org: collections of JSON records."},
+		{Name: "kv", Mount: kv.Mount, Shutdown: kv.Shutdown, Description: "Your key-value store: versioned values your apps read and write."},
+		{Name: "tasks", Mount: tasks.Mount, Shutdown: tasks.Shutdown, Description: "Durable work: a lease and acknowledge queue."},
 		// STAGED (see stagedSubsystems): functions RUNS CODE, so it is linked in
 		// every build but mounts only when an operator names it.
-		{Name: "functions", Mount: functions.Mount, Shutdown: functions.Shutdown},
+		{Name: "functions", Mount: functions.Mount, Shutdown: functions.Shutdown, Description: "Serverless code: publish it and call it over HTTP."},
 
 		// Runtime wasm/proxy plugins — mounts dead last.
-		{Name: "plugins", Mount: plugin.Mount},
+		{Name: "plugins", Mount: plugin.Mount, Description: "Runtime plugins, wasm and proxy, mounted under /v1/plugins."},
 	}
 }
 

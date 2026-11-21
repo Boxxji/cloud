@@ -152,8 +152,6 @@ func Serve(specs []MountSpec, enable []string) error {
 	// middleware_tracing.go.
 	app.Use(TracingMiddleware())
 
-	app.Use(middleware.Logger(deps.Logger))
-
 	// Edge policy. Runs BEFORE identity by design:
 	//   - EdgeCORS answers the browser OPTIONS preflight (which carries no
 	//     credentials) and short-circuits it, so a preflight never reaches auth.
@@ -210,7 +208,7 @@ func Serve(specs []MountSpec, enable []string) error {
 			continue
 		}
 		name := spec.Name
-		app.Get("/v1/"+name+"/health", func(c *zip.Ctx) error {
+		app.Raw(http.MethodGet, "/v1/"+name+"/health", func(c *zip.Ctx) error {
 			return c.JSON(200, map[string]string{"service": name, "status": "ok"})
 		})
 	}
@@ -224,10 +222,15 @@ func Serve(specs []MountSpec, enable []string) error {
 	// — no second copy of any business logic: each call is replayed in-process
 	// through this Fiber app (see zapface). Mounted AFTER MountAll so every /v1
 	// route exists before the dispatcher captures the app.
-	app.Get("/zap", zapface.Handler(app.Fiber(), zapface.Options{
+	app.Raw(http.MethodGet, "/zap", zapface.Handler(app.Fiber(), zapface.Options{
 		OriginPatterns: cfg.ZAPWebOrigins,
 		Logger:         deps.Logger,
 	}))
+
+	// GET /v1 — the capability index: what this deployment mounted, read from the
+	// same specs MountAll just mounted. Unauthenticated, for the reason the
+	// document below is.
+	mountIndex(app, specs, cfg)
 
 	// GET /v1/openapi.json — the THIRD projection of the same route table. ZAP
 	// replays the /v1 handlers, the console renders them, and this DESCRIBES
@@ -248,21 +251,6 @@ func Serve(specs []MountSpec, enable []string) error {
 		},
 		openapi.Server{URL: serverURL(cfg.Domain)},
 	)
-
-	// Install zip's own deferred projections of the typed-op registry — the MCP
-	// endpoint at /mcp, the typed OpenAPI document, the op-call plane — BEFORE the
-	// console catch-all below.
-	//
-	// zip installs these itself, but from Listen, which is AFTER everything mounted
-	// here. Fiber matches in registration order and the catch-all matches
-	// everything, so a /mcp registered after it is a route the router can never
-	// reach: the endpoint existed and still answered 404. Prepare is idempotent
-	// (sync.Once), so Listen's own call becomes a no-op and this is purely a
-	// question of who registers first.
-	//
-	// It has to be here rather than earlier for the same reason openapi.Mount is:
-	// the projections read the COMPLETE op registry, so they run after MountAll.
-	app.Prepare()
 
 	// Mounted LAST, after every /v1 route, the /zap plane, the health contract and
 	// the projections above, this registers the terminal catch-all: the embedded

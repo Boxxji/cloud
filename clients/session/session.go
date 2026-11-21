@@ -98,13 +98,13 @@ func Shutdown() error {
 // :id siblings so the first-match scan resolves them first.
 func routes(app *zip.App, s *cloud.Service[state]) {
 	g := app.Group("/v1/code")
-	g.Post("/sessions", cloud.Handle(s, createSession))
-	g.Get("/sessions", cloud.Handle(s, listSessions))
-	g.Get("/sessions/:id", cloud.Handle(s, getSession))
-	g.Patch("/sessions/:id", cloud.Handle(s, updateSession))
-	g.Delete("/sessions/:id", cloud.Handle(s, deleteSession))
-	g.Post("/sessions/:id/events", cloud.Handle(s, createEvent))
-	g.Get("/sessions/:id/events", cloud.Handle(s, listEvents))
+	g.Raw(http.MethodPost, "/sessions", cloud.Handle(s, createSession))
+	g.Raw(http.MethodGet, "/sessions", cloud.Handle(s, listSessions))
+	g.Raw(http.MethodGet, "/sessions/:id", cloud.Handle(s, getSession))
+	g.Raw(http.MethodPatch, "/sessions/:id", cloud.Handle(s, updateSession))
+	g.Raw(http.MethodDelete, "/sessions/:id", cloud.Handle(s, deleteSession))
+	g.Raw(http.MethodPost, "/sessions/:id/events", cloud.Handle(s, createEvent))
+	g.Raw(http.MethodGet, "/sessions/:id/events", cloud.Handle(s, listEvents))
 }
 
 func org(c *zip.Ctx) (string, bool) { return principal.Org(c) }

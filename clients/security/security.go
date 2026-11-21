@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -83,13 +84,13 @@ func Mount(app *zip.App, deps cloud.Deps) error {
 // params so a scan id can never shadow /rules or /health (Fiber first-match).
 func routes(app *zip.App, s *cloud.Service[state]) {
 	g := app.Group("/v1/security")
-	g.Get("/health", cloud.Handle(s, health))
-	g.Get("/rules", cloud.Handle(s, listRules))
-	g.Post("/scans", cloud.Handle(s, submitScan))
-	g.Get("/scans", cloud.Handle(s, listScans))
-	g.Get("/findings", cloud.Handle(s, listFindings))
-	g.Get("/scans/:id", cloud.Handle(s, getScan))
-	g.Get("/findings/:id", cloud.Handle(s, getFinding))
+	g.Raw(http.MethodGet, "/health", cloud.Handle(s, health))
+	g.Raw(http.MethodGet, "/rules", cloud.Handle(s, listRules))
+	g.Raw(http.MethodPost, "/scans", cloud.Handle(s, submitScan))
+	g.Raw(http.MethodGet, "/scans", cloud.Handle(s, listScans))
+	g.Raw(http.MethodGet, "/findings", cloud.Handle(s, listFindings))
+	g.Raw(http.MethodGet, "/scans/:id", cloud.Handle(s, getScan))
+	g.Raw(http.MethodGet, "/findings/:id", cloud.Handle(s, getFinding))
 }
 
 // Shutdown closes the findings store. Idempotent; safe if Mount never ran.

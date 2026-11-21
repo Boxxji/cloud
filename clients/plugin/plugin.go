@@ -218,7 +218,7 @@ func Mount(app *zip.App, deps cloud.Deps) error {
 		ls = append(ls, &loader{p: p, baseDir: baseDir, log: log})
 	}
 	for _, l := range ls {
-		app.All(l.p.Prefix+"/*", l.serve)
+		app.Raw(zip.MethodAll, l.p.Prefix+"/*", l.serve)
 		log.Info("plugin mounted", "name", l.p.Name, "kind", l.p.Kind, "prefix", l.p.Prefix)
 	}
 	mu.Lock()
@@ -226,7 +226,7 @@ func Mount(app *zip.App, deps cloud.Deps) error {
 	mu.Unlock()
 
 	// Introspection: what is mounted, and which of it has actually loaded.
-	app.Get("/v1/plugins", func(c *zip.Ctx) error {
+	app.Raw(http.MethodGet, "/v1/plugins", func(c *zip.Ctx) error {
 		out := make([]view, 0, len(ls))
 		for _, l := range ls {
 			out = append(out, view{Name: l.p.Name, Kind: l.p.Kind, Prefix: l.p.Prefix, Loaded: l.loaded()})

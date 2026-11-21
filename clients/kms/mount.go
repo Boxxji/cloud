@@ -89,8 +89,8 @@ func Mount(app *zip.App, deps cloud.Deps) error {
 	// group because it carries a per-source-IP rate-limit middleware this group
 	// must not apply.
 	g := app.Group("/v1/kms")
-	g.Get("/health", cloud.Handle(s, health))
-	g.Get("/config", configHandler(deps))
+	g.Raw(http.MethodGet, "/health", cloud.Handle(s, health))
+	g.Raw(http.MethodGet, "/config", configHandler(deps))
 	// The login broker is PUBLIC (it IS the credential exchange) and independent of
 	// the local store: the kms-operator POSTs its per-tenant clientId/clientSecret
 	// here to mint the owner-scoped IAM bearer it then carries on the org-scoped
@@ -110,7 +110,7 @@ func Mount(app *zip.App, deps cloud.Deps) error {
 		Limit:  loginRateLimit,
 		Window: loginRateWindow,
 		KeyFn:  func(c *zip.Ctx) string { return c.Fiber().IP() },
-	})).Post("/login", cloud.Handle(s, login))
+	})).Raw(http.MethodPost, "/login", cloud.Handle(s, login))
 
 	if kc == nil {
 		s.Log.Warn("kms REST mounted health-only: no in-process KMS client (secrets served out-of-process or disabled)")
@@ -123,10 +123,10 @@ func Mount(app *zip.App, deps cloud.Deps) error {
 	// from getSecret (400 "secret name is required"), leaving listSecrets
 	// unreachable. `+` requires a non-empty name, so the bare path falls through
 	// to the exact list route.
-	g.Get("/orgs/:org/secrets", guard(s, cloud.Handle(s, listSecrets)))
-	g.Get("/orgs/:org/secrets/+", guard(s, cloud.Handle(s, getSecret)))
-	g.Post("/orgs/:org/secrets", guard(s, cloud.Handle(s, putSecret)))
-	g.Delete("/orgs/:org/secrets/+", guard(s, cloud.Handle(s, deleteSecret)))
+	g.Raw(http.MethodGet, "/orgs/:org/secrets", guard(s, cloud.Handle(s, listSecrets)))
+	g.Raw(http.MethodGet, "/orgs/:org/secrets/+", guard(s, cloud.Handle(s, getSecret)))
+	g.Raw(http.MethodPost, "/orgs/:org/secrets", guard(s, cloud.Handle(s, putSecret)))
+	g.Raw(http.MethodDelete, "/orgs/:org/secrets/+", guard(s, cloud.Handle(s, deleteSecret)))
 
 	s.Log.Info(
 		"kms subsystem mounted",

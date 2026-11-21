@@ -5,12 +5,15 @@ One Go binary that mounts every subsystem from a single composition root (`apps.
 Base (`/v1/base` document/KV/SQLite store), Tasks (`/v1/tasks` durable lease/ack queue),
 Functions (`/v1/functions` staged runner), KMS (`/v1/kms` embedded `luxfi/kms`), S3, Search,
 Edge, Feature Flags, Audit, Plugin runtime (`/v1/plugins`), OpenAPI (`/v1/openapi.json`),
-and MCP (`/mcp` JSON-RPC 2.0).
+and MCP (`/mcp` JSON-RPC 2.0). `GET /v1` is the capability index: the subsystems this process mounted, each
+with its address and a sentence on what it is for (`MountSpec.Description`).
 
 **Canonical AI instructions**: `LLM.md` is the canonical instruction file in this repository.
 `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md` are tracked symlinks to `LLM.md`.
 
 ## Build, Run & Test
+
+The stack is Go 1.27.1 and `github.com/zap-proto/zip` v1.37.45 (the version the private build runs). A route is a typed op (`app.Get[In, Out](path, fn)`) or, where a handler owns its whole response, a raw one (`app.Raw(method, path, handler)`).
 
 ```bash
 make dev      # CGO_ENABLED=0 go build ./cmd/cloud, mints .dev/master.key (0600), serves 127.0.0.1:8080

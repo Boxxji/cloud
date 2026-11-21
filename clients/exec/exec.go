@@ -141,8 +141,8 @@ func Mount(app *zip.App, deps cloud.Deps) error {
 	// /download/{id}, GET /files/{sid}). Registered before ai (order 150), so
 	// these specific paths win over ai's bare /v1/* glob.
 	for _, p := range prefixes {
-		app.All(p, h)      // exact match, e.g. /v1/exec, /v1/upload
-		app.All(p+"/*", h) // subpaths, e.g. /v1/exec/programmatic, /v1/files/{sid}
+		app.Raw(zip.MethodAll, p, h)      // exact match, e.g. /v1/exec, /v1/upload
+		app.Raw(zip.MethodAll, p+"/*", h) // subpaths, e.g. /v1/exec/programmatic, /v1/files/{sid}
 	}
 
 	logger.Info("code interpreter surface mounted (reverse proxy)",

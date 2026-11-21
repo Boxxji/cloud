@@ -28,6 +28,7 @@ package gateway
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 
 	"github.com/hanzoai/cloud"
 	"github.com/hanzoai/cloud/clients/gateway/edge"
@@ -67,8 +68,8 @@ func Mount(app *zip.App, deps cloud.Deps) error {
 // routes registers the gateway config plane.
 func routes(app *zip.App, s *cloud.Service[state]) {
 	g := app.Group("/v1/gateway")
-	g.Get("/config", cloud.Handle(s, get))
-	g.Put("/config", cloud.Handle(s, put))
+	g.Raw(http.MethodGet, "/config", cloud.Handle(s, get))
+	g.Raw(http.MethodPut, "/config", cloud.Handle(s, put))
 }
 
 // get returns the EFFECTIVE edge policy the caller is subject to: the platform

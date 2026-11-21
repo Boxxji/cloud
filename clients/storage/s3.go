@@ -85,14 +85,14 @@ func Mount(app *zip.App, deps cloud.Deps) error {
 	// so the s3 subsystem always OWNS its route space and answers an honest 503
 	// under its own name rather than a 404 from whatever matches next.
 	g := app.Group("/v1/s3")
-	g.Get("/health", cloud.Handle(s, health))
-	g.Get("/buckets", guard(s, cloud.Handle(s, listBuckets)))
-	g.Post("/buckets", guard(s, cloud.Handle(s, createBucket)))
-	g.Delete("/buckets/:bucket", guard(s, cloud.Handle(s, deleteBucket)))
-	g.Get("/buckets/:bucket/objects", guard(s, cloud.Handle(s, listObjects)))
-	g.Post("/buckets/:bucket/objects", guard(s, cloud.Handle(s, presignUpload)))
-	g.Get("/buckets/:bucket/objects/*", guard(s, cloud.Handle(s, presignDownload)))
-	g.Delete("/buckets/:bucket/objects/*", guard(s, cloud.Handle(s, deleteObject)))
+	g.Raw(http.MethodGet, "/health", cloud.Handle(s, health))
+	g.Raw(http.MethodGet, "/buckets", guard(s, cloud.Handle(s, listBuckets)))
+	g.Raw(http.MethodPost, "/buckets", guard(s, cloud.Handle(s, createBucket)))
+	g.Raw(http.MethodDelete, "/buckets/:bucket", guard(s, cloud.Handle(s, deleteBucket)))
+	g.Raw(http.MethodGet, "/buckets/:bucket/objects", guard(s, cloud.Handle(s, listObjects)))
+	g.Raw(http.MethodPost, "/buckets/:bucket/objects", guard(s, cloud.Handle(s, presignUpload)))
+	g.Raw(http.MethodGet, "/buckets/:bucket/objects/*", guard(s, cloud.Handle(s, presignDownload)))
+	g.Raw(http.MethodDelete, "/buckets/:bucket/objects/*", guard(s, cloud.Handle(s, deleteObject)))
 
 	if !s.State.store.Configured() {
 		s.Log.Warn("s3 subsystem mounted fail-closed: S3_ACCESS_KEY/S3_SECRET_KEY not set (all ops 503 until set)")

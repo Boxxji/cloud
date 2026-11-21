@@ -55,7 +55,7 @@ func serveFS(app *zip.App, fsys fs.FS) error {
 	if err != nil {
 		return fmt.Errorf("console index: %w", err)
 	}
-	app.All("/*", func(c *zip.Ctx) error {
+	app.Raw(zip.MethodAll, "/*", func(c *zip.Ctx) error {
 		p := c.Path()
 		if isAPIPath(p) {
 			return c.JSON(http.StatusNotFound, map[string]any{

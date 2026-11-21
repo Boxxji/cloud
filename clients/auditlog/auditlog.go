@@ -63,7 +63,7 @@ func Mount(app *zip.App, deps cloud.Deps) error {
 
 // routes registers the org-scoped audit surface.
 func routes(app *zip.App, s *cloud.Service[state]) {
-	app.Get("/v1/audit", cloud.Handle(s, list))
+	app.Raw(http.MethodGet, "/v1/audit", cloud.Handle(s, list))
 }
 
 // list answers GET /v1/audit — the caller's OWN org audit trail, newest first.

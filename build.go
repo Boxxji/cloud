@@ -234,6 +234,14 @@ type MountSpec struct {
 	// (a real, fail-closed probe). Serve's generic liveness loop skips these so
 	// its always-ok route never shadows the subsystem's real probe.
 	OwnsHealth bool
+
+	// Description is one sentence saying what the subsystem is for. GET /v1 lists
+	// it beside the name.
+	Description string
+
+	// Prefix is the address the subsystem is mounted at, when it is not
+	// "/v1/"+Name.
+	Prefix string
 }
 
 // MountAll mounts every ENABLED subsystem in specs, in slice order — the order is

@@ -109,29 +109,29 @@ func Shutdown(context.Context) error {
 // siblings so the first-match scan resolves them first.
 func routes(app *zip.App, s *cloud.Service[state]) {
 	g := app.Group("/v1/base")
-	zip.Get[CollectionsIn, CollectionsOut](g, "/collections", collections(s),
+	g.Get[CollectionsIn, CollectionsOut]("/collections", collections(s),
 		zip.WithOperationID("base_collections"),
 		zip.WithSummary("List the collections that hold records"),
 		zip.WithTags("base"))
-	zip.Get[ListIn, ListOut](g, "/collections/:collection", list(s),
+	g.Get[ListIn, ListOut]("/collections/:collection", list(s),
 		zip.WithOperationID("base_list"),
 		zip.WithSummary("List the records in one collection"),
 		zip.WithTags("base"))
-	zip.Post[CreateIn, Record](g, "/collections/:collection", create(s),
+	g.Post[CreateIn, Record]("/collections/:collection", create(s),
 		zip.WithOperationID("base_create"),
 		zip.WithSummary("Create a record"),
 		zip.WithTags("base"),
 		zip.WithStatus(201))
-	zip.Get[GetIn, Record](g, "/collections/:collection/:id", get(s),
+	g.Get[GetIn, Record]("/collections/:collection/:id", get(s),
 		zip.WithOperationID("base_get"),
 		zip.WithSummary("Read one record"),
 		zip.WithTags("base"))
-	zip.Put[UpdateIn, Record](g, "/collections/:collection/:id", update(s),
+	g.Put[UpdateIn, Record]("/collections/:collection/:id", update(s),
 		zip.WithOperationID("base_update"),
 		zip.WithSummary("Replace one record"),
 		zip.WithTags("base"),
 	)
-	zip.Delete[DeleteIn, DeleteOut](g, "/collections/:collection/:id", remove(s),
+	g.Delete[DeleteIn, DeleteOut]("/collections/:collection/:id", remove(s),
 		zip.WithOperationID("base_delete"),
 		zip.WithSummary("Delete one record"),
 		zip.WithTags("base"))

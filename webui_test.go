@@ -27,7 +27,7 @@ func get(t *testing.T, app *zip.App, path string) (*http.Response, string) {
 
 func TestTmpConsole(t *testing.T) {
 	app := zip.New(zip.Config{})
-	app.Get("/v1/kv/:key", func(c *zip.Ctx) error { return c.JSON(200, map[string]string{"k": c.Param("key")}) })
+	app.Raw(http.MethodGet, "/v1/kv/:key", func(c *zip.Ctx) error { return c.JSON(200, map[string]string{"k": c.Param("key")}) })
 	if err := mountConsole(app); err != nil {
 		t.Fatal(err)
 	}

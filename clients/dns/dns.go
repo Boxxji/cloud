@@ -64,7 +64,7 @@ func Mount(app *zip.App, deps cloud.Deps) error {
 			},
 		},
 	}
-	app.Group("/v1/dns").All("/*", e.forward)
+	app.Group("/v1/dns").Raw(zip.MethodAll, "/*", e.forward)
 	if deps.Logger != nil {
 		deps.Logger.Info("dns forward head mounted", "upstream", e.base)
 	}
