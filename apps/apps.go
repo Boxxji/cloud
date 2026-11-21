@@ -19,7 +19,11 @@ import (
 	"context"
 	"fmt"
 
+	luxlog "github.com/luxfi/log"
+	"github.com/zap-proto/zip"
+
 	"github.com/hanzoai/cloud"
+	"github.com/hanzoai/cloud/apps/blueprint"
 
 	// In-repo subsystem packages (clients/*). Each exports a Mount (and, where it
 	// owns process-lifetime resources, a Shutdown); Wire references them directly.
@@ -83,6 +87,12 @@ func Wire() []cloud.MountSpec {
 		// every build but mounts only when an operator names it.
 		{Name: "functions", Mount: functions.Mount, Shutdown: functions.Shutdown, Description: "Serverless code: publish it and call it over HTTP."},
 
+		// Apps that import zip and nothing of their host: the same package mounts in
+		// any host that hands it a router and the few things it reads. Each takes
+		// only what it names, so an entry here is an adapter from cloud.Deps to
+		// that and nothing more.
+		{Name: "blueprint", Mount: logged("blueprint", blueprint.Mount), OwnsHealth: true, Description: "What a template costs to run: its bill of images and a compute-cost estimate."},
+
 		// Runtime wasm/proxy plugins — mounts dead last.
 		{Name: "plugins", Mount: plugin.Mount, Description: "Runtime plugins, wasm and proxy, mounted under /v1/plugins."},
 	}
@@ -101,6 +111,14 @@ func ServeSingle(name string) error {
 		}
 	}
 	return fmt.Errorf("ServeSingle: unknown app %q", name)
+}
+
+// logged adapts an app that asks its host for a router and a logger to the mount
+// contract: the logger is scoped to the app's name, as cloud.Mount scopes it.
+func logged(name string, mount func(*zip.App, luxlog.Logger) error) cloud.MountFunc {
+	return func(app *zip.App, deps cloud.Deps) error {
+		return mount(app, deps.Logger.New("subsystem", name))
+	}
 }
 
 // ctxShutdown adapts a subsystem's zero-arg Shutdown() error to the
