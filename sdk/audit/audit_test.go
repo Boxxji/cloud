@@ -1,0 +1,864 @@
+package audit
+
+// Tests for the tamper-evident audit chain. They exercise the REAL SQLite store
+// (an on-disk temp db, not a mock) so the append-only write path, the hash-chain
+// math, the verifier, redaction, and the filtered query are all proven
+// end-to-end. The headline test is tamper-detection: a record edited directly in
+// the database is DETECTED as breaking the chain.
+
+import (
+	"cmp"
+	"context"
+	"encoding/json"
+	"fmt"
+	"github.com/hanzoai/cloud/sdk/sqltest"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/hanzoai/cloud/sdk/dialect"
+	_ "github.com/hanzoai/cloud/sdk/kit/master"
+	"github.com/hanzoai/cloud/sdk/locus"
+	"github.com/hanzoai/namespace"
+)
+
+// openTemp opens a Recorder backed by a fresh on-disk database, and reports the
+// directory holding it so a tamper test can re-open the SAME store on a second
+// connection and edit it out-of-band — exactly what an attacker with DB access
+// would do.
+func openTemp(t *testing.T) (*Recorder, string) {
+	t.Helper()
+	dir := t.TempDir()
+	rec, err := Open(dir, "audit", nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = rec.Close() })
+	return rec, dir
+}
+
+// sampleRecord is a representative security event (a SuperAdmin org deletion).
+func sampleRecord(action string) Record {
+	return Record{
+		Time:      time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC),
+		Actor:     Actor{Org: "admin", Sub: "z@hanzo.ai", Email: "z@hanzo.ai"},
+		Action:    action,
+		Resource:  Resource{Type: "org", ID: "acme"},
+		Auth:      AuthContext{Method: "jwt", IsAdmin: true},
+		Outcome:   Outcome{Result: "success", Status: 200},
+		SourceIP:  "203.0.113.7",
+		UserAgent: "console",
+		RequestID: "req-123",
+		Method:    "DELETE",
+		Path:      "/v1/admin/orgs/acme",
+	}
+}
+
+// TestChain_AppendSealsAndLinks proves each appended record gets a monotonic seq,
+// links its PrevHash to the previous record's Hash, and starts from the genesis
+// anchor.
+func TestChain_AppendSealsAndLinks(t *testing.T) {
+	sqltest.Engines(t, func(t *testing.T, _ sqltest.Open) {
+		rec, _ := openTemp(t)
+		ctx := context.Background()
+
+		r0, err := rec.Append(ctx, sampleRecord("DELETE /v1/admin/orgs"))
+		if err != nil {
+			t.Fatalf("append 0: %v", err)
+		}
+		if r0.Seq != 0 {
+			t.Fatalf("first seq = %d, want 0", r0.Seq)
+		}
+		if r0.PrevHash != genesisPrevHash {
+			t.Fatalf("genesis prev = %q, want %q", r0.PrevHash, genesisPrevHash)
+		}
+		if r0.Hash == "" || r0.Hash == genesisPrevHash {
+			t.Fatalf("hash not computed: %q", r0.Hash)
+		}
+
+		r1, err := rec.Append(ctx, sampleRecord("POST /v1/admin/roles"))
+		if err != nil {
+			t.Fatalf("append 1: %v", err)
+		}
+		if r1.Seq != 1 {
+			t.Fatalf("second seq = %d, want 1", r1.Seq)
+		}
+		if r1.PrevHash != r0.Hash {
+			t.Fatalf("link broken: r1.prev=%q, r0.hash=%q", r1.PrevHash, r0.Hash)
+		}
+		if r1.Hash == r0.Hash {
+			t.Fatal("distinct records must have distinct hashes")
+		}
+	})
+}
+
+// TestVerify_PassesOnUntamperedChain proves a well-formed chain verifies OK.
+func TestVerify_PassesOnUntamperedChain(t *testing.T) {
+	sqltest.Engines(t, func(t *testing.T, _ sqltest.Open) {
+		rec, _ := openTemp(t)
+		ctx := context.Background()
+		for i := range 25 {
+			if _, err := rec.Append(ctx, sampleRecord("POST /v1/admin/sync")); err != nil {
+				t.Fatalf("append %d: %v", i, err)
+			}
+		}
+		integrity, err := rec.Verify(ctx)
+		if err != nil {
+			t.Fatalf("Verify: %v", err)
+		}
+		if integrity.Verdict != Intact {
+			t.Fatalf("chain not OK: broken at %d (%s)", integrity.BrokenAt, integrity.Reason)
+		}
+		if integrity.Count != 25 {
+			t.Fatalf("count = %d, want 25", integrity.Count)
+		}
+		if integrity.BrokenAt != -1 {
+			t.Fatalf("brokenAt = %d, want -1 on a good chain", integrity.BrokenAt)
+		}
+		// Head must equal the last record's hash.
+		count, head := rec.Head()
+		if count != 25 || head != integrity.Head {
+			t.Fatalf("head mismatch: (%d,%q) vs verify (%d,%q)", count, head, integrity.Count, integrity.Head)
+		}
+	})
+}
+
+// actorBeforeHome is Actor as the binary that sealed the existing trail declared
+// it: no Home. It exists so the hash-compatibility claim is checked against what
+// that binary actually marshaled instead of against the current code's own idea
+// of itself, which would agree with anything.
+type actorBeforeHome struct {
+	Org   string `json:"org"`
+	Sub   string `json:"sub"`
+	Email string `json:"email,omitempty"`
+}
+
+// TestVerify_HomeFieldIsHashCompatible proves actor_home could be added to a
+// SEALED chain at all, in the two places it had to hold.
+//
+// The hash: Home is omitempty, so an empty one marshals to nothing and the actor
+// an ordinary same-org record hashes over is byte-identical to what the pre-field
+// binary produced. Drop the omitempty and every record ever written verifies as
+// TAMPERED.
+//
+// The store: five records are sealed and the column is then dropped, which is the
+// table a pre-field binary leaves behind. Re-opening runs migrate, whose addColumn
+// puts it back, and the chain still verifies against the hashes already on disk.
+func TestVerify_HomeFieldIsHashCompatible(t *testing.T) {
+	sqltest.Engines(t, func(t *testing.T, _ sqltest.Open) {
+		now, was := Actor{Org: "acme", Sub: "z@hanzo.ai", Email: "z@hanzo.ai"},
+			actorBeforeHome{Org: "acme", Sub: "z@hanzo.ai", Email: "z@hanzo.ai"}
+		nowJSON, err := json.Marshal(now)
+		if err != nil {
+			t.Fatalf("marshal actor: %v", err)
+		}
+		wasJSON, err := json.Marshal(was)
+		if err != nil {
+			t.Fatalf("marshal pre-field actor: %v", err)
+		}
+		if string(nowJSON) != string(wasJSON) {
+			t.Fatalf("adding Home changed what a same-org record hashes over:\n now %s\n was %s", nowJSON, wasJSON)
+		}
+
+		dir := t.TempDir()
+		ctx := context.Background()
+
+		rec, err := Open(dir, "audit", nil)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		for i := range 5 {
+			if _, err := rec.Append(ctx, sampleRecord("POST /v1/admin/roles")); err != nil {
+				t.Fatalf("append %d: %v", i, err)
+			}
+		}
+		_, head := rec.Head()
+		if err := rec.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		// Same opener the Recorder uses, on a closed store — the pre-field schema.
+		tamperOutOfBand(t, dir, `ALTER TABLE audit_log DROP COLUMN actor_home`)
+
+		rec2, err := Open(dir, "audit", nil)
+		if err != nil {
+			t.Fatalf("re-Open on the pre-field schema: %v", err)
+		}
+		t.Cleanup(func() { _ = rec2.Close() })
+
+		iv, err := rec2.Verify(ctx)
+		if err != nil {
+			t.Fatalf("Verify: %v", err)
+		}
+		if iv.Verdict != Intact {
+			t.Fatalf("a chain sealed before actor_home existed no longer verifies: broke at %d (%s)", iv.BrokenAt, iv.Reason)
+		}
+		if iv.Count != 5 || iv.Head != head {
+			t.Fatalf("head moved across the migration: (%d,%q), want (5,%q)", iv.Count, iv.Head, head)
+		}
+	})
+}
+
+// TestVerify_DetectsFieldTamper is the headline: an attacker with direct DB
+// access edits a record's content (flips a denied outcome to success, or changes
+// the actor). The stored hash no longer matches the recomputed hash, so Verify
+// reports the exact seq where the chain breaks. THIS is the tamper-evidence
+// property — an audit trail that can be silently forged is worse than none.
+func TestVerify_DetectsFieldTamper(t *testing.T) {
+	sqltest.Engines(t, func(t *testing.T, _ sqltest.Open) {
+		requireSharedStore(t) // tampers through a second handle while the Recorder holds the store open
+		rec, dir := openTemp(t)
+		ctx := context.Background()
+		for i := range 10 {
+			if _, err := rec.Append(ctx, sampleRecord("DELETE /v1/admin/orgs")); err != nil {
+				t.Fatalf("append %d: %v", i, err)
+			}
+		}
+		// Sanity: clean chain verifies.
+		if iv, _ := rec.Verify(ctx); iv.Verdict != Intact {
+			t.Fatalf("precondition: clean chain should verify, broke at %d", iv.BrokenAt)
+		}
+
+		// Tamper OUT OF BAND — a second connection issues an UPDATE the application
+		// never would. This models an attacker who owns the file / a rogue DBA.
+		tamperOutOfBand(t, dir, `UPDATE audit_log SET actor_sub='attacker', result='success' WHERE seq=4`)
+
+		iv, err := rec.Verify(ctx)
+		if err != nil {
+			t.Fatalf("Verify after tamper: %v", err)
+		}
+		if iv.Verdict == Intact {
+			t.Fatal("TAMPER NOT DETECTED — a modified record verified as OK; the chain is forgeable")
+		}
+		if iv.BrokenAt != 4 {
+			t.Fatalf("brokenAt = %d, want 4 (the edited record)", iv.BrokenAt)
+		}
+		if !strings.Contains(iv.Reason, "hash mismatch") {
+			t.Fatalf("reason = %q, want a hash-mismatch explanation", iv.Reason)
+		}
+	})
+}
+
+// TestVerify_DetectsDeletion proves deleting a record (or a contiguous run) breaks
+// the chain: the record after the hole has a PrevHash that no longer matches the
+// now-preceding record, and the seq sequence gaps. Either way Verify flags it.
+func TestVerify_DetectsDeletion(t *testing.T) {
+	sqltest.Engines(t, func(t *testing.T, _ sqltest.Open) {
+		requireSharedStore(t) // tampers through a second handle while the Recorder holds the store open
+		rec, dir := openTemp(t)
+		ctx := context.Background()
+		for i := range 10 {
+			if _, err := rec.Append(ctx, sampleRecord("POST /v1/admin/roles")); err != nil {
+				t.Fatalf("append %d: %v", i, err)
+			}
+		}
+		// Delete a MIDDLE record — the classic "cover your tracks" edit.
+		tamperOutOfBand(t, dir, `DELETE FROM audit_log WHERE seq=5`)
+
+		iv, err := rec.Verify(ctx)
+		if err != nil {
+			t.Fatalf("Verify after delete: %v", err)
+		}
+		if iv.Verdict == Intact {
+			t.Fatal("DELETION NOT DETECTED — a removed record left the chain verifying OK")
+		}
+		// The break is observed at seq 6 (the record whose predecessor vanished): its
+		// seq no longer follows the running counter (5 is missing), so the gap check
+		// fires first at 6.
+		if iv.BrokenAt != 6 {
+			t.Fatalf("brokenAt = %d, want 6 (record after the hole)", iv.BrokenAt)
+		}
+	})
+}
+
+// TestVerify_DetectsReorder proves swapping two records' positions (an attacker
+// trying to reorder events) breaks the prev-hash linkage.
+func TestVerify_DetectsReorder(t *testing.T) {
+	sqltest.Engines(t, func(t *testing.T, _ sqltest.Open) {
+		requireSharedStore(t) // tampers through a second handle while the Recorder holds the store open
+		rec, dir := openTemp(t)
+		ctx := context.Background()
+		for i := range 6 {
+			if _, err := rec.Append(ctx, sampleRecord("POST /v1/kms/secrets")); err != nil {
+				t.Fatalf("append %d: %v", i, err)
+			}
+		}
+		// Swap the hashes of seq 2 and seq 3 (content stays, linkage corrupts). Any
+		// out-of-band shuffle that doesn't recompute the WHOLE suffix is detectable.
+		tamperOutOfBand(t, dir, `
+UPDATE audit_log SET hash = (SELECT hash FROM audit_log WHERE seq=3) WHERE seq=2;`)
+
+		iv, _ := rec.Verify(ctx)
+		if iv.Verdict == Intact {
+			t.Fatal("REORDER/HASH-SWAP NOT DETECTED")
+		}
+		if iv.BrokenAt < 0 {
+			t.Fatalf("expected a break, got brokenAt=%d", iv.BrokenAt)
+		}
+	})
+}
+
+// TestChain_RestartContinues proves a re-opened store continues the SAME chain
+// (recovers seq + head) rather than forking — so a pod restart cannot silently
+// reset the trail.
+func TestChain_RestartContinues(t *testing.T) {
+	sqltest.Engines(t, func(t *testing.T, _ sqltest.Open) {
+		dir := t.TempDir()
+		ctx := context.Background()
+
+		rec1, err := Open(dir, "audit", nil)
+		if err != nil {
+			t.Fatalf("open 1: %v", err)
+		}
+		var lastHash string
+		for i := range 5 {
+			r, err := rec1.Append(ctx, sampleRecord("POST /v1/admin/sync"))
+			if err != nil {
+				t.Fatalf("append %d: %v", i, err)
+			}
+			lastHash = r.Hash
+		}
+		_ = rec1.Close()
+
+		rec2, err := Open(dir, "audit", nil)
+		if err != nil {
+			t.Fatalf("open 2: %v", err)
+		}
+		defer func() { _ = rec2.Close() }()
+
+		count, head := rec2.Head()
+		if count != 5 {
+			t.Fatalf("recovered count = %d, want 5", count)
+		}
+		if head != lastHash {
+			t.Fatalf("recovered head = %q, want %q", head, lastHash)
+		}
+		// The next append must chain onto the recovered head at seq 5.
+		r5, err := rec2.Append(ctx, sampleRecord("DELETE /v1/admin/orgs"))
+		if err != nil {
+			t.Fatalf("append after restart: %v", err)
+		}
+		if r5.Seq != 5 || r5.PrevHash != lastHash {
+			t.Fatalf("chain did not continue: seq=%d prev=%q (want seq 5 prev %q)", r5.Seq, r5.PrevHash, lastHash)
+		}
+		// And the whole continued chain still verifies.
+		if iv, _ := rec2.Verify(ctx); iv.Verdict != Intact {
+			t.Fatalf("continued chain broke at %d (%s)", iv.BrokenAt, iv.Reason)
+		}
+	})
+}
+
+// TestRedact_StripsSecrets proves the redactor removes credential-bearing fields
+// (by key name, recursively) while keeping non-secret structure — so an explicit
+// emit point's before/after can never carry a password/token/key.
+func TestRedact_StripsSecrets(t *testing.T) {
+	in := json.RawMessage(`{
+      "name": "acme",
+      "password": "hunter2",
+      "apiKey": "sk-live-abc123",
+      "passphrase": "correct horse",
+      "wgPrivKey": "PRIVKEYBYTES",
+      "recoveryPhrase": "twelve words here",
+      "socialSecurityNumber": "078-05-1120",
+      "config": {
+        "clientSecret": "shh",
+        "endpoint": "https://api.example.com",
+        "nested": {"private_key": "-----BEGIN-----", "region": "sfo3"}
+      },
+      "tokens": ["t1", "t2"],
+      "roles": ["admin", "viewer"]
+    }`)
+	out := Redact(in)
+
+	s := string(out)
+	// Secrets gone (incl. the edge-case key names: passphrase, privkey, phrase, ssn).
+	for _, leak := range []string{"hunter2", "sk-live-abc123", "shh", "BEGIN",
+		"correct horse", "PRIVKEYBYTES", "twelve words here", "078-05-1120"} {
+		if strings.Contains(s, leak) {
+			t.Fatalf("secret leaked through redaction: %q still present in %s", leak, s)
+		}
+	}
+	// Non-secret structure preserved.
+	for _, keep := range []string{"acme", "https://api.example.com", "sfo3", "viewer"} {
+		if !strings.Contains(s, keep) {
+			t.Fatalf("redaction dropped a non-secret value %q: %s", keep, s)
+		}
+	}
+	// The redaction marker appears where secrets were.
+	if !strings.Contains(s, redactedMarker) {
+		t.Fatalf("no redaction marker in output: %s", s)
+	}
+	// "tokens" is a secret key → the whole array is redacted (not its elements).
+	var decoded map[string]any
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatalf("redacted output is not valid JSON: %v", err)
+	}
+	if decoded["tokens"] != redactedMarker {
+		t.Fatalf("secret-keyed array not redacted whole: %v", decoded["tokens"])
+	}
+}
+
+// TestRedact_FailsClosedOnBadJSON proves unparseable input is never echoed back.
+func TestRedact_FailsClosedOnBadJSON(t *testing.T) {
+	out := Redact(json.RawMessage(`{not valid json, password=hunter2`))
+	if strings.Contains(string(out), "hunter2") {
+		t.Fatalf("bad JSON echoed a secret: %s", out)
+	}
+	if !strings.Contains(string(out), redactedMarker) {
+		t.Fatalf("bad JSON should redact to a marker, got %s", out)
+	}
+}
+
+// TestQuery_Filters proves the filtered read returns the right subset by actor,
+// action, resource, and result, newest-first, with an accurate total.
+func TestQuery_Filters(t *testing.T) {
+	sqltest.Engines(t, func(t *testing.T, _ sqltest.Open) {
+		rec, _ := openTemp(t)
+		ctx := context.Background()
+
+		mk := func(org, action, res, result string) Record {
+			r := sampleRecord(action)
+			r.Actor.Org = org
+			r.Resource.Type = res
+			r.Outcome.Result = result
+			return r
+		}
+		// A mixed set.
+		seed := []Record{
+			mk("admin", "DELETE /v1/admin/orgs", "org", "success"),
+			mk("acme", "POST /v1/base/records", "records", "success"),
+			mk("admin", "POST /v1/admin/roles", "roles", "deny"),
+			mk("admin", "DELETE /v1/admin/orgs", "org", "success"),
+			mk("acme", "POST /v1/kms/secrets", "secrets", "error"),
+		}
+		for i, r := range seed {
+			if _, err := rec.Append(ctx, r); err != nil {
+				t.Fatalf("seed %d: %v", i, err)
+			}
+		}
+
+		// Filter by org=admin → 3 rows.
+		rows, total, err := rec.Query(ctx, Filter{Org: "admin"})
+		if err != nil {
+			t.Fatalf("query org: %v", err)
+		}
+		if total != 3 || len(rows) != 3 {
+			t.Fatalf("org=admin: got %d rows, total %d, want 3/3", len(rows), total)
+		}
+		// Newest first: the last-appended admin row (seq 3) comes before seq 2, 0.
+		if rows[0].Seq < rows[len(rows)-1].Seq {
+			t.Fatalf("not newest-first: %d..%d", rows[0].Seq, rows[len(rows)-1].Seq)
+		}
+
+		// Filter by result=deny → 1 row (the 403-style role change).
+		denies, dtotal, err := rec.Query(ctx, Filter{Result: "deny"})
+		if err != nil {
+			t.Fatalf("query deny: %v", err)
+		}
+		if dtotal != 1 || len(denies) != 1 || denies[0].Action != "POST /v1/admin/roles" {
+			t.Fatalf("result=deny: got %d (%+v), want 1 role-change", dtotal, denies)
+		}
+
+		// Filter by resource=secrets → 1 row.
+		secs, stotal, err := rec.Query(ctx, Filter{Resource: "secrets"})
+		if err != nil {
+			t.Fatalf("query resource: %v", err)
+		}
+		if stotal != 1 || len(secs) != 1 {
+			t.Fatalf("resource=secrets: got %d, want 1", stotal)
+		}
+	})
+}
+
+// A resource filter — the one an org's money history reads, `credit` and
+// `credit_line` by org — is answered from ix_audit_res_seq, newest first, and never
+// by a scan of the whole trail.
+//
+// The plan is read from SQLite (EXPLAIN QUERY PLAN), so this test runs on SQLite only.
+func TestQuery_ResourceFilterUsesItsIndex(t *testing.T) {
+	t.Setenv(locus.Env, "")
+	rec, _ := openTemp(t)
+	var a dialect.Args
+	where := Filter{Resource: "credit", ResourceID: "acme"}.build(&a)
+	rows, err := rec.db.Query(`EXPLAIN QUERY PLAN SELECT seq FROM audit_log`+where+` ORDER BY seq DESC LIMIT 100`, a.Values()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+	}
+	got := strings.Join(plan, "; ")
+	if !strings.Contains(got, "ix_audit_res_seq") || strings.Contains(got, "TEMP B-TREE") {
+		t.Fatalf("resource filter plan = %q; want ix_audit_res_seq, in seq order", got)
+	}
+}
+
+// TestQuery_SQLInjectionInFilterIsInert proves a malicious filter value is a
+// parameter, never SQL: it simply matches nothing and cannot drop the table.
+func TestQuery_SQLInjectionInFilterIsInert(t *testing.T) {
+	sqltest.Engines(t, func(t *testing.T, _ sqltest.Open) {
+		rec, _ := openTemp(t)
+		ctx := context.Background()
+		for i := range 3 {
+			if _, err := rec.Append(ctx, sampleRecord("POST /v1/admin/sync")); err != nil {
+				t.Fatalf("seed %d: %v", i, err)
+			}
+		}
+		inject := Filter{Org: "admin'; DROP TABLE audit_log;--"}
+		rows, total, err := rec.Query(ctx, inject)
+		if err != nil {
+			t.Fatalf("query should not error on injection attempt: %v", err)
+		}
+		if total != 0 || len(rows) != 0 {
+			t.Fatalf("injection value matched %d rows, want 0", total)
+		}
+		// The table survived — a normal query still returns the seeded rows.
+		if _, all, err := rec.Query(ctx, Filter{}); err != nil || all != 3 {
+			t.Fatalf("table damaged by injection attempt: all=%d err=%v", all, err)
+		}
+	})
+}
+
+// TestChain_ConcurrentAppendsStayGapless proves the serialized writer keeps the
+// chain a true, gapless total order under CONCURRENT appends: many goroutines
+// append at once, and the resulting chain must have every seq 0..N-1 exactly once
+// AND verify. A race in the head/seq handoff would surface as a duplicate seq (a
+// PRIMARY KEY error), a gap, or a broken link — all of which this catches.
+func TestChain_ConcurrentAppendsStayGapless(t *testing.T) {
+	sqltest.Engines(t, func(t *testing.T, _ sqltest.Open) {
+		rec, _ := openTemp(t)
+		ctx := context.Background()
+
+		const goroutines, per = 16, 20
+		total := goroutines * per
+		errCh := make(chan error, total)
+		var wg sync.WaitGroup
+		for range goroutines {
+			wg.Go(func() {
+				for range per {
+					if _, err := rec.Append(ctx, sampleRecord("POST /v1/admin/sync")); err != nil {
+						errCh <- err
+					}
+				}
+			})
+		}
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			t.Fatalf("concurrent append failed (race in seq/head handoff?): %v", err)
+		}
+
+		// The chain must verify and contain exactly `total` gapless records.
+		iv, err := rec.Verify(ctx)
+		if err != nil {
+			t.Fatalf("verify: %v", err)
+		}
+		if iv.Verdict != Intact {
+			t.Fatalf("concurrent chain broke at %d (%s)", iv.BrokenAt, iv.Reason)
+		}
+		if iv.Count != uint64(total) {
+			t.Fatalf("recorded %d records, want %d (a lost/duplicated append)", iv.Count, total)
+		}
+	})
+}
+
+// checkpointMirror is a Mirror that also captures checkpoints (implements
+// CheckpointSink) so the test can assert the head digest reaches an independent
+// sink.
+type checkpointMirror struct {
+	mu  sync.Mutex
+	cps []Checkpoint
+}
+
+func (m *checkpointMirror) Append(context.Context, Record) error { return nil }
+func (m *checkpointMirror) Checkpoint(_ context.Context, cp Checkpoint) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cps = append(m.cps, cp)
+	return nil
+}
+func (m *checkpointMirror) last() (Checkpoint, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.cps) == 0 {
+		return Checkpoint{}, false
+	}
+	return m.cps[len(m.cps)-1], true
+}
+
+// TestCheckpoint_EmitsHeadDigest proves the AU-9 anchor: the periodic checkpoint
+// emits the current (count, head) to the log function AND, when the mirror is a
+// CheckpointSink, to the independent digest store — and a final checkpoint fires
+// on Close. This is what an external monitor compares to detect tail-truncation.
+func TestCheckpoint_EmitsHeadDigest(t *testing.T) {
+	sqltest.Engines(t, func(t *testing.T, _ sqltest.Open) {
+		dir := t.TempDir()
+		mirror := &checkpointMirror{}
+		rec, err := Open(dir, "audit", mirror)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		ctx := context.Background()
+
+		var logged []Checkpoint
+		var lmu sync.Mutex
+		// every=0 → no ticker; we drive checkpoints via Close (final) + a manual tick.
+		rec.StartCheckpoints(0, func(cp Checkpoint) {
+			lmu.Lock()
+			logged = append(logged, cp)
+			lmu.Unlock()
+		})
+
+		for i := range 7 {
+			if _, err := rec.Append(ctx, sampleRecord("POST /v1/admin/sync")); err != nil {
+				t.Fatalf("append %d: %v", i, err)
+			}
+		}
+		// Close emits the FINAL checkpoint (count=7, head=chain head).
+		if err := rec.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+
+		lmu.Lock()
+		n := len(logged)
+		var lastLogged Checkpoint
+		if n > 0 {
+			lastLogged = logged[n-1]
+		}
+		lmu.Unlock()
+		if n == 0 {
+			t.Fatal("no checkpoint logged (Close should emit a final head digest)")
+		}
+		if lastLogged.Count != 7 {
+			t.Errorf("final checkpoint count = %d, want 7", lastLogged.Count)
+		}
+		if lastLogged.Head == "" || lastLogged.Head == genesisPrevHash {
+			t.Errorf("final checkpoint head not set: %q", lastLogged.Head)
+		}
+		// The independent sink also received the final digest.
+		if cp, ok := mirror.last(); !ok || cp.Count != 7 {
+			t.Errorf("checkpoint sink final = %+v (ok=%v), want count 7", cp, ok)
+		}
+	})
+}
+
+// TestCheckpoint_DoubleStartIsSafe proves a second StartCheckpoints call is
+// ignored (no re-arm, no field/WaitGroup race) — the Red-review robustness fix.
+// Run under -race to catch a regression.
+func TestCheckpoint_DoubleStartIsSafe(t *testing.T) {
+	sqltest.Engines(t, func(t *testing.T, _ sqltest.Open) {
+		dir := t.TempDir()
+		rec, err := Open(dir, "audit", nil)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		rec.StartCheckpoints(time.Hour, func(Checkpoint) {})
+		rec.StartCheckpoints(time.Hour, func(Checkpoint) {}) // second call must be a no-op.
+		// Append + close must not race or hang.
+		if _, err := rec.Append(context.Background(), sampleRecord("POST /v1/admin/sync")); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+		if err := rec.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	})
+}
+
+// TestCheckpoint_CloseSyncsToSink proves the FINAL checkpoint on Close reaches the
+// independent sink SYNCHRONOUSLY (the Red-review durability fix) — the sink has
+// the final count before Close returns, not on a detached goroutine that might
+// not run before process exit.
+func TestCheckpoint_CloseSyncsToSink(t *testing.T) {
+	sqltest.Engines(t, func(t *testing.T, _ sqltest.Open) {
+		dir := t.TempDir()
+		mirror := &checkpointMirror{}
+		rec, err := Open(dir, "audit", mirror)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		rec.StartCheckpoints(0, func(Checkpoint) {}) // no ticker; only the on-close checkpoint.
+		for i := range 4 {
+			if _, err := rec.Append(context.Background(), sampleRecord("POST /v1/admin/sync")); err != nil {
+				t.Fatalf("append %d: %v", i, err)
+			}
+		}
+		if err := rec.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		// Immediately after Close returns (no sleep), the sink MUST already have the
+		// final digest — proving the Close-path write was synchronous.
+		cp, ok := mirror.last()
+		if !ok || cp.Count != 4 {
+			t.Fatalf("sink final checkpoint = %+v (ok=%v), want count 4 synchronously on Close", cp, ok)
+		}
+	})
+}
+
+// TestCheckpoint_CountMonotonicDetectsTruncation demonstrates the DETECTION an
+// external monitor performs: consecutive checkpoints have non-decreasing Count;
+// after a tail truncation the head reported by Head() drops below a prior
+// checkpoint — the signal the o11y alert fires on.
+func TestCheckpoint_CountMonotonicDetectsTruncation(t *testing.T) {
+	sqltest.Engines(t, func(t *testing.T, _ sqltest.Open) {
+		dir := t.TempDir()
+		rec, err := Open(dir, "audit", nil)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		ctx := context.Background()
+		for i := range 10 {
+			if _, err := rec.Append(ctx, sampleRecord("POST /v1/admin/sync")); err != nil {
+				t.Fatalf("append %d: %v", i, err)
+			}
+		}
+		before, _ := rec.Head() // the monitor's last pinned checkpoint count.
+		if before != 10 {
+			t.Fatalf("pre-truncation count = %d, want 10", before)
+		}
+		_ = rec.Close()
+
+		// Attacker truncates the tail (deletes the last 4 records) out of band.
+		tamperOutOfBand(t, dir, `DELETE FROM audit_log WHERE seq >= 6`)
+
+		rec2, err := Open(dir, "audit", nil)
+		if err != nil {
+			t.Fatalf("reopen: %v", err)
+		}
+		defer func() { _ = rec2.Close() }()
+		after, _ := rec2.Head()
+		// The internal chain still verifies (a truncated prefix is self-consistent)…
+		if iv, _ := rec2.Verify(ctx); iv.Verdict != Intact {
+			t.Fatalf("truncated prefix should self-verify, broke at %d", iv.BrokenAt)
+		}
+		// …but the count REGRESSED vs the pinned checkpoint — the truncation signal.
+		if after >= before {
+			t.Fatalf("count did not regress after truncation: before=%d after=%d", before, after)
+		}
+		t.Logf("truncation detected by count regression: %d → %d (chain-internal verify is OK; external anchor catches it)", before, after)
+	})
+}
+
+// tamperOutOfBand opens the SAME store on a SEPARATE connection and runs a
+// mutating statement the audit application itself never issues — modeling an
+// attacker with direct database/file access. The Recorder's own connection is
+// unaffected; Verify then re-reads and must catch the damage.
+func tamperOutOfBand(t *testing.T, dir, stmt string) {
+	t.Helper()
+	// Opened the same way the Recorder itself is: a SQLite store is encrypted at rest,
+	// so a bare sql.Open cannot read it. The modelled adversary is one with database
+	// access AND the key (an insider, or a compromised process) — file access alone
+	// no longer suffices, which is the point of encrypting it. On hanzo-sql it is a
+	// second pool on the chain's schema.
+	db, err := locus.Open(namespace.System(), "audit", dir)
+	if err != nil {
+		t.Fatalf("tamper open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(stmt); err != nil {
+		t.Fatalf("tamper exec %q: %v", stmt, err)
+	}
+}
+
+// A page starts below the chain position it is given and never moves the count,
+// so walking the trail by Before visits every record once, newest first; a query
+// matches action, actor and resource case-insensitively, and its LIKE wildcards
+// match only themselves.
+func TestQuery_KeysetAndSearch(t *testing.T) {
+	sqltest.Engines(t, func(t *testing.T, _ sqltest.Open) {
+		rec, _ := openTemp(t)
+		ctx := context.Background()
+		for i := range 7 {
+			r := sampleRecord(fmt.Sprintf("POST /v1/thing/%d", i))
+			r.Resource.Type = []string{"credit", "org"}[i%2]
+			if _, err := rec.Append(ctx, r); err != nil {
+				t.Fatalf("seed %d: %v", i, err)
+			}
+		}
+		var seen []uint64
+		f := Filter{Limit: 3}
+		for range 5 {
+			rows, total, err := rec.Query(ctx, f)
+			if err != nil || total != 7 {
+				t.Fatalf("page before %d: total %d, %v", f.Before, total, err)
+			}
+			if len(rows) == 0 {
+				break
+			}
+			for _, r := range rows {
+				seen = append(seen, r.Seq)
+			}
+			f.Before = rows[len(rows)-1].Seq
+			if f.Before == 0 {
+				break
+			}
+		}
+		if len(seen) != 7 || !slices.IsSortedFunc(seen, func(a, b uint64) int { return cmp.Compare(b, a) }) {
+			t.Fatalf("a keyset walk visited %v, want every seq once, newest first", seen)
+		}
+		if _, total, err := rec.Query(ctx, Filter{Q: "CREDIT"}); err != nil || total != 4 {
+			t.Fatalf("q=CREDIT matched %d, %v; want 4", total, err)
+		}
+		if _, total, err := rec.Query(ctx, Filter{Q: "%"}); err != nil || total != 0 {
+			t.Fatalf("q=%% matched %d, %v; want 0", total, err)
+		}
+	})
+}
+
+// A walk reads the chain walkPage records at a time and judges it the same way across
+// page boundaries: every record counted, a tampered record past the first page found
+// at its own seq, and each verdict stamped with when the walk finished.
+func TestVerify_WalksAcrossPages(t *testing.T) {
+	sqltest.Engines(t, func(t *testing.T, _ sqltest.Open) {
+		rec, dir := openTemp(t)
+		ctx := context.Background()
+		n := 2*walkPage + 5
+		for i := range n {
+			if _, err := rec.Append(ctx, sampleRecord("GET /v1/admin/orgs")); err != nil {
+				t.Fatalf("append %d: %v", i, err)
+			}
+		}
+		iv, err := rec.Verify(ctx)
+		if err != nil || iv.Verdict != Intact || iv.Count != uint64(n) || iv.BrokenAt != -1 {
+			t.Fatalf("clean chain of %d: %+v, %v", n, iv, err)
+		}
+		if _, err := time.Parse(time.RFC3339, iv.At); err != nil {
+			t.Fatalf("at = %q, want the walk's RFC 3339 time", iv.At)
+		}
+		requireSharedStore(t) // tampers through a second handle while the Recorder holds the store open
+		tamperOutOfBand(t, dir, fmt.Sprintf(`UPDATE audit_log SET actor_sub='attacker' WHERE seq=%d`, walkPage+500))
+		iv, err = rec.Verify(ctx)
+		if err != nil || iv.Verdict != Broken || iv.BrokenAt != int64(walkPage+500) {
+			t.Fatalf("tamper past the first page: %+v, %v", iv, err)
+		}
+	})
+}
+
+// Latest serves the newest full walk and walks again in the background: nothing
+// before a first walk finishes, then an intact verdict over every record, with its time.
+func TestLatest_ServesTheNewestFullWalk(t *testing.T) {
+	sqltest.Engines(t, func(t *testing.T, _ sqltest.Open) {
+		rec, _ := openTemp(t)
+		ctx := context.Background()
+		for i := range 7 {
+			if _, err := rec.Append(ctx, sampleRecord("GET /v1/admin/orgs")); err != nil {
+				t.Fatalf("append %d: %v", i, err)
+			}
+		}
+		var iv *Integrity
+		for deadline := time.Now().Add(10 * time.Second); iv == nil && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+			iv = rec.Latest()
+		}
+		if iv == nil || iv.Verdict != Intact || iv.Count != 7 || iv.At == "" {
+			t.Fatalf("latest = %+v, want an intact walk of 7 records with its time", iv)
+		}
+	})
+}

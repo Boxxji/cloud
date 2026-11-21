@@ -1,0 +1,347 @@
+// Copyright 2025 Hanzo AI Inc. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+
+package tenure
+
+// It exercises the SAME hazards as handoff_test.go, but through the reusable
+// Durable a per-org store actually wires, over a plaintext local file (nil
+// cipher).
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/hanzoai/cloud/sdk/locus"
+	"github.com/hanzoai/sqlite"
+	"github.com/hanzoai/vfs/replica"
+)
+
+// testDSN opens a WAL SQLite file with synchronous(OFF): the durability under test is
+// the fenced ship to the object store, not the local fsync, and OFF keeps the suite
+// off this box's pathologically slow fsync. Production opens through cek/replica with
+// synchronous(NORMAL); the snapshot (checkpoint + file copy) is identical either way.
+// The driver builds it: the two backends spell a pragma differently in a DSN and
+// each ignores the other's spelling silently, so writing one by hand gets the
+// profile on one build and the defaults on the other — here, the fsync this
+// deliberately avoids.
+func testDSN(path string) string {
+	return sqlite.PragmaDSN(path, []sqlite.Pragma{
+		{Name: "journal_mode", Value: "WAL"},
+		{Name: "synchronous", Value: "OFF"},
+		{Name: "busy_timeout", Value: "5000"},
+	})
+}
+
+// durablePod models one replica opening an org DB through the Durable gate: its own
+// local SQLite file, a Durable bound to the shared object store cs, under a fixed
+// membership view. (stubView, newFakeCondStore, electedOwnerID live in fence_test.go.)
+type durablePod struct {
+	id string
+	d  *Durable
+	db *sql.DB
+}
+
+func newDurablePod(t *testing.T, cs replica.ConditionalStore, id string, set []Member, orgID, dbKey string) *durablePod {
+	t.Helper()
+	dy := NewDurability(cs, stubView{id: id, set: set}, nil) // nil cipher: plaintext local
+	d := dy.For(testNS(orgID), "research", dbKey, filepath.Join(t.TempDir(), "research.db"))
+	return &durablePod{id: id, d: d}
+}
+
+// open opens the local handle AFTER Hydrate (so it sees the hydrated file), pins it
+// to one connection (as the real store does), and binds it for Sync's checkpoint.
+func (p *durablePod) open(t *testing.T) {
+	t.Helper()
+	db, err := sql.Open("sqlite", testDSN(p.d.dbPath))
+	if err != nil {
+		t.Fatalf("%s open: %v", p.id, err)
+	}
+	locus.Single(db)
+	if err := db.Ping(); err != nil {
+		t.Fatalf("%s ping: %v", p.id, err)
+	}
+	p.db = db
+	t.Cleanup(func() { _ = db.Close() })
+	p.d.Bind(db)
+	ensureKV(t, db)
+}
+
+func ensureKV(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT)`); err != nil {
+		t.Fatalf("ensure kv: %v", err)
+	}
+}
+
+func putKV(t *testing.T, db *sql.DB, k, v string) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT OR REPLACE INTO kv(k,v) VALUES(?,?)`, k, v); err != nil {
+		t.Fatalf("put %s: %v", k, err)
+	}
+}
+
+func hasKV(t *testing.T, db *sql.DB, k string) bool {
+	t.Helper()
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM kv WHERE k=?`, k).Scan(&n); err != nil {
+		t.Fatalf("has %s: %v", k, err)
+	}
+	return n == 1
+}
+
+// durableValue restores the durable object into a scratch DB and reads kv[k]; ok is
+// false when the row is absent. It reads through a fresh FencedStore over the same
+// object store and opens the database bytes it holds — the exact path a successor
+// takes, so it proves what a successor would actually see.
+func durableValue(t *testing.T, ctx context.Context, cs replica.ConditionalStore, dbKey, k string) (string, bool) {
+	t.Helper()
+	payload, _, err := replica.NewFencedStore(cs).Get(ctx, dbKey)
+	if err != nil {
+		t.Fatalf("read durable object: %v", err)
+	}
+	scratch := filepath.Join(t.TempDir(), "scratch.db")
+	if err := replica.RestoreFile(scratch, payload); err != nil {
+		t.Fatalf("restore scratch: %v", err)
+	}
+	sd, err := replica.OpenSQLite(scratch)
+	if err != nil {
+		t.Fatalf("open scratch: %v", err)
+	}
+	defer sd.Close()
+	var v string
+	switch err := sd.DB().QueryRowContext(ctx, `SELECT v FROM kv WHERE k=?`, k).Scan(&v); {
+	case err == sql.ErrNoRows:
+		return "", false
+	case err != nil:
+		t.Fatalf("scratch query %s: %v", k, err)
+	}
+	return v, true
+}
+
+// TestDurableContentionOneWriterOtherDefers is the direct outage proof: two replicas
+// with the SAME converged membership open the SAME org store. Exactly one is the
+// HRW-elected writer; the other DEFERS (its write fails closed). BOTH open without a
+// "store unavailable" error, and the durable object only ever holds the owner's write
+// — no split-brain.
+func TestDurableContentionOneWriterOtherDefers(t *testing.T) {
+	ctx := context.Background()
+	cs := newFakeCondStore()
+	const orgID = "acme"
+	dbKey := replica.DBPath(orgID, "", "research")
+	set := []Member{{ID: "pod-a"}, {ID: "pod-b"}}
+	ownerID := electedOwnerID(orgID, set)
+	otherID := "pod-a"
+	if otherID == ownerID {
+		otherID = "pod-b"
+	}
+
+	owner := newDurablePod(t, cs, ownerID, set, orgID, dbKey)
+	other := newDurablePod(t, cs, otherID, set, orgID, dbKey)
+
+	// Both hydrate WITHOUT error — the store is available on both replicas (the exact
+	// regression: a second replica must not break the store).
+	if err := owner.d.Hydrate(ctx); err != nil {
+		t.Fatalf("owner hydrate: %v", err)
+	}
+	if err := other.d.Hydrate(ctx); err != nil {
+		t.Fatalf("second replica hydrate returned an error (store must stay available): %v", err)
+	}
+	if !owner.d.Owned() {
+		t.Fatal("the HRW-elected owner did not acquire the writer lease")
+	}
+	if other.d.Owned() {
+		t.Fatal("the non-owner acquired the lease too — split-brain (two writers)")
+	}
+
+	owner.open(t)
+	other.open(t)
+
+	// The owner writes and ships; the ship is acknowledged.
+	putKV(t, owner.db, "k1", "owner-wrote")
+	if acked, err := owner.d.Sync(ctx); err != nil || !acked {
+		t.Fatalf("owner sync: acked=%v err=%v, want true/nil", acked, err)
+	}
+
+	// The non-owner's write is refused at the gate — never a second writer to the
+	// same durable object.
+	putKV(t, other.db, "k1", "non-owner-wrote")
+	acked, err := other.d.Sync(ctx)
+	if acked || !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("non-owner sync: acked=%v err=%v, want false/ErrNotOwner", acked, err)
+	}
+
+	// The durable object holds ONLY the owner's write.
+	if v, ok := durableValue(t, ctx, cs, dbKey, "k1"); !ok || v != "owner-wrote" {
+		t.Fatalf("durable k1 = %q,%v, want \"owner-wrote\",true (non-owner must not have written)", v, ok)
+	}
+}
+
+// TestDurableTakeoverHydratesNoLostWriteFencesDeposed is the rolling-handoff proof:
+// a fresh successor becomes owner, HYDRATES the predecessor's shipped snapshot (no
+// lost write), serves on it, and advances the round; the deposed predecessor that
+// keeps running is FENCED (its stale-round ship is rejected, never acknowledged,
+// never reaches the durable state).
+func TestDurableTakeoverHydratesNoLostWriteFencesDeposed(t *testing.T) {
+	ctx := context.Background()
+	cs := newFakeCondStore()
+	const orgID = "acme"
+	dbKey := replica.DBPath(orgID, "", "research")
+
+	// Old owner: sole-member view, claims round 1, writes k1, ships.
+	old := newDurablePod(t, cs, "pod-old", []Member{{ID: "pod-old"}}, orgID, dbKey)
+	if err := old.d.Hydrate(ctx); err != nil {
+		t.Fatalf("old hydrate: %v", err)
+	}
+	old.open(t)
+	putKV(t, old.db, "k1", "v1")
+	if acked, err := old.d.Sync(ctx); err != nil || !acked {
+		t.Fatalf("old sync k1: acked=%v err=%v", acked, err)
+	}
+	oldRound := old.d.lease.Round
+
+	// Fresh successor boots (empty local dir), becomes owner, hydrates the shipped
+	// snapshot and claims a strictly higher round.
+	next := newDurablePod(t, cs, "pod-new", []Member{{ID: "pod-new"}}, orgID, dbKey)
+	if err := next.d.Hydrate(ctx); err != nil {
+		t.Fatalf("successor hydrate: %v", err)
+	}
+	if !next.d.Owned() {
+		t.Fatal("successor did not acquire the lease")
+	}
+	if next.d.lease.Round <= oldRound {
+		t.Fatalf("successor round %d not strictly > predecessor %d", next.d.lease.Round, oldRound)
+	}
+	next.open(t)
+
+	// The successor SERVES on the hydrated state: k1 survived the handoff.
+	if !hasKV(t, next.db, "k1") {
+		t.Fatal("successor lost the pre-handoff write k1 (hydrate-on-open failed)")
+	}
+
+	// Successor writes k2 and ships — durable now carries k1 AND k2.
+	putKV(t, next.db, "k2", "v2")
+	if acked, err := next.d.Sync(ctx); err != nil || !acked {
+		t.Fatalf("successor sync k2: acked=%v err=%v", acked, err)
+	}
+
+	// The DEPOSED old owner keeps running and ships at its STALE round: fenced.
+	putKV(t, old.db, "k-stale", "should-be-fenced")
+	acked, err := old.d.Sync(ctx)
+	if err != nil {
+		t.Fatalf("deposed old sync unexpected hard error: %v", err)
+	}
+	if acked {
+		t.Fatal("deposed writer ACKED a fenced ship (split-brain double-write)")
+	}
+	if old.d.Owned() {
+		t.Fatal("deposed writer still believes it holds the lease")
+	}
+
+	// Durable state: k1 + k2 present, the deposed writer's k-stale never landed.
+	if v, ok := durableValue(t, ctx, cs, dbKey, "k1"); !ok || v != "v1" {
+		t.Fatalf("durable k1 = %q,%v, want v1,true", v, ok)
+	}
+	if v, ok := durableValue(t, ctx, cs, dbKey, "k2"); !ok || v != "v2" {
+		t.Fatalf("durable k2 = %q,%v, want v2,true", v, ok)
+	}
+	if v, ok := durableValue(t, ctx, cs, dbKey, "k-stale"); ok {
+		t.Fatalf("deposed writer's k-stale leaked into durable state as %q", v)
+	}
+}
+
+// TestDurableShipsTheDatabaseAlone covers what a successor needs to read an
+// encrypted store: the database bytes, and nothing else. A database's key is
+// DERIVED from the deployment's master and the namespace that owns it, so there
+// is no key material to travel with the file — the payload is the file.
+func TestDurableShipsTheDatabaseAlone(t *testing.T) {
+	ctx := context.Background()
+	cs := newFakeCondStore()
+	const orgID = "acme"
+	dbKey := replica.DBPath(orgID, "", "research")
+
+	old := newDurablePod(t, cs, "pod-old", []Member{{ID: "pod-old"}}, orgID, dbKey)
+	if err := old.d.Hydrate(ctx); err != nil {
+		t.Fatalf("old hydrate: %v", err)
+	}
+	old.open(t)
+	putKV(t, old.db, "k1", "v1")
+	if acked, err := old.d.Sync(ctx); err != nil || !acked {
+		t.Fatalf("old sync: acked=%v err=%v", acked, err)
+	}
+
+	// A fresh successor hydrates and has the row.
+	next := newDurablePod(t, cs, "pod-new", []Member{{ID: "pod-new"}}, orgID, dbKey)
+	if err := next.d.Hydrate(ctx); err != nil {
+		t.Fatalf("successor hydrate: %v", err)
+	}
+	next.open(t)
+	if !hasKV(t, next.db, "k1") {
+		t.Fatal("successor lost k1 across the ship")
+	}
+}
+
+// TestDurableRestoreIntoFreshNestedDir: a successor's orgs/<slug>/ directory does not
+// exist yet, so restore must create the parent — otherwise the write fails and hydrate
+// silently degrades to an empty store. (The flat-tempdir test above cannot catch this.)
+func TestDurableRestoreIntoFreshNestedDir(t *testing.T) {
+	ctx := context.Background()
+	cs := newFakeCondStore()
+	const orgID = "acme"
+	dbKey := replica.DBPath(orgID, "", "research")
+
+	old := newDurablePod(t, cs, "pod-old", []Member{{ID: "pod-old"}}, orgID, dbKey)
+	if err := old.d.Hydrate(ctx); err != nil {
+		t.Fatalf("old hydrate: %v", err)
+	}
+	old.open(t)
+	putKV(t, old.db, "k1", "v1")
+	if acked, err := old.d.Sync(ctx); err != nil || !acked {
+		t.Fatalf("old sync: acked=%v err=%v", acked, err)
+	}
+
+	// Successor DB path lives under a NESTED dir that does not exist yet.
+	succPath := filepath.Join(t.TempDir(), "orgs", orgID, "research.db")
+	succ := NewDurability(cs, stubView{id: "pod-new", set: []Member{{ID: "pod-new"}}}, nil).For(testNS(orgID), "research", dbKey, succPath)
+	if err := succ.Hydrate(ctx); err != nil {
+		t.Fatalf("hydrate into a fresh nested dir must succeed (restore mkdirs): %v", err)
+	}
+	if _, err := os.Stat(succPath); err != nil {
+		t.Fatalf("database not restored into the fresh dir: %v", err)
+	}
+}
+
+// TestDurableStoreUnreachableDegradesReadOnly proves the availability posture: when
+// the object store is unreachable the store still OPENS (never "unavailable"), reads
+// serve off local, and writes fail CLOSED (no unfenced write).
+func TestDurableStoreUnreachableDegradesReadOnly(t *testing.T) {
+	ctx := context.Background()
+	cs := newFakeCondStore()
+	cs.failAll = fmt.Errorf("object store unreachable")
+	const orgID = "acme"
+	dbKey := replica.DBPath(orgID, "", "research")
+
+	p := newDurablePod(t, cs, "pod-a", []Member{{ID: "pod-a"}}, orgID, dbKey)
+
+	// Hydrate surfaces the store error (for the caller to log) but does NOT prevent
+	// opening the local handle.
+	if err := p.d.Hydrate(ctx); err == nil {
+		t.Fatal("expected the unreachable-store error to surface for logging")
+	}
+	p.open(t) // must succeed regardless
+	if p.d.Owned() {
+		t.Fatal("must not hold the lease when the store is unreachable")
+	}
+
+	// A write fails closed — never an unfenced ship.
+	putKV(t, p.db, "k1", "v1")
+	if acked, err := p.d.Sync(ctx); acked || err == nil {
+		t.Fatalf("unreachable-store write must fail closed: acked=%v err=%v", acked, err)
+	}
+}

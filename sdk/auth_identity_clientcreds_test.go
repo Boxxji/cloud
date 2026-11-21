@@ -1,0 +1,232 @@
+package cloud
+
+// The client_credentials principal: an application authenticating AS ITSELF.
+//
+// homeOrg resolves such a token to its `owner` — the application's own organization —
+// because a machine cannot choose an org the way a human choosing an app can. That is
+// the same reasoning the KMS branch already rests on; these tests exist because the
+// recognition is by SHAPE rather than by a derivable audience, so every part of the
+// shape needs a test that fails when it is loosened.
+//
+// The dangerous direction is second-to-last: a HUMAN with no `orgs` must still resolve
+// nothing. That is the estate rule, it is what makes an org-less request fail closed
+// everywhere, and widening machine recognition must never reach it.
+
+import (
+	"crypto/rand"
+	"crypto/rsa"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/hanzoai/authz"
+)
+
+// machineClaims builds a client_credentials token as IAM mints one: the client is the
+// subject ("<org>/<app>"), the sole audience, and the authorized party — and there is
+// no membership set, which is correct for a machine rather than a degraded token.
+// Spelled the way IAM spells one. `Type` is the claim the client_credentials
+// grant stamps and a person's token never carries; a fixture without it is a
+// token shape no issuer mints, and a reader validated against it proves nothing.
+func machineClaims(app, owner string, exp time.Time) idClaims {
+	c := idClaims{Owner: owner, Organization: owner, Azp: app, Type: authz.Program,
+		Issuer:    testIssuer,
+		Subject:   "admin/" + app,
+		Audience:  jwt.ClaimStrings{app},
+		ExpiresAt: jwt.NewNumericDate(exp),
+		IssuedAt:  jwt.NewNumericDate(time.Now())}
+	return c
+}
+
+func TestClientCredentialsPrincipalResolvesItsOwnerOrg(t *testing.T) {
+	c := machineClaims("hanzo-studio", "hanzo", time.Now().Add(time.Hour))
+
+	if !appPrincipal(&c) {
+		t.Fatal("a token whose client is its own subject and sole audience is a machine principal")
+	}
+	if got := c.homeOrg(); got != "hanzo" {
+		t.Fatalf("homeOrg=%q, want hanzo — a machine's org is its owner, which it cannot choose", got)
+	}
+}
+
+// A machine token carries an owner and no `orgs`, so Home() would return "" and
+// SanitizeIdentity would mint X-User-Id with no X-Org-Id, which every org-scoped gate
+// refuses. A machine token is therefore not org-less: its owner is its home org.
+func TestMachineTokenWithNoOrgsIsNotOrgless(t *testing.T) {
+	c := machineClaims("hanzo-studio", "hanzo", time.Now().Add(time.Hour))
+	if len(c.Orgs) != 0 {
+		t.Fatal("precondition: a machine token carries no membership set")
+	}
+	if c.Claims.Home() != "" {
+		t.Fatal("precondition: the estate rule alone resolves nothing here")
+	}
+	if c.homeOrg() == "" {
+		t.Fatal("an org-less machine principal reaches every org gate as anonymous and is refused")
+	}
+}
+
+// appPrincipal is the same recognition, narrowed twice, and each narrowing is the
+// predicate standing on its own rather than leaning on a caller's ordering. homeOrg
+// checks subjectOrg before it asks this, so within homeOrg the first clause is
+// invisible; the boundary asks it directly, and there it is the whole rule.
+func TestAppPrincipalNarrowings(t *testing.T) {
+	exp := time.Now().Add(time.Hour)
+
+	t.Run("an API key is a person's credential, never an application", func(t *testing.T) {
+		c := machineClaims("hanzo-kms", "hanzo", exp)
+		c.subjectOrg = "hanzo" // resolved from an sk- key's own IAM user row
+		if appPrincipal(&c) {
+			t.Fatal("a key read as an application — every member of the org inherits the machine identity's reach")
+		}
+	})
+
+	// The two kinds are exclusive from BOTH sides, and a membership set does not
+	// move a token between them.
+	t.Run("a program in the reserved org is never an operator", func(t *testing.T) {
+		c := machineClaims("hanzo-kms", "admin", exp)
+		c.Orgs = []authz.Membership{{Org: authz.AdminOrg, Role: authz.Admin}}
+		if !appPrincipal(&c) {
+			t.Fatal("IAM signed this as a program and the membership set outvoted the claim")
+		}
+		if sudo(&c.Claims) {
+			t.Fatal("one principal was both platform sudo and an application — the two kinds must never coincide")
+		}
+	})
+
+	t.Run("a person in the reserved org is the operator", func(t *testing.T) {
+		c := machineClaims("hanzo-console", "admin", exp)
+		c.Type = "" // a person's token carries no kind
+		c.Subject = "admin/z"
+		c.Orgs = []authz.Membership{{Org: authz.AdminOrg, Role: authz.Admin}}
+		if !sudo(&c.Claims) {
+			t.Fatal("precondition: a person whose own org is the reserved one is the operator this contrasts against")
+		}
+		if appPrincipal(&c) {
+			t.Fatal("a person read as an application")
+		}
+	})
+}
+
+// A HUMAN with no membership set still resolves nothing. This is the rule the machine
+// branches must never reach: a human's org follows their token, and a token that
+// proves no membership proves no org.
+func TestHumanWithoutOrgsStillFailsClosed(t *testing.T) {
+	c := idClaims{Owner: "hanzo", Azp: "hanzo-console",
+		Issuer:    testIssuer,
+		Subject:   "u-alice", // a USER, not "<org>/<app>"
+		Audience:  jwt.ClaimStrings{"hanzo-console"},
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour))}
+
+	if appPrincipal(&c) {
+		t.Fatal("a human subject must never be read as a machine, whatever else matches")
+	}
+	if got := c.homeOrg(); got != "" {
+		t.Fatalf("homeOrg=%q, want empty — falling back to owner is the mis-attribution this prevents", got)
+	}
+}
+
+// A MULTI-AUDIENCE MACHINE TOKEN IS STILL A MACHINE. The reading this replaces
+// required the sole audience to equal azp, so a program that named what its token
+// was for — the `resource` parameter IAM's client_credentials grant accepts — was
+// refused for saying so. The claim does not care what the token is addressed to.
+func TestAProgramIsOneWhateverItsTokenIsAddressedTo(t *testing.T) {
+	exp := time.Now().Add(time.Hour)
+	for _, aud := range []jwt.ClaimStrings{
+		{"some-other-app"},
+		{"hanzo-studio", "hanzo-console"},
+		nil,
+	} {
+		c := machineClaims("hanzo-studio", "hanzo", exp)
+		c.Audience = aud
+		if !appPrincipal(&c) {
+			t.Fatalf("audience %v: a program was refused for what its token names", aud)
+		}
+		if got := c.homeOrg(); got != "hanzo" {
+			t.Fatalf("audience %v: homeOrg=%q, want hanzo", aud, got)
+		}
+	}
+}
+
+// THE SHAPE ALONE IS NOT THE PROOF.
+//
+// Reading that as an application handed it the org off `owner` and a build
+// endpoint's whole registry namespace.
+//
+// IAM signs the kind, so the answer no longer depends on a shape anyone can
+// arrange.
+func TestATokenShapedLikeAMachineIsNotOneWithoutTheClaim(t *testing.T) {
+	c := machineClaims("hanzo-console", "hanzo", time.Now().Add(time.Hour))
+	c.Subject = "acme/hanzo-console"
+	c.Orgs = nil
+	c.Type = "" // the one difference: IAM never signed this as a program
+
+	if appPrincipal(&c) {
+		t.Fatal("a token IAM never called a program was admitted as one on shape alone")
+	}
+	if got := c.homeOrg(); got != "" {
+		t.Fatalf("homeOrg=%q, want empty — nothing may be resolved for it", got)
+	}
+}
+
+// AN APPLICATION ACTS IN AN ORG THAT GRANTED IT MEMBERSHIP, and only there.
+//
+// IAM signs those grants into the machine token's `orgs`. The leaf's EffectiveOrg
+// reads a selection of the FIRST granted org as "home, not switched" — right for a
+// person, whose first membership is their anchor, and wrong for an application,
+// whose anchor is its own org. Honouring only `switched` left the first org to
+// grant an application membership the one org it could never act in.
+func TestAnApplicationActsInEveryOrgThatGrantedIt(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("genkey: %v", err)
+	}
+	jwks := jwksServer(t, &key.PublicKey)
+	v := newIdentityValidator(testIssuer, jwks.URL, 0)
+
+	c := machineClaims("hanzo-visor", "hanzo", time.Now().Add(time.Hour))
+	c.Orgs = []authz.Membership{{Org: "acme", Role: authz.Member}, {Org: "beta", Role: authz.Member}}
+	tok := signWith(t, key, c)
+
+	for _, tc := range []struct{ selected, want string }{
+		{"acme", "acme"},    // the first grant — the case the leaf reads as home
+		{"beta", "beta"},    // any later grant
+		{"", "hanzo"},       // no selection: the application's own org
+		{"hanzo", "hanzo"},  // its own org, named
+		{"victim", "hanzo"}, // an org that granted nothing: discarded, never honoured
+	} {
+		app, got := newIdentityApp(t, v)
+		probe(t, app, func(r *http.Request) {
+			r.Header.Set("Authorization", "Bearer "+tok)
+			if tc.selected != "" {
+				r.Header.Set("X-Org-Id", tc.selected)
+			}
+		})
+		if got.org != tc.want {
+			t.Errorf("selected %q: acted in %q, want %q", tc.selected, got.org, tc.want)
+		}
+		if got.admin || got.orgAdmin {
+			t.Errorf("selected %q: an application gained an admin scope (admin=%v orgAdmin=%v)", tc.selected, got.admin, got.orgAdmin)
+		}
+	}
+
+	// A person's first membership IS their anchor, so the same rule changes
+	// nothing for them: home selected is home, a foreign org is discarded.
+	person := tokenClaims("hanzo-console", "acme", "a@acme.test", false, time.Now().Add(time.Hour))
+	person.Orgs = append(person.Orgs, authz.Membership{Org: "beta", Role: authz.Member})
+	ptok := signWith(t, key, person)
+	for _, tc := range []struct{ selected, want string }{
+		{"acme", "acme"}, {"beta", "beta"}, {"", "acme"}, {"victim", "acme"},
+	} {
+		app, got := newIdentityApp(t, v)
+		probe(t, app, func(r *http.Request) {
+			r.Header.Set("Authorization", "Bearer "+ptok)
+			if tc.selected != "" {
+				r.Header.Set("X-Org-Id", tc.selected)
+			}
+		})
+		if got.org != tc.want {
+			t.Errorf("person selected %q: acted in %q, want %q", tc.selected, got.org, tc.want)
+		}
+	}
+}
