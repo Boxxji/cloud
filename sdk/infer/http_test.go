@@ -332,7 +332,6 @@ func TestAIHTTP_UnparsedCallRefused(t *testing.T) {
 	}
 }
 
-
 // TestUnparsedMistralMarker asserts unparsed returns the mistral marker when it
 // appears anywhere in content.
 func TestUnparsedMistralMarker(t *testing.T) {
@@ -686,7 +685,6 @@ func TestAIHTTP_StripsChannelReasoning(t *testing.T) {
 	}
 }
 
-
 // TestAIHTTP_ReasoningDoesNotEatTheVisibleBudget pins issue #782's second half:
 // hidden reasoning tokens must not consume the visible max_tokens budget so the
 // visible answer is cut off mid-sentence. The fake upstream enforces the cap it
@@ -717,8 +715,8 @@ func TestAIHTTP_ReasoningDoesNotEatTheVisibleBudget(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"id": "chatcmpl-x", "object": "chat.completion", "model": "enso-auto",
 			"choices": []map[string]any{{
-				"index": 0,
-				"message": map[string]string{"role": "assistant", "content": content},
+				"index":         0,
+				"message":       map[string]string{"role": "assistant", "content": content},
 				"finish_reason": "length",
 			}},
 		})
@@ -743,7 +741,6 @@ func TestAIHTTP_ReasoningDoesNotEatTheVisibleBudget(t *testing.T) {
 	}
 }
 
-
 // TestAIHTTP_NoReasoningUnchanged is the control: an ordinary completion with no
 // reasoning passes through exactly as before, with empty Reasoning.
 func TestAIHTTP_NoReasoningUnchanged(t *testing.T) {
@@ -752,8 +749,8 @@ func TestAIHTTP_NoReasoningUnchanged(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"id": "chatcmpl-x", "object": "chat.completion", "model": "enso-auto",
 			"choices": []map[string]any{{
-				"index": 0,
-				"message": map[string]string{"role": "assistant", "content": "plain answer"},
+				"index":         0,
+				"message":       map[string]string{"role": "assistant", "content": "plain answer"},
 				"finish_reason": "stop",
 			}},
 		})
@@ -772,7 +769,6 @@ func TestAIHTTP_NoReasoningUnchanged(t *testing.T) {
 		t.Errorf("reasoning should be empty with no channel markup, got %q", got.Reasoning)
 	}
 }
-
 
 // TestAIHTTP_StreamingStripsChannelReasoning proves streaming and non-streaming
 // agree on the stripped content: a streamed channel/thought block is removed from
@@ -816,4 +812,3 @@ func TestAIHTTP_StreamingStripsChannelReasoning(t *testing.T) {
 		t.Errorf("stream Reasoning: got %q want thinking...", resp.Reasoning)
 	}
 }
-

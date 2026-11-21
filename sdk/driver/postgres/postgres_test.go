@@ -13,10 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hanzoai/cloud/sdk/driver/postgres"
-	"github.com/hanzoai/cloud/sdk/sqltest"
 	"github.com/hanzoai/cloud/sdk/dialect"
+	"github.com/hanzoai/cloud/sdk/driver/postgres"
 	"github.com/hanzoai/cloud/sdk/locus"
+	"github.com/hanzoai/cloud/sdk/sqltest"
 	"github.com/hanzoai/namespace"
 )
 

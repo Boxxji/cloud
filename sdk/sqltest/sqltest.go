@@ -21,9 +21,9 @@ import (
 	// Keys the test binary: cek opens no SQLite file without a master, and a test
 	// process has no KMS.
 	"github.com/hanzoai/cloud/sdk/driver/postgres"
-	"github.com/hanzoai/cloud/sdk/sqlcheck"
 	_ "github.com/hanzoai/cloud/sdk/kit/master"
 	"github.com/hanzoai/cloud/sdk/locus"
+	"github.com/hanzoai/cloud/sdk/sqlcheck"
 	"github.com/hanzoai/namespace"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/stdlib"

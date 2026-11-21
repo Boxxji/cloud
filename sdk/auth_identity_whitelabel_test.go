@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hanzoai/cloud/sdk/brand"
 	"github.com/hanzoai/authz/edge"
+	"github.com/hanzoai/cloud/sdk/brand"
 )
 
 // TestValidate_FailSecureOnEmptyTrustSet proves I2: a validator whose resolved

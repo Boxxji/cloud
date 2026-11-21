@@ -13,9 +13,9 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 
-	_ "github.com/hanzoai/cloud/sdk/driver/kv"
 	"github.com/hanzoai/cloud/sdk/coord"
 	"github.com/hanzoai/cloud/sdk/coord/coordtest"
+	_ "github.com/hanzoai/cloud/sdk/driver/kv"
 )
 
 // KV starts a Valkey server for one test and answers its KV_URL. A machine without

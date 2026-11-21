@@ -33,6 +33,7 @@ package cloud
 // "we authorize NOTHING here". They stay distinguishable values.
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -147,6 +148,10 @@ var paidReads = []string{
 	"/v1/websearch/search", // one debit per answer a bought engine served (apps/websearch/meter.go).
 	"/v1/s3/",              // the guard meters every request it wraps (apps/s3/s3.go); the probe is outside it.
 }
+
+// PaidReads lists the reads that are the paid unit of work: the roots whose GET
+// spends, and so asks for standing, where every other read is free.
+func PaidReads() []string { return slices.Clone(paidReads) }
 
 // DefaultPrice is what ONE invocation of the operation (method, path) costs.
 //

@@ -51,6 +51,14 @@ make hooks    # git config core.hooksPath .githooks (public-only pre-push guard)
 4. **Fail-Closed External Integrations**: Optional sibling services (`S3_*`, `HANZO_DNS_URL`, `CODE_EXEC_UPSTREAM`, `CLOUD_AI_ZAP_ADDR`) report 503 clearly when unconfigured rather than faking success.
 5. **Public-Only Repository Guard**: `.githooks/pre-push` enforces that `github.com/hanzoai/cloud` carries zero commits from non-public remotes and zero non-public Go module imports (`Apache-2.0 OR MIT`).
 
+## sdk: the shared framework
+
+`sdk/` (package `cloud`, import `github.com/hanzoai/cloud/sdk`) is the framework every app is built on: the identity boundary, the op-invoke rule, metering, audit, the per-org stores, `Plugin`/`Router`/`Deps`. It names an interface for each fact a host supplies and ships a local default; the host registers its answers once, at start, through `cloud.SetHooks`, and a process that registers nothing is a standalone process with no host. The private build imports this package: one framework, one source.
+
+Beside it: `sdk/driver/{postgres,kv,s3}` (the hanzo-sql, KV and object-store backends; `postgres.Declare` names the subsystems that live on hanzo-sql), and the test kits `sdk/sqltest`, `sdk/sqlcheck`, `sdk/driver/kv/kvtest`, `sdk/coord/coordtest`. Tests that exercise a billing ledger, the private app registry or the private host live with those.
+
+The module builds with no credentials: `GOENV=off GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org GOFLAGS=-mod=readonly go build ./...` is the first step of CI, so a dependency the public proxy does not serve fails there.
+
 ## Apps: one source each
 
 An app under `apps/<name>` imports zip, the standard library and public modules, and nothing of its host: not `github.com/hanzoai/cloud` itself and not another of this repo's packages (`apps/imports_test.go` fails the build on one). It exports `Mount(app *zip.App, ...) error`, taking the router and exactly what it reads from its host, and `apps.Wire()` adapts `cloud.Deps` to that. An app written this way mounts unchanged in any host that hands it those values, which is how the private build runs the same source.
