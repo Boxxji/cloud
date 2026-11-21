@@ -21,7 +21,6 @@ require (
 	github.com/hanzoai/money v0.2.5
 	github.com/hanzoai/namespace v1.2.0
 	github.com/hanzoai/orm v0.6.45
-	github.com/hanzoai/plans v1.10.1
 	github.com/hanzoai/sqlite v0.5.10
 	github.com/hanzoai/tasks v1.53.11
 	github.com/hanzoai/vfs v0.6.6
