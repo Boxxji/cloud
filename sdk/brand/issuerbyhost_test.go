@@ -28,3 +28,36 @@ func TestIssuerByHostCoversEveryBrand(t *testing.T) {
 		}
 	}
 }
+
+// During an issuer move a brand has more than one issuer: every one names the brand,
+// none is minted under by default, and an organization's own issuer (one path segment
+// under a platform origin) is never one.
+func TestABrandsIssuersDuringAMove(t *testing.T) {
+	for _, iss := range []string{"https://hanzo.id", "https://hanzo.ai", "https://hanzo.ai/"} {
+		if id, ok := ForIssuer(iss); !ok || id != "hanzo" {
+			t.Errorf("ForIssuer(%q) = %q, %v; want hanzo", iss, id, ok)
+		}
+	}
+	for _, iss := range []string{"https://hanzo.ai/acme", "https://hanzo.ai/acme/", "https://hanzo.ai.evil.test", "http://hanzo.ai"} {
+		if id, ok := ForIssuer(iss); ok {
+			t.Errorf("ForIssuer(%q) = %q: an organization's issuer or a lookalike named a platform brand", iss, id)
+		}
+	}
+	if got := Siblings("https://hanzo.id"); len(got) != 1 || got[0] != "https://hanzo.ai" {
+		t.Errorf("Siblings(hanzo.id) = %v", got)
+	}
+	if got := Siblings("https://hanzo.ai"); len(got) != 1 || got[0] != "https://hanzo.id" {
+		t.Errorf("Siblings(hanzo.ai) = %v", got)
+	}
+	if got := Siblings("https://lux.id"); len(got) != 0 {
+		t.Errorf("a brand with one issuer has siblings: %v", got)
+	}
+	if got := IssuerFor("hanzo"); got != "https://hanzo.id" {
+		t.Errorf("a brand mints under %q: the move never changes what is minted here", got)
+	}
+	for host, iss := range IssuerByHost() {
+		if iss == "https://hanzo.ai" {
+			t.Errorf("%s mints under the new issuer before the move", host)
+		}
+	}
+}

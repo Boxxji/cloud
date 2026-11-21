@@ -17,6 +17,13 @@ type Info struct {
 	// IAMIssuer is the OIDC issuer (JWKS source) for this brand — the value the
 	// JWT `iss` claim must equal and whose /v1/iam/.well-known/jwks signs tokens.
 	IAMIssuer string
+	// AlsoIssuers are further issuers whose tokens are this brand's too, for the
+	// length of an issuer move: a verifier trusts every one of them, a minter mints
+	// only under the one it is configured with (IAMIssuer / IAM_ISSUER). Each is
+	// matched EXACTLY, and an organization's own issuer, which sits one path
+	// segment under a platform origin, is never one of them. Empty once the move is
+	// over.
+	AlsoIssuers []string
 	// Domain is the brand's primary marketing/site domain (for response scoping
 	// and base-URL derivation, e.g. api.<Domain>).
 	Domain string
@@ -131,7 +138,7 @@ type Info struct {
 // every principal — SuperAdmin would 403 platform-wide (fail-secure, but
 // broken). lux/zoo/pars already correctly point at their own .id issuers.
 var brands = map[string]Info{
-	"hanzo": {ID: "hanzo", IAMIssuer: "https://hanzo.id", Domain: "hanzo.ai", AltDomains: []string{"hanzo.cloud", "hanzo.app"}, Console: "platform.hanzo.ai",
+	"hanzo": {ID: "hanzo", IAMIssuer: "https://hanzo.id", AlsoIssuers: []string{"https://hanzo.ai"}, Domain: "hanzo.ai", AltDomains: []string{"hanzo.cloud", "hanzo.app"}, Console: "platform.hanzo.ai",
 		SignIn:    []string{"hanzo.ai"},
 		Published: []string{"hanzo.app"},
 		Sites: []string{"hanzo.id", "hanzo.bot", "hanzo.chat", "hanzo.team", "hanzo.build", "hanzo.market",
@@ -228,11 +235,43 @@ func ForIssuer(iss string) (string, bool) {
 		return "", false
 	}
 	for id, b := range brands {
-		if strings.TrimSuffix(strings.ToLower(b.IAMIssuer), "/") == iss {
-			return id, true
+		for _, own := range b.issuers() {
+			if strings.TrimSuffix(strings.ToLower(own), "/") == iss {
+				return id, true
+			}
 		}
 	}
 	return "", false
+}
+
+// issuers is every issuer whose tokens are this brand's: its own and the ones an
+// issuer move adds beside it.
+func (b Info) issuers() []string {
+	if b.IAMIssuer == "" {
+		return nil
+	}
+	return append([]string{b.IAMIssuer}, b.AlsoIssuers...)
+}
+
+// Siblings are the other issuers of the brand that issuer belongs to, for a
+// verifier that holds one provider per issuer (the object store's STS). Empty for
+// an issuer no brand claims.
+func Siblings(issuer string) []string {
+	issuer = strings.TrimSuffix(strings.TrimSpace(issuer), "/")
+	for _, b := range brands {
+		all := b.issuers()
+		if !slices.ContainsFunc(all, func(i string) bool { return strings.TrimSuffix(i, "/") == issuer }) {
+			continue
+		}
+		var out []string
+		for _, i := range all {
+			if strings.TrimSuffix(i, "/") != issuer {
+				out = append(out, i)
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 // Issuer is the ONE resolution of "which IAM signs my token": a pinned value if
@@ -388,9 +427,7 @@ func Display(id string) string {
 func Issuers() []string {
 	out := make([]string, 0, len(brands))
 	for _, b := range brands {
-		if b.IAMIssuer != "" {
-			out = append(out, b.IAMIssuer)
-		}
+		out = append(out, b.issuers()...)
 	}
 	return out
 }
