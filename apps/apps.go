@@ -17,13 +17,19 @@ package apps
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
+	"path/filepath"
 
 	luxlog "github.com/luxfi/log"
 	"github.com/zap-proto/zip"
 
 	"github.com/hanzoai/cloud"
 	"github.com/hanzoai/cloud/apps/blueprint"
+	"github.com/hanzoai/cloud/apps/template"
+	"github.com/hanzoai/cloud/cek"
+	"github.com/hanzoai/cloud/clients/principal"
 
 	// In-repo subsystem packages (clients/*). Each exports a Mount (and, where it
 	// owns process-lifetime resources, a Shutdown); Wire references them directly.
@@ -93,6 +99,8 @@ func Wire() []cloud.MountSpec {
 		// that and nothing more.
 		{Name: "blueprint", Mount: logged("blueprint", blueprint.Mount), OwnsHealth: true, Description: "What a template costs to run: its bill of images and a compute-cost estimate."},
 
+		{Name: "template", Mount: templates, Shutdown: template.Shutdown, Description: "Starter kits you can deploy as they come, and your org's own."},
+
 		// Runtime wasm/proxy plugins — mounts dead last.
 		{Name: "plugins", Mount: plugin.Mount, Description: "Runtime plugins, wasm and proxy, mounted under /v1/plugins."},
 	}
@@ -118,6 +126,49 @@ func ServeSingle(name string) error {
 func logged(name string, mount func(*zip.App, luxlog.Logger) error) cloud.MountFunc {
 	return func(app *zip.App, deps cloud.Deps) error {
 		return mount(app, deps.Logger.New("subsystem", name))
+	}
+}
+
+// templates adapts the starter-kit gallery to cloud.Deps: the caller is whoever the
+// identity boundary validated, and the private kits live in a database under the
+// data directory.
+func templates(app *zip.App, deps cloud.Deps) error {
+	return template.Mount(app, template.Deps{
+		Log:    deps.Logger.New("subsystem", "template"),
+		Org:    principal.OrgFrom,
+		Acting: principal.Acting,
+		Open:   opener(deps.DataDir, "templates"),
+	})
+}
+
+// opener opens {dataDir}/{name}.db through cek, so it is encrypted at rest under
+// the deployment's key, and applies the app's schema in one transaction before
+// handing the database over. One connection, because one writer owns the file.
+func opener(dataDir, name string) func(context.Context, func(context.Context, *sql.Tx) error) (*sql.DB, error) {
+	return func(ctx context.Context, migrate func(context.Context, *sql.Tx) error) (*sql.DB, error) {
+		if dataDir == "" {
+			return nil, errors.New("empty DataDir")
+		}
+		db, err := cek.Open(filepath.Join(dataDir, name+".db"))
+		if err != nil {
+			return nil, err
+		}
+		db.SetMaxOpenConns(1)
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		if err := migrate(ctx, tx); err != nil {
+			_ = tx.Rollback()
+			_ = db.Close()
+			return nil, err
+		}
+		if err := tx.Commit(); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		return db, nil
 	}
 }
 

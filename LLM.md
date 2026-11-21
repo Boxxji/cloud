@@ -63,7 +63,7 @@ An app is private only when its job is one of:
 
 Everything else is OSS. An OSS app that still needs a private package is OSS with a host seam to cut, not private: the seam is the work, not the verdict.
 
-Moved here so far: `blueprint`. The private build deletes its copy as each one lands and imports this module's.
+Moved here so far: `blueprint`, `template`. The private build deletes its copy as each one lands and imports this module's.
 
 | app | class | reason |
 |---|---|---|
@@ -191,7 +191,7 @@ Moved here so far: `blueprint`. The private build deletes its copy as each one l
 | taxonomy | OSS | the product catalogue's categories and tags |
 | team | OSS | shared documents and files |
 | tel | PRIVATE | M: carrier numbers and calls resold |
-| template | OSS | starter-kit gallery |
+| template | OSS | MOVED: starter-kit gallery |
 | tools | OSS | everything an org can call, in one list |
 | train | PRIVATE | M: per-second billing windows and our executor fleet |
 | translate | OSS | text translation |

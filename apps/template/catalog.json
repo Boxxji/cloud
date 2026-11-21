@@ -1,0 +1,2629 @@
+[
+  {
+    "slug": "instrument",
+    "title": "Instrument",
+    "category": "Portfolio",
+    "description": "Monospace portfolio website with interactive 3D project cards, command palette, live experimental lab (particles, spring physics, ASCII shaders), and procedural audio.",
+    "framework": "React 19 + Vite + TS",
+    "features": [
+      "Command Palette",
+      "Interactive Lab",
+      "Theme Switcher",
+      "Lenis Smooth Scroll",
+      "Keyboard Audio"
+    ],
+    "useCase": "Design engineer & creative developer portfolios",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/instrument",
+    "preview": "https://hanzo.app/templates/instrument.webp"
+  },
+  {
+    "slug": "fernline",
+    "title": "Fernline",
+    "category": "AI/SaaS",
+    "description": "Full-featured AI agent operations UI kit and observability console built on Next.js 16 and React 19, including both marketing pages and a multi-route operator console.",
+    "framework": "Next.js 16 + React 19 + TS",
+    "features": [
+      "AI Agent Ops",
+      "Run Trace Viewer",
+      "28+ Primitives",
+      "Marketing + Console",
+      "Tailwind v4"
+    ],
+    "useCase": "AI agent observability & ops platforms",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/fernline",
+    "preview": "https://hanzo.app/templates/fernline.webp"
+  },
+  {
+    "slug": "aerva",
+    "title": "Aerva",
+    "category": "AI/SaaS",
+    "description": "Polished AI and SaaS landing page template built with React 19, Vite, and TypeScript featuring bento feature grids, interactive pricing toggles, and customer proof sections.",
+    "framework": "React 19 + Vite + TS",
+    "features": [
+      "AI Landing Page",
+      "Bento Features",
+      "Interactive Pricing",
+      "Testimonials",
+      "Responsive"
+    ],
+    "useCase": "High-converting AI & SaaS landing pages",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/aerva",
+    "preview": "https://hanzo.app/templates/aerva.webp"
+  },
+  {
+    "slug": "tensile",
+    "title": "Tensile Studio",
+    "category": "Portfolio",
+    "description": "Architectural and editorial studio website theme built with Astro 5, TypeScript, and embedded Sanity v5 CMS studio with project case studies and journal publishing.",
+    "framework": "Astro 5 + Sanity + TS",
+    "features": [
+      "Astro 5 Content",
+      "Sanity CMS Studio",
+      "Editorial Grid",
+      "Case Studies",
+      "Swiss Typography"
+    ],
+    "useCase": "Architecture, industrial design & editorial studios",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/tensile",
+    "preview": "https://hanzo.app/templates/tensile.webp"
+  },
+  {
+    "slug": "nova",
+    "title": "Nova AI",
+    "category": "AI/SaaS",
+    "description": "Modular AI SaaS marketing template featuring 15 switchable hero, feature, pricing, and CTA variants with live WebGL shaders and interactive product demos.",
+    "framework": "React 19 + Vite + TS",
+    "features": [
+      "15 Hero Variants",
+      "WebGL Shaders",
+      "Interactive Pricing",
+      "Variant Switcher",
+      "Responsive"
+    ],
+    "useCase": "AI SaaS & developer platform marketing sites",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/nova",
+    "preview": "https://hanzo.app/templates/nova.webp"
+  },
+  {
+    "slug": "minimal-ui",
+    "title": "Minimal UI Kit",
+    "category": "Component Library",
+    "description": "Precision monospace component library and interactive documentation site with 40+ components across 8 visual variants and full design token inspection.",
+    "framework": "React 19 + Vite + TS",
+    "features": [
+      "40+ Components",
+      "8 Theme Variants",
+      "Design Tokens",
+      "Command Menu",
+      "Interactive Docs"
+    ],
+    "useCase": "Design systems & developer documentation",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/minimal-ui",
+    "preview": "https://hanzo.app/templates/minimal-ui.webp"
+  },
+  {
+    "slug": "component-states",
+    "title": "Component States",
+    "category": "Component Library",
+    "description": "Interactive UI component states reference matrix showcasing default, hover, focus, active, loading, error, and disabled states across core primitives.",
+    "framework": "React 19 + Vite + TS",
+    "features": [
+      "State Matrix",
+      "Interactive Inspector",
+      "A11y Focus States",
+      "Dark/Light Mode",
+      "Token Specs"
+    ],
+    "useCase": "UI state specification & QA matrices",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/component-states",
+    "preview": "https://hanzo.app/templates/component-states.webp"
+  },
+  {
+    "slug": "lighthouse",
+    "title": "Lighthouse Island",
+    "category": "App",
+    "description": "Playable cozy top-down island exploration web game with lighthouse beam physics, dynamic weather and day/night cycle, quests, and synthesized WebAudio soundtrack.",
+    "framework": "React 19 + Canvas + TS",
+    "features": [
+      "Playable 2D World",
+      "Day/Night Cycle",
+      "Procedural Audio",
+      "NPC Dialogs",
+      "Minimap"
+    ],
+    "useCase": "Interactive web games & gamified experiences",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/lighthouse",
+    "preview": "https://hanzo.app/templates/lighthouse.webp"
+  },
+  {
+    "slug": "warp-tunnel",
+    "title": "Warp Tunnel",
+    "category": "3D & Shaders",
+    "description": "High-speed procedural tunnel ride built with Three.js Shading Language (TSL) on WebGPU with dynamic camera banking and bloom post-processing.",
+    "framework": "Three.js WebGPU + React 19",
+    "features": [
+      "Three.js TSL",
+      "WebGPU Renderer",
+      "Procedural Geometry",
+      "Post-Processing",
+      "60fps Animation"
+    ],
+    "useCase": "3D WebGPU hero backgrounds & visualizers",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/warp-tunnel",
+    "preview": "https://hanzo.app/templates/warp-tunnel.webp"
+  },
+  {
+    "slug": "dotted-globe",
+    "title": "Dotted Globe",
+    "category": "3D & Shaders",
+    "description": "Interactive 3D particle globe rendering 31,723 world cities with instanced spatial indexing, population density scaling, and orbital telemetry controls.",
+    "framework": "Three.js + React 19 + TS",
+    "features": [
+      "31,723 Cities Dataset",
+      "Instanced Particles",
+      "Interactive Orbit",
+      "Geo Coordinates",
+      "HUD Controls"
+    ],
+    "useCase": "Global network & telemetry visualizations",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/dotted-globe",
+    "preview": "https://hanzo.app/templates/dotted-globe.webp"
+  },
+  {
+    "slug": "tracking-3d",
+    "title": "3D Motion Tracking",
+    "category": "3D & Shaders",
+    "description": "Signal-red 3D motion-tracking and computer-vision HUD overlay with real-time bounding-box telemetry, vector callouts, and spatial keypoint tracking.",
+    "framework": "Three.js + React 19 + TS",
+    "features": [
+      "Motion Tracking HUD",
+      "Bounding Boxes",
+      "Telemetry Overlay",
+      "Real-time Vectors",
+      "Custom Shaders"
+    ],
+    "useCase": "Computer vision & robotics HUD interfaces",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/tracking-3d",
+    "preview": "https://hanzo.app/templates/tracking-3d.webp"
+  },
+  {
+    "slug": "line-illustrations",
+    "title": "Line Illustrations",
+    "category": "Component Library",
+    "description": "Parametric technical SVG line illustrations playground with live geometric controls, animated stroke paths, and copy-ready React/SVG export.",
+    "framework": "React 19 + SVG + TS",
+    "features": [
+      "Parametric SVG",
+      "Interactive Controls",
+      "SVG Export",
+      "Stroke Animation",
+      "Grid Layouts"
+    ],
+    "useCase": "Technical vector illustrations & empty states",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/line-illustrations",
+    "preview": "https://hanzo.app/templates/line-illustrations.webp"
+  },
+  {
+    "slug": "holo",
+    "title": "Holo Scene",
+    "category": "3D & Shaders",
+    "description": "Interactive Three.js holographic instrument scene featuring custom Fresnel scanline shaders, 6 switchable 3D models, and real-time optical controls.",
+    "framework": "Three.js + React 19 + TS",
+    "features": [
+      "GLB 3D Models",
+      "Holographic Shader",
+      "Scanline FX",
+      "Interactive Camera",
+      "Scene Switcher"
+    ],
+    "useCase": "3D product showcases & sci-fi interfaces",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/holo",
+    "preview": "https://hanzo.app/templates/holo.webp"
+  },
+  {
+    "slug": "warp-shader",
+    "title": "Warp Shader",
+    "category": "3D & Shaders",
+    "description": "Domain-warped fractional Brownian motion (fBm) fluid shader written in Three.js TSL running natively on WebGPU with real-time parameter controls.",
+    "framework": "Three.js WebGPU + React 19",
+    "features": [
+      "Domain-Warped fBm",
+      "Three.js TSL",
+      "WebGPU Compute",
+      "Palette Mixer",
+      "Uniform Controls"
+    ],
+    "useCase": "Generative shader backdrops & art",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/warp-shader",
+    "preview": "https://hanzo.app/templates/warp-shader.webp"
+  },
+  {
+    "slug": "animated-rings",
+    "title": "Animated Rings",
+    "category": "3D & Shaders",
+    "description": "Procedural silver orbital ring sculpture in Three.js with physically based metallic reflections, nested gimbal kinematics, and studio environment lighting.",
+    "framework": "Three.js + React 19 + TS",
+    "features": [
+      "PBR Metal Materials",
+      "Orbital Kinematics",
+      "Studio Lighting",
+      "Interactive Gimbal",
+      "60fps"
+    ],
+    "useCase": "3D metallic sculptures & hero centerpieces",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/animated-rings",
+    "preview": "https://hanzo.app/templates/animated-rings.webp"
+  },
+  {
+    "slug": "bestiary",
+    "title": "Bestiary 3D",
+    "category": "Component Library",
+    "description": "Interactive 3D point-cloud specimen library featuring 8 biological and mythological forms with pointer-reactive physics, morph transitions, and React/ESM exports.",
+    "framework": "React + Three.js + TS",
+    "features": [
+      "8 Point-Cloud Specimens",
+      "Zero-Dep ESM",
+      "React Wrapper",
+      "Morph Transitions",
+      "Interactive Pointer"
+    ],
+    "useCase": "Interactive 3D point-cloud hero illustrations",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/bestiary",
+    "preview": "https://hanzo.app/templates/bestiary.webp"
+  },
+  {
+    "slug": "emptykit",
+    "title": "Emptykit",
+    "category": "Component Library",
+    "description": "Comprehensive collection of 48 isometric 3D and vector SVG empty-state components for React and vanilla JS with live theme switching and interactive camera angles.",
+    "framework": "React + Three.js + SVG",
+    "features": [
+      "48 Empty States",
+      "3D & SVG Modes",
+      "Light/Dark Themes",
+      "Zero-Dep Bundle",
+      "Interactive Gallery"
+    ],
+    "useCase": "Application empty states & onboarding illustrations",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/emptykit",
+    "preview": "https://hanzo.app/templates/emptykit.webp"
+  },
+  {
+    "slug": "synapse",
+    "title": "Synapse",
+    "category": "AI/SaaS",
+    "description": "AI chat workspace \u2014 conversation lists, prompt composer, subscription and settings screens.",
+    "framework": "Next.js 14.2 + TS",
+    "features": [
+      "AI Chat",
+      "Audio/Video",
+      "Photo Edit",
+      "Pricing",
+      "Responsive"
+    ],
+    "useCase": "AI SaaS platforms",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/synapse",
+    "preview": "https://hanzo.app/templates/synapse.webp",
+    "demo": "https://synapse.hanzo.app"
+  },
+  {
+    "slug": "circle",
+    "title": "Circle",
+    "category": "Social Media",
+    "description": "Social platform UI \u2014 feed, profile and messaging screens.",
+    "framework": "Next.js 14.2 + TS",
+    "features": [
+      "Posts",
+      "Messages",
+      "Profiles",
+      "Notifications",
+      "Responsive"
+    ],
+    "useCase": "Social media platforms",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/circle",
+    "preview": "https://hanzo.app/templates/circle.webp"
+  },
+  {
+    "slug": "metrics",
+    "title": "Metrics",
+    "category": "Dashboard",
+    "description": "Admin dashboard \u2014 sales, purchases and returns over a leaderboard, product list and transaction history.",
+    "framework": "HTML/Gulp",
+    "features": [
+      "Analytics",
+      "CRM",
+      "Finance",
+      "Projects",
+      "Responsive"
+    ],
+    "useCase": "Admin dashboards",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/metrics",
+    "preview": "https://hanzo.app/templates/metrics.webp"
+  },
+  {
+    "slug": "kinetic",
+    "title": "Kinetic",
+    "category": "Portfolio",
+    "description": "Creative portfolio driven by GSAP and smooth scroll \u2014 a project reel over case-study pages.",
+    "framework": "React 18 + CRA",
+    "features": [
+      "GSAP",
+      "Smooth Scroll",
+      "Portfolio",
+      "Modern"
+    ],
+    "useCase": "Creative portfolios",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/kinetic",
+    "preview": "https://hanzo.app/templates/kinetic.webp"
+  },
+  {
+    "slug": "blocks",
+    "title": "Blocks",
+    "category": "Bento Cards",
+    "description": "Bento card grid in four layouts (default, square, horizontal, background) for SaaS feature sections.",
+    "framework": "HTML/Gulp",
+    "features": [
+      "Bento Layout",
+      "Cards",
+      "v3",
+      "Responsive"
+    ],
+    "useCase": "SaaS feature sections",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/blocks",
+    "preview": "https://hanzo.app/templates/blocks.webp",
+    "demo": "https://blocks.hanzo.app"
+  },
+  {
+    "slug": "savor",
+    "title": "Savor",
+    "category": "E-commerce",
+    "description": "Food-delivery storefront \u2014 menu, favourites and cart over a restaurant home page.",
+    "framework": "Next.js 13.4 + TS",
+    "features": [
+      "Food",
+      "Delivery",
+      "Orders",
+      "Responsive"
+    ],
+    "useCase": "Food delivery apps",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/savor",
+    "preview": "https://hanzo.app/templates/savor.webp"
+  },
+  {
+    "slug": "mint",
+    "title": "Mint",
+    "category": "Portfolio",
+    "description": "Creative-studio portfolio \u2014 work index, about and contact behind a full-screen menu.",
+    "framework": "HTML/CSS/JS",
+    "features": [
+      "Portfolio",
+      "Creative",
+      "Modern",
+      "Responsive"
+    ],
+    "useCase": "Creative portfolios",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/mint",
+    "preview": "https://hanzo.app/templates/mint.webp",
+    "demo": "https://mint.hanzo.app"
+  },
+  {
+    "slug": "matrix",
+    "title": "Matrix",
+    "category": "Bento Cards",
+    "description": "Bento card grid on a binary-rain theme, in four layouts.",
+    "framework": "HTML/Gulp",
+    "features": [
+      "Bento Layout",
+      "AI Theme",
+      "Next.js",
+      "Responsive"
+    ],
+    "useCase": "AI-focused bento card layouts",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/matrix",
+    "preview": "https://hanzo.app/templates/matrix.webp",
+    "demo": "https://matrix.hanzo.app",
+    "variants": [
+      {
+        "id": "default",
+        "label": "Default",
+        "kind": "format",
+        "source": "https://github.com/hanzo-apps/matrix"
+      },
+      {
+        "id": "react",
+        "label": "React",
+        "kind": "format",
+        "framework": "React 18",
+        "source": "https://github.com/hanzo-apps/matrix"
+      }
+    ]
+  },
+  {
+    "slug": "mosaic",
+    "title": "Mosaic",
+    "category": "Bento Cards",
+    "description": "Bento card grid for component and analytics products, in four layouts.",
+    "framework": "HTML/Gulp",
+    "features": [
+      "Bento Layout",
+      "Multipurpose",
+      "Next.js",
+      "Responsive"
+    ],
+    "useCase": "General purpose bento card layouts",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/mosaic",
+    "preview": "https://hanzo.app/templates/mosaic.webp",
+    "demo": "https://mosaic.hanzo.app",
+    "variants": [
+      {
+        "id": "default",
+        "label": "Default",
+        "kind": "format",
+        "source": "https://github.com/hanzo-apps/mosaic"
+      },
+      {
+        "id": "react",
+        "label": "React",
+        "kind": "format",
+        "framework": "React 18 + CRA",
+        "source": "https://github.com/hanzo-apps/mosaic"
+      }
+    ]
+  },
+  {
+    "slug": "prism",
+    "title": "Prism",
+    "category": "Portfolio",
+    "description": "Creative-agency portfolio built on GSAP \u2014 one scroll through work, services and contact.",
+    "framework": "Next.js 13.3 + TS",
+    "features": [
+      "GSAP",
+      "Portfolio",
+      "Agency",
+      "Responsive"
+    ],
+    "useCase": "Creative agencies",
+    "tier": 3,
+    "rating": 3,
+    "source": "https://github.com/hanzo-apps/prism",
+    "preview": "https://hanzo.app/templates/prism-react.webp",
+    "variants": [
+      {
+        "id": "default",
+        "label": "Default",
+        "kind": "format",
+        "source": "https://github.com/hanzo-apps/prism"
+      },
+      {
+        "id": "html",
+        "label": "HTML",
+        "kind": "format",
+        "framework": "HTML/Gulp",
+        "source": "https://github.com/hanzo-apps/prism"
+      },
+      {
+        "id": "react",
+        "label": "React",
+        "kind": "format",
+        "framework": "React 18 + Vite",
+        "source": "https://github.com/hanzo-apps/prism-react"
+      }
+    ]
+  },
+  {
+    "slug": "soar",
+    "title": "Soar",
+    "category": "Business",
+    "description": "Web-studio landing page \u2014 services, team and work, with a contact call-to-action.",
+    "framework": "Next.js 13.4",
+    "features": [
+      "Agency",
+      "Services",
+      "Team",
+      "Responsive"
+    ],
+    "useCase": "Web studio and agency sites",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/soar",
+    "preview": "https://hanzo.app/templates/soar.webp",
+    "variants": [
+      {
+        "id": "default",
+        "label": "Default",
+        "kind": "format",
+        "source": "https://github.com/hanzo-apps/soar"
+      },
+      {
+        "id": "html",
+        "label": "HTML",
+        "kind": "format",
+        "framework": "HTML/Gulp",
+        "source": "https://github.com/hanzo-apps/soar"
+      }
+    ]
+  },
+  {
+    "slug": "cipher",
+    "title": "Cipher",
+    "category": "Bento Cards",
+    "description": "Bento card grid for crypto products \u2014 wallet keys, exchange and blockchain explainer cards.",
+    "framework": "HTML/Gulp",
+    "features": [
+      "Bento Layout",
+      "Crypto",
+      "v4",
+      "Responsive"
+    ],
+    "useCase": "Crypto product sections",
+    "tier": 3,
+    "rating": 3,
+    "source": "https://github.com/hanzo-apps/cipher",
+    "preview": "https://hanzo.app/templates/cipher-react.webp",
+    "variants": [
+      {
+        "id": "html",
+        "label": "HTML",
+        "kind": "format",
+        "source": "https://github.com/hanzo-apps/cipher-html"
+      },
+      {
+        "id": "react",
+        "label": "React",
+        "kind": "format",
+        "framework": "React 17",
+        "source": "https://github.com/hanzo-apps/cipher-react"
+      },
+      {
+        "id": "cards-html",
+        "label": "Cards HTML",
+        "kind": "theme",
+        "framework": "HTML/CSS",
+        "source": "https://github.com/hanzo-apps/cipher"
+      },
+      {
+        "id": "cards-react",
+        "label": "Cards React",
+        "kind": "theme",
+        "framework": "React 18",
+        "source": "https://github.com/hanzo-apps/cipher"
+      }
+    ]
+  },
+  {
+    "slug": "launch",
+    "title": "Launch",
+    "category": "SaaS",
+    "description": "SaaS launch page \u2014 waitlist capture, feature tour and pricing.",
+    "framework": "Next.js 14",
+    "features": [
+      "Landing",
+      "SaaS",
+      "Modern",
+      "Responsive"
+    ],
+    "useCase": "SaaS landing pages",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/launch",
+    "preview": "https://hanzo.app/templates/launch.webp"
+  },
+  {
+    "slug": "construct",
+    "title": "Construct",
+    "category": "Landing",
+    "description": "App landing page \u2014 feature tour, screenshots and a download call-to-action.",
+    "framework": "React 18 + CRA",
+    "features": [
+      "App",
+      "Landing",
+      "Modern",
+      "Responsive"
+    ],
+    "useCase": "App landing pages",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/construct",
+    "preview": "https://hanzo.app/templates/construct.webp"
+  },
+  {
+    "slug": "deploy",
+    "title": "Deploy",
+    "category": "Bento Cards",
+    "description": "Bento list cards \u2014 grouped task lists with per-card icon, colour and duplicate/delete.",
+    "framework": "Next.js 14",
+    "features": [
+      "Bento Layout",
+      "Lists",
+      "Cards",
+      "Responsive"
+    ],
+    "useCase": "Task and list UIs",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/deploy",
+    "preview": "https://hanzo.app/templates/deploy.webp"
+  },
+  {
+    "slug": "loop",
+    "title": "Loop",
+    "category": "Web3",
+    "description": "Crypto-card product site \u2014 virtual card, NFT and metaverse pages with light and dark blog.",
+    "framework": "Next.js 13.2",
+    "features": [
+      "Crypto Card",
+      "NFT",
+      "Blog",
+      "Responsive"
+    ],
+    "useCase": "Crypto product sites",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/loop",
+    "preview": "https://hanzo.app/templates/loop.webp",
+    "variants": [
+      {
+        "id": "default",
+        "label": "Default",
+        "kind": "format",
+        "source": "https://github.com/hanzo-apps/loop"
+      },
+      {
+        "id": "html",
+        "label": "HTML",
+        "kind": "format",
+        "framework": "HTML/Gulp",
+        "source": "https://github.com/hanzo-apps/loop"
+      }
+    ],
+    "demo": "https://loop.hanzo.app"
+  },
+  {
+    "slug": "unity",
+    "title": "Unity",
+    "category": "Dashboard",
+    "description": "Creator admin app \u2014 products, campaigns, schedules, payouts, statements and insights.",
+    "framework": "HTML/Gulp",
+    "features": [
+      "Products",
+      "Campaigns",
+      "Payouts",
+      "Responsive"
+    ],
+    "useCase": "Creator and marketplace admin",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/unity",
+    "preview": "https://hanzo.app/templates/unity.webp",
+    "demo": "https://unity.hanzo.app"
+  },
+  {
+    "slug": "canvas",
+    "title": "Canvas",
+    "category": "Portfolio",
+    "description": "Personal portfolio \u2014 animated name marquee over about, projects and contact.",
+    "framework": "Next.js 14.2 + GSAP",
+    "features": [
+      "Portfolio",
+      "GSAP",
+      "Studio",
+      "Responsive"
+    ],
+    "useCase": "Design studios",
+    "tier": 3,
+    "rating": 3,
+    "source": "https://github.com/hanzo-apps/canvas",
+    "preview": "https://hanzo.app/templates/canvas.webp",
+    "demo": "https://canvas.hanzo.app"
+  },
+  {
+    "slug": "vault",
+    "title": "Vault",
+    "category": "Portfolio",
+    "description": "Architecture-studio site \u2014 architecture, landscape and interior work with a studio profile.",
+    "framework": "HTML/CSS/JS",
+    "features": [
+      "Architecture",
+      "Portfolio",
+      "Clean",
+      "Responsive"
+    ],
+    "useCase": "Architecture portfolios",
+    "tier": 3,
+    "rating": 3,
+    "source": "https://github.com/hanzo-apps/vault",
+    "preview": "https://hanzo.app/templates/vault.webp",
+    "demo": "https://vault.hanzo.app"
+  },
+  {
+    "slug": "studio",
+    "title": "Studio",
+    "category": "Portfolio",
+    "description": "Digital-agency portfolio \u2014 expertise, projects and articles behind an animated wordmark.",
+    "framework": "HTML/CSS/JS",
+    "features": [
+      "Agency",
+      "Portfolio",
+      "Digital",
+      "Responsive"
+    ],
+    "useCase": "Digital agencies",
+    "tier": 3,
+    "rating": 3,
+    "source": "https://github.com/hanzo-apps/studio",
+    "preview": "https://hanzo.app/templates/studio.webp",
+    "demo": "https://studio.hanzo.app"
+  },
+  {
+    "slug": "drive",
+    "title": "Drive",
+    "category": "Business",
+    "description": "Electric-vehicle marketing site \u2014 models, technology, news and ordering.",
+    "framework": "HTML/CSS",
+    "features": [
+      "Automotive",
+      "Business",
+      "Modern",
+      "Responsive"
+    ],
+    "useCase": "Automotive websites",
+    "tier": 3,
+    "rating": 3,
+    "source": "https://github.com/hanzo-apps/drive",
+    "preview": "https://hanzo.app/templates/drive.webp",
+    "demo": "https://drive.hanzo.app",
+    "variants": [
+      {
+        "id": "default",
+        "label": "Default",
+        "kind": "format",
+        "source": "https://github.com/hanzo-apps/drive"
+      },
+      {
+        "id": "html",
+        "label": "HTML",
+        "kind": "format",
+        "framework": "HTML/Gulp",
+        "source": "https://github.com/hanzo-apps/drive"
+      }
+    ]
+  },
+  {
+    "slug": "oasis",
+    "title": "Oasis",
+    "category": "Hospitality",
+    "description": "Resort site \u2014 accommodation, dining, spa, weddings and tour booking, in four languages.",
+    "framework": "HTML/CSS",
+    "features": [
+      "Hospitality",
+      "Resort",
+      "Luxury",
+      "Responsive"
+    ],
+    "useCase": "Resort/hospitality sites",
+    "tier": 3,
+    "rating": 3,
+    "source": "https://github.com/hanzo-apps/oasis",
+    "preview": "https://hanzo.app/templates/oasis.webp"
+  },
+  {
+    "slug": "solo",
+    "title": "Solo",
+    "category": "SaaS",
+    "description": "Productivity-app landing page \u2014 tasks, lists and reminders with pricing and downloads.",
+    "framework": "HTML/Gulp",
+    "features": [
+      "SaaS",
+      "Landing",
+      "Simple",
+      "Responsive"
+    ],
+    "useCase": "SaaS landing pages",
+    "tier": 3,
+    "rating": 3,
+    "source": "https://github.com/hanzo-apps/solo",
+    "preview": "https://hanzo.app/templates/solo.webp",
+    "demo": "https://solo.hanzo.app"
+  },
+  {
+    "slug": "forge",
+    "title": "Forge",
+    "category": "SaaS",
+    "description": "SaaS product landing page \u2014 feature blocks, pricing, FAQ and light/dark toggle.",
+    "framework": "Next.js 15.1 + TS",
+    "features": [
+      "Landing",
+      "Pricing",
+      "Dark Mode",
+      "Responsive"
+    ],
+    "useCase": "SaaS landing pages",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/forge",
+    "preview": "https://hanzo.app/templates/forge.webp",
+    "demo": "https://forge-template.hanzo.app"
+  },
+  {
+    "slug": "beta",
+    "title": "Beta",
+    "category": "Dashboard",
+    "description": "Admin dashboard \u2014 projects, tasks, kanban, calendar, contacts, invoices and a file browser.",
+    "framework": "HTML/Gulp",
+    "features": [
+      "CRM",
+      "Dashboard",
+      "Business",
+      "Responsive"
+    ],
+    "useCase": "CRM dashboards",
+    "tier": 3,
+    "rating": 3,
+    "source": "https://github.com/hanzo-apps/beta",
+    "preview": "https://hanzo.app/templates/beta.webp"
+  },
+  {
+    "slug": "hygge",
+    "title": "Hygge",
+    "category": "E-commerce",
+    "description": "Skincare storefront \u2014 category browsing, product pages and a slide-out cart.",
+    "framework": "HTML/Gulp",
+    "features": [
+      "E-commerce",
+      "Shop",
+      "Clean",
+      "Responsive"
+    ],
+    "useCase": "E-commerce stores",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/hygge",
+    "preview": "https://hanzo.app/templates/hygge-html.webp",
+    "variants": [
+      {
+        "id": "html",
+        "label": "HTML",
+        "kind": "format",
+        "source": "https://github.com/hanzo-apps/hygge"
+      },
+      {
+        "id": "bootstrap",
+        "label": "Bootstrap",
+        "kind": "format",
+        "framework": "HTML/Gulp + Bootstrap 5",
+        "source": "https://github.com/hanzo-apps/hygge"
+      }
+    ]
+  },
+  {
+    "slug": "folio",
+    "title": "Folio",
+    "category": "Portfolio",
+    "description": "Creative portfolio kit \u2014 26 pages of masonry and grid layouts plus agency, designer, developer and photography variants.",
+    "framework": "HTML/Gulp",
+    "features": [
+      "Portfolio",
+      "Multi-layout",
+      "Creative",
+      "Responsive"
+    ],
+    "useCase": "Creative portfolios",
+    "tier": 3,
+    "rating": 3,
+    "source": "https://github.com/hanzo-apps/folio",
+    "preview": "https://hanzo.app/templates/folio-full.webp",
+    "variants": [
+      {
+        "id": "main",
+        "label": "Main",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "index",
+        "label": "Index",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "full",
+        "label": "Full",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "about",
+        "label": "About",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "contact",
+        "label": "Contact",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "creative-agency-1",
+        "label": "Creative Agency 1",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "creative-agency-2",
+        "label": "Creative Agency 2",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "creative-designer-1",
+        "label": "Creative Designer 1",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "creative-designer-2",
+        "label": "Creative Designer 2",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "creative-developer-1",
+        "label": "Creative Developer 1",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "creative-developer-2",
+        "label": "Creative Developer 2",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "details-1",
+        "label": "Details 1",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "details-2",
+        "label": "Details 2",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "details-3",
+        "label": "Details 3",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "grid-2-columns",
+        "label": "Grid 2 Columns",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "grid-3-columns",
+        "label": "Grid 3 Columns",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "grid-3-fluid",
+        "label": "Grid 3 Fluid",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "grid-4-columns",
+        "label": "Grid 4 Columns",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "grid-4-fluid",
+        "label": "Grid 4 Fluid",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "masonry-2-columns",
+        "label": "Masonry 2 Columns",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "masonry-3-columns",
+        "label": "Masonry 3 Columns",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "masonry-3-fluid",
+        "label": "Masonry 3 Fluid",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "masonry-4-columns",
+        "label": "Masonry 4 Columns",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "masonry-4-fluid",
+        "label": "Masonry 4 Fluid",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "photography-1",
+        "label": "Photography 1",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      },
+      {
+        "id": "photography-2",
+        "label": "Photography 2",
+        "kind": "page",
+        "source": "https://github.com/hanzo-apps/folio"
+      }
+    ]
+  },
+  {
+    "slug": "pixel",
+    "title": "Pixel",
+    "category": "Portfolio",
+    "description": "Web-studio portfolio \u2014 work, expertise and a playground page.",
+    "framework": "HTML/CSS/JS",
+    "features": [
+      "Studio",
+      "Creative",
+      "Modern",
+      "Responsive"
+    ],
+    "useCase": "Studio portfolios",
+    "tier": 3,
+    "rating": 3,
+    "source": "https://github.com/hanzo-apps/pixel",
+    "preview": "https://hanzo.app/templates/pixel.webp",
+    "demo": "https://pixel.hanzo.app"
+  },
+  {
+    "slug": "saas-landing",
+    "title": "SaaS Landing",
+    "category": "SaaS",
+    "description": "SaaS landing page on @hanzo/ui \u2014 hero, feature grid, social proof and pricing.",
+    "framework": "Next.js 14.2",
+    "features": [
+      "Landing",
+      "Pricing",
+      "Features",
+      "Responsive"
+    ],
+    "useCase": "SaaS landing pages",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/saas-landing",
+    "preview": "https://hanzo.app/templates/saas-landing.webp",
+    "demo": "https://saas-landing.hanzo.app"
+  },
+  {
+    "slug": "serif",
+    "title": "Serif",
+    "category": "Magazine",
+    "description": "Editorial magazine \u2014 section fronts, article pages and a shop in a serif type system.",
+    "framework": "HTML/Sass",
+    "features": [
+      "Magazine",
+      "Articles",
+      "Sass",
+      "Responsive"
+    ],
+    "useCase": "Editorial and magazine sites",
+    "tier": 3,
+    "rating": 3,
+    "source": "https://github.com/hanzo-apps/serif",
+    "preview": "https://hanzo.app/templates/serif.webp"
+  },
+  {
+    "slug": "analytics-dashboard",
+    "title": "Analytics Dashboard",
+    "category": "Dashboard",
+    "description": "Analytics dashboard on @hanzo/ui \u2014 revenue, users and sales tiles over an overview chart.",
+    "framework": "Next.js 14.2 + TS",
+    "features": [],
+    "useCase": "",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/analytics-dashboard",
+    "preview": "https://hanzo.app/templates/analytics-dashboard.webp"
+  },
+  {
+    "slug": "blog-platform",
+    "title": "Blog Platform",
+    "category": "Blog",
+    "description": "Blog on @hanzo/ui \u2014 tag filters, post list and a writing view.",
+    "framework": "Next.js 14.2 + TS",
+    "features": [],
+    "useCase": "",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/blog-platform",
+    "preview": "https://hanzo.app/templates/blog-platform.webp"
+  },
+  {
+    "slug": "changelog",
+    "title": "Changelog",
+    "category": "Blog",
+    "description": "Product changelog \u2014 dated releases with tags, a version timeline and dark mode.",
+    "framework": "Next.js 15.3 + TS",
+    "features": [],
+    "useCase": "",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/changelog",
+    "preview": "https://hanzo.app/templates/changelog.webp"
+  },
+  {
+    "slug": "crypto-portfolio",
+    "title": "Crypto Portfolio",
+    "category": "Web3",
+    "description": "Crypto portfolio tracker on @hanzo/ui \u2014 holdings, performance and transaction history.",
+    "framework": "Next.js 14.2 + TS",
+    "features": [],
+    "useCase": "",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/crypto-portfolio",
+    "preview": "https://hanzo.app/templates/crypto-portfolio.webp"
+  },
+  {
+    "slug": "ecommerce-storefront",
+    "title": "Ecommerce Storefront",
+    "category": "E-commerce",
+    "description": "Storefront on @hanzo/ui \u2014 category filters, product grid and add-to-cart.",
+    "framework": "Next.js 14.2 + TS",
+    "features": [],
+    "useCase": "",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/ecommerce-storefront",
+    "preview": "https://hanzo.app/templates/ecommerce-storefront.webp"
+  },
+  {
+    "slug": "kanban-board",
+    "title": "Kanban Board",
+    "category": "Productivity",
+    "description": "Kanban board on @hanzo/ui \u2014 To Do / In Progress / Done with labelled, assigned cards.",
+    "framework": "Next.js 14.2 + TS",
+    "features": [],
+    "useCase": "",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/kanban-board",
+    "preview": "https://hanzo.app/templates/kanban-board.webp"
+  },
+  {
+    "slug": "markdown-editor",
+    "title": "Markdown Editor",
+    "category": "Productivity",
+    "description": "Markdown editor on @hanzo/ui \u2014 live preview, syntax highlighting, copy and export.",
+    "framework": "Next.js 14.2 + TS",
+    "features": [],
+    "useCase": "",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/markdown-editor",
+    "preview": "https://hanzo.app/templates/markdown-editor.webp"
+  },
+  {
+    "slug": "portfolio",
+    "title": "Portfolio",
+    "category": "Portfolio",
+    "description": "Personal developer portfolio \u2014 intro, about, projects and contact on one page.",
+    "framework": "Next.js 14.2 + TS",
+    "features": [],
+    "useCase": "",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/portfolio",
+    "preview": "https://hanzo.app/templates/portfolio.webp"
+  },
+  {
+    "slug": "video-streaming",
+    "title": "Video Streaming",
+    "category": "Media",
+    "description": "Video watch page on @hanzo/ui \u2014 player, chapters, transcript and channel subscribe.",
+    "framework": "Next.js 14.2 + TS",
+    "features": [],
+    "useCase": "",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/video-streaming",
+    "preview": "https://hanzo.app/templates/video-streaming.webp"
+  },
+  {
+    "slug": "mobile",
+    "title": "Hanzo Mobile",
+    "category": "Mobile",
+    "description": "Expo Router tab starter \u2014 iOS, Android and web from one tree. Feed, search, settings and a dynamic detail route.",
+    "framework": "Expo SDK 54 + expo-router 6",
+    "features": [
+      "Expo Router",
+      "Tabs",
+      "Dynamic route",
+      "Dark theme",
+      "Web target"
+    ],
+    "useCase": "Cross-platform mobile apps",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/mobile"
+  },
+  {
+    "slug": "expo-chat",
+    "title": "Hanzo Chat (Expo)",
+    "category": "Mobile",
+    "description": "Streaming AI chat client on Expo Router, wired to the Hanzo /v1 API with run-time endpoint config.",
+    "framework": "Expo SDK 54 + expo-router 6",
+    "features": [
+      "SSE streaming",
+      "Hanzo /v1",
+      "Runtime config",
+      "Tabs",
+      "Web target"
+    ],
+    "useCase": "AI assistants on mobile",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/expo-chat",
+    "preview": "https://hanzo.app/templates/expo-chat.webp"
+  },
+  {
+    "slug": "expo-shop",
+    "title": "Hanzo Shop",
+    "category": "Mobile",
+    "description": "Storefront: product grid, detail route and a cart with a live tab badge.",
+    "framework": "Expo SDK 54 + expo-router 6",
+    "features": [
+      "Product grid",
+      "Cart",
+      "Tab badge",
+      "Dynamic route",
+      "Web target"
+    ],
+    "useCase": "Mobile commerce",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/expo-shop",
+    "preview": "https://hanzo.app/templates/expo-shop.webp"
+  },
+  {
+    "slug": "expo-auth",
+    "title": "Hanzo Auth",
+    "category": "Mobile",
+    "description": "OAuth 2.0 + PKCE sign-in against Hanzo IAM in the system browser, with a one-place route guard.",
+    "framework": "Expo SDK 54 + expo-auth-session",
+    "features": [
+      "PKCE",
+      "Hanzo IAM",
+      "Keychain storage",
+      "Route guard",
+      "Web target"
+    ],
+    "useCase": "Authenticated mobile apps",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/expo-auth",
+    "preview": "https://hanzo.app/templates/expo-auth.webp"
+  },
+  {
+    "slug": "flutter",
+    "title": "Hanzo Flutter",
+    "category": "Mobile",
+    "description": "Material 3 starter \u2014 NavigationBar over an IndexedStack, search, detail route and widget tests.",
+    "framework": "Flutter 3.44 + Material 3",
+    "features": [
+      "Material 3",
+      "NavigationBar",
+      "Search",
+      "Widget tests",
+      "Web target"
+    ],
+    "useCase": "Cross-platform mobile apps",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/flutter"
+  },
+  {
+    "slug": "flutter-chat",
+    "title": "Hanzo Chat (Flutter)",
+    "category": "Mobile",
+    "description": "Streaming AI chat in Flutter, wired to the Hanzo /v1 API, with tests over the failure path.",
+    "framework": "Flutter 3.44 + http",
+    "features": [
+      "SSE streaming",
+      "Hanzo /v1",
+      "Runtime config",
+      "Widget tests",
+      "Web target"
+    ],
+    "useCase": "AI assistants on mobile",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/flutter-chat"
+  },
+  {
+    "slug": "desktop-tauri",
+    "title": "Hanzo Desktop",
+    "category": "Desktop",
+    "description": "Tauri v2 + React 19 desktop starter \u2014 Rust command round-trip, Hanzo Base backend, frameless chrome, one web preview build.",
+    "framework": "Tauri v2 + React 19 + Vite 7",
+    "features": [
+      "Rust core",
+      "Web fallback",
+      "Hanzo Base",
+      "Frameless",
+      "3 installers"
+    ],
+    "useCase": "Any cross-platform desktop app",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/desktop-tauri",
+    "preview": "https://hanzo.app/templates/desktop-tauri.webp"
+  },
+  {
+    "slug": "desktop-notes",
+    "title": "Notes",
+    "category": "Desktop",
+    "description": "Local-first markdown notes \u2014 one .md file per note in the OS app-data dir, split editor/preview, autosave, optional Base sync.",
+    "framework": "Tauri v2 + React 19 + marked",
+    "features": [
+      "Local-first",
+      "Markdown",
+      "Autosave",
+      "File-per-note",
+      "Base sync"
+    ],
+    "useCase": "Note-taking and journalling apps",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/desktop-notes",
+    "preview": "https://hanzo.app/templates/desktop-notes.webp"
+  },
+  {
+    "slug": "desktop-chat",
+    "title": "Chat",
+    "category": "Desktop",
+    "description": "Desktop AI client \u2014 streaming SSE to any OpenAI-compatible gateway, threads and API key kept in the OS config dir, not web storage.",
+    "framework": "Tauri v2 + React 19",
+    "features": [
+      "SSE streaming",
+      "Threads",
+      "Key off-page",
+      "Model picker",
+      "Any gateway"
+    ],
+    "useCase": "AI assistants and chat clients",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/desktop-chat",
+    "preview": "https://hanzo.app/templates/desktop-chat.webp"
+  },
+  {
+    "slug": "desktop-monitor",
+    "title": "Monitor",
+    "category": "Desktop",
+    "description": "Native system monitor \u2014 per-core CPU, memory, process table, disks and interfaces via sysinfo, sampled at 1 Hz.",
+    "framework": "Tauri v2 + React 19 + sysinfo",
+    "features": [
+      "Per-core CPU",
+      "Processes",
+      "Disks",
+      "Network",
+      "SVG sparklines"
+    ],
+    "useCase": "System utilities and dashboards",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/desktop-monitor",
+    "preview": "https://hanzo.app/templates/desktop-monitor.webp"
+  },
+  {
+    "slug": "desktop-editor",
+    "title": "Editor",
+    "category": "Desktop",
+    "description": "CodeMirror 6 code editor in a Tauri window \u2014 real filesystem tree, syntax highlighting, native folder picker, Cmd-S writes through.",
+    "framework": "Tauri v2 + CodeMirror 6",
+    "features": [
+      "Filesystem tree",
+      "Syntax highlight",
+      "Folder picker",
+      "Write-through",
+      "Tabs"
+    ],
+    "useCase": "Editors and developer tools",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/desktop-editor",
+    "preview": "https://hanzo.app/templates/desktop-editor.webp"
+  },
+  {
+    "slug": "desktop-tray",
+    "title": "Tray",
+    "category": "Desktop",
+    "description": "Menubar/tray utility \u2014 resident clipboard history, global shortcut, close-hides-not-quits, background watcher thread in Rust.",
+    "framework": "Tauri v2 + tray-icon",
+    "features": [
+      "Tray icon",
+      "Global shortcut",
+      "Clipboard watch",
+      "Filtering",
+      "In-memory"
+    ],
+    "useCase": "Always-resident menubar utilities",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/desktop-tray",
+    "preview": "https://hanzo.app/templates/desktop-tray.webp"
+  },
+  {
+    "slug": "desktop-electron",
+    "title": "Electron",
+    "category": "Desktop",
+    "description": "Electron 43 + Forge + Vite + React baseline \u2014 contextIsolated IPC allowlist, native dialogs, app metrics, frameless chrome.",
+    "framework": "Electron 43 + Forge + React 19",
+    "features": [
+      "IPC allowlist",
+      "contextIsolation",
+      "Native dialogs",
+      "App metrics",
+      "Frameless"
+    ],
+    "useCase": "Apps that need Chromium itself",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/desktop-electron",
+    "preview": "https://hanzo.app/templates/desktop-electron.webp"
+  },
+  {
+    "slug": "desktop-recorder",
+    "title": "Recorder",
+    "category": "Desktop",
+    "description": "Screen recorder \u2014 desktopCapturer enumerates every screen and window with no OS prompt, MediaRecorder writes webm to disk.",
+    "framework": "Electron 43 + Forge + React 19",
+    "features": [
+      "desktopCapturer",
+      "MediaRecorder",
+      "Thumbnails",
+      "Writes to disk",
+      "webm"
+    ],
+    "useCase": "Screen capture and streaming tools",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/desktop-recorder",
+    "preview": "https://hanzo.app/templates/desktop-recorder.webp"
+  },
+  {
+    "slug": "godot-arcade",
+    "title": "Orb Runner",
+    "category": "Games/3D",
+    "description": "A complete 3D arcade game in ~150 lines of GDScript, exported to WebAssembly by Godot 4.",
+    "framework": "Godot 4.4 (Web export)",
+    "features": [
+      "3D physics",
+      "WASM engine",
+      "Keyboard/gamepad",
+      "COOP/COEP ready",
+      "MIT"
+    ],
+    "useCase": "Browser games and 3D product demos",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/godot-arcade"
+  },
+  {
+    "slug": "unity-webgl",
+    "title": "Unity WebGL",
+    "category": "Games/3D",
+    "description": "A real Unity WebGL build served cross-origin-isolated, so SharedArrayBuffer is available to multithreaded builds.",
+    "framework": "Unity 6 (WebGL)",
+    "features": [
+      "Unity runtime",
+      "crossOriginIsolated",
+      "SharedArrayBuffer",
+      "application/wasm MIME",
+      "Apache-2.0"
+    ],
+    "useCase": "Shipping an existing Unity project to the web",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/unity-webgl",
+    "preview": "https://hanzo.app/templates/unity-webgl.webp"
+  },
+  {
+    "slug": "three-webgpu",
+    "title": "Neon Reef",
+    "category": "Games/3D",
+    "description": "WebGPU-first Three.js scene with automatic WebGL2 fallback: TSL node materials and 900 instanced shards in one draw call.",
+    "framework": "three.js 0.185 (WebGPU)",
+    "features": [
+      "WebGPU",
+      "WebGL2 fallback",
+      "TSL node materials",
+      "Instancing",
+      "MIT"
+    ],
+    "useCase": "3D landing pages and product configurators",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/three-webgpu",
+    "preview": "https://hanzo.app/templates/three-webgpu.webp"
+  },
+  {
+    "slug": "rapier-physics",
+    "title": "Fracture Yard",
+    "category": "Games/3D",
+    "description": "Rigid-body sandbox where Rapier3D (Rust compiled to WASM) owns the simulation and three.js only draws it.",
+    "framework": "Rapier3D + three.js",
+    "features": [
+      "WASM physics",
+      "CCD projectiles",
+      "Live solver cost",
+      "Shadow mapping",
+      "MIT/Apache-2.0"
+    ],
+    "useCase": "Simulation, training and physics-driven demos",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/rapier-physics",
+    "preview": "https://hanzo.app/templates/rapier-physics.webp"
+  },
+  {
+    "slug": "voxel-craft",
+    "title": "Chunk",
+    "category": "Games/3D",
+    "description": "First-person voxel sandbox: procedural terrain, face-culled chunk meshing, place/break editing that re-meshes only what changed.",
+    "framework": "three.js 0.185",
+    "features": [
+      "Procedural terrain",
+      "Chunk meshing",
+      "Pointer lock",
+      "Voxel editing",
+      "MIT"
+    ],
+    "useCase": "Sandbox games and world builders",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/voxel-craft",
+    "preview": "https://hanzo.app/templates/voxel-craft.webp"
+  },
+  {
+    "slug": "kart-racer",
+    "title": "Circuit",
+    "category": "Games/3D",
+    "description": "A drivable arcade racer where one Catmull-Rom track curve drives the road mesh, the on-track test, the lap checkpoints and the autopilot line.",
+    "framework": "three.js 0.185",
+    "features": [
+      "Drivable kart",
+      "Lap timing",
+      "Autopilot demo mode",
+      "Off-track grip loss",
+      "MIT"
+    ],
+    "useCase": "Arcade games and interactive brand experiences",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/kart-racer",
+    "preview": "https://hanzo.app/templates/kart-racer.webp"
+  },
+  {
+    "slug": "hanzo-starter",
+    "title": "Hanzo Starter",
+    "category": "AI/SaaS",
+    "description": "Canonical Hanzo full-stack app starter with IAM PKCE sign-in, org-scoped Hanzo Base SQLite collections, and @hanzo/gui.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Hanzo IAM PKCE",
+      "Hanzo Base DDL",
+      "@hanzo/gui v7",
+      "Org-Scoped Data"
+    ],
+    "useCase": "Full-stack Hanzo Cloud web applications",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/hanzo-starter",
+    "preview": "https://hanzo.app/templates/hanzo-starter.webp"
+  },
+  {
+    "slug": "deskline",
+    "title": "Deskline",
+    "category": "SaaS",
+    "description": "Support ticket queue and customer helpdesk with split-pane intake, agent assignment, and status triage on Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Ticket Queue",
+      "Split-Pane Triage",
+      "Hanzo Base Sync",
+      "IAM Auth"
+    ],
+    "useCase": "Customer support & helpdesk queues",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/deskline",
+    "preview": "https://hanzo.app/templates/deskline.webp"
+  },
+  {
+    "slug": "kanban",
+    "title": "Kanban",
+    "category": "SaaS",
+    "description": "Focused three-column Kanban board (To Do, Doing, Done) with org-scoped task persistence in Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Kanban Columns",
+      "Task Cards",
+      "Hanzo Base Sync",
+      "Team Auth"
+    ],
+    "useCase": "Team task & project boards",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/kanban",
+    "preview": "https://hanzo.app/templates/kanban.webp"
+  },
+  {
+    "slug": "roadmap",
+    "title": "Trailmap",
+    "category": "SaaS",
+    "description": "Public product roadmap organized into Now, Next, and Later horizons with customer-visible initiatives on Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Now / Next / Later",
+      "Initiative Cards",
+      "Theme Filtering",
+      "Hanzo Base"
+    ],
+    "useCase": "Public product roadmaps",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/roadmap",
+    "preview": "https://hanzo.app/templates/roadmap.webp"
+  },
+  {
+    "slug": "upvote",
+    "title": "Upvote",
+    "category": "SaaS",
+    "description": "Feature-request voting board where users post ideas, upvote priorities, and discuss roadmap items on Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Live Upvoting",
+      "Feature Board",
+      "Comment Threads",
+      "Hanzo Base"
+    ],
+    "useCase": "Customer feature voting & feedback",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/upvote",
+    "preview": "https://hanzo.app/templates/upvote.webp"
+  },
+  {
+    "slug": "feedback",
+    "title": "Feedback Signal",
+    "category": "SaaS",
+    "description": "Two-pane product feedback triage inbox to read, tag, and route customer insights backed by Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Two-Pane Inbox",
+      "Theme Tagging",
+      "Triage Routing",
+      "Hanzo Base"
+    ],
+    "useCase": "Product feedback & user research triage",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/feedback",
+    "preview": "https://hanzo.app/templates/feedback.webp"
+  },
+  {
+    "slug": "releases",
+    "title": "Releases",
+    "category": "SaaS",
+    "description": "Public product changelog and release notes archive paired with a longform engineering blog on Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Changelog Feed",
+      "Version Tags",
+      "Release Notes",
+      "Hanzo Base"
+    ],
+    "useCase": "Product changelogs & release notes",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/releases",
+    "preview": "https://hanzo.app/templates/releases.webp"
+  },
+  {
+    "slug": "standup",
+    "title": "Standup",
+    "category": "SaaS",
+    "description": "Async daily standup tracker for engineering teams logging yesterday, today, and blockers in Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Async Standups",
+      "Blocker Alerts",
+      "Team Feed",
+      "Hanzo Base"
+    ],
+    "useCase": "Remote team daily standups",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/standup",
+    "preview": "https://hanzo.app/templates/standup.webp"
+  },
+  {
+    "slug": "retro",
+    "title": "Sprint Retro",
+    "category": "SaaS",
+    "description": "Three-column sprint retrospective board with sticky cards, dot voting, and action items persisted in Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Sticky Board",
+      "Dot Voting",
+      "Action Items",
+      "Hanzo Base"
+    ],
+    "useCase": "Agile sprint retrospectives",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/retro",
+    "preview": "https://hanzo.app/templates/retro.webp"
+  },
+  {
+    "slug": "roster",
+    "title": "Team Roster",
+    "category": "Business",
+    "description": "Searchable company directory with department filtering, role profiles, and org-scoped records in Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Team Directory",
+      "Role Search",
+      "Department Filter",
+      "Hanzo Base"
+    ],
+    "useCase": "Internal team directories & org charts",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/roster",
+    "preview": "https://hanzo.app/templates/roster.webp"
+  },
+  {
+    "slug": "gear",
+    "title": "Gear Locker",
+    "category": "Business",
+    "description": "IT equipment and company hardware asset tracker assigning laptops, monitors, and keys per employee in Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Asset Tracking",
+      "Employee Checkouts",
+      "Serial Audit",
+      "Hanzo Base"
+    ],
+    "useCase": "IT asset & equipment management",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/gear",
+    "preview": "https://hanzo.app/templates/gear.webp"
+  },
+  {
+    "slug": "expenses",
+    "title": "Expenses",
+    "category": "Business",
+    "description": "Team expense logger categorizing spend with live category totals and receipt records stored in Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Expense Logging",
+      "Category Breakdown",
+      "Org Ledger",
+      "Hanzo Base"
+    ],
+    "useCase": "Team expense tracking & spend reports",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/expenses",
+    "preview": "https://hanzo.app/templates/expenses.webp"
+  },
+  {
+    "slug": "inventory",
+    "title": "Inventory Stockroom",
+    "category": "E-commerce",
+    "description": "High-density stockroom and SKU inventory tracker with real-time low-stock threshold alerts on Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "SKU Tracking",
+      "Low-Stock Alerts",
+      "Quantity Ledger",
+      "Hanzo Base"
+    ],
+    "useCase": "Warehouse & retail inventory management",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/inventory",
+    "preview": "https://hanzo.app/templates/inventory.webp"
+  },
+  {
+    "slug": "proposal",
+    "title": "Quotewright",
+    "category": "Business",
+    "description": "Interactive B2B proposal and quote builder with itemized pricing tables and shareable client links on Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Line-Item Quotes",
+      "Automatic Totals",
+      "Shareable Links",
+      "Hanzo Base"
+    ],
+    "useCase": "Client proposals & B2B quotes",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/proposal",
+    "preview": "https://hanzo.app/templates/proposal.webp"
+  },
+  {
+    "slug": "bistro",
+    "title": "Ember Bistro",
+    "category": "Hospitality",
+    "description": "Warm neighborhood restaurant website featuring an editorial home, live Hanzo Base dining menu, and table reservations.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Live Menu",
+      "Table Reservations",
+      "Kitchen Publisher",
+      "Hanzo Base"
+    ],
+    "useCase": "Restaurants, cafes & hospitality",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/bistro",
+    "preview": "https://hanzo.app/templates/bistro.webp"
+  },
+  {
+    "slug": "booking",
+    "title": "Cadence Booking",
+    "category": "Business",
+    "description": "Calm timeslot availability publisher and client appointment scheduler backed by org-scoped Hanzo Base collections.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Timeslot Grid",
+      "Instant Booking",
+      "Availability Rules",
+      "Hanzo Base"
+    ],
+    "useCase": "Appointment & consultation scheduling",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/booking",
+    "preview": "https://hanzo.app/templates/booking.webp"
+  },
+  {
+    "slug": "dropstore",
+    "title": "Digital Dropstore",
+    "category": "E-commerce",
+    "description": "Digital downloads and creator drop storefront for selling sound packs, LUTs, UI kits, and files on Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Digital Drops",
+      "Instant Claim",
+      "Buyer Library",
+      "Hanzo Base"
+    ],
+    "useCase": "Creator digital product storefronts",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/dropstore",
+    "preview": "https://hanzo.app/templates/dropstore.webp"
+  },
+  {
+    "slug": "shop",
+    "title": "Editorial Shop",
+    "category": "E-commerce",
+    "description": "Minimal editorial product storefront with curated lookbook grid, slide-over cart, and Hanzo Base catalog.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Product Grid",
+      "Persistent Cart",
+      "Catalog Publisher",
+      "Hanzo Base"
+    ],
+    "useCase": "Boutique e-commerce storefronts",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/shop",
+    "preview": "https://hanzo.app/templates/shop.webp"
+  },
+  {
+    "slug": "launchpad",
+    "title": "Launchpad",
+    "category": "Landing",
+    "description": "High-converting product launch page with live countdown timer, real-time signup counter, and Hanzo Base capture.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Launch Countdown",
+      "Live Signup Counter",
+      "Email Capture",
+      "Hanzo Base"
+    ],
+    "useCase": "Product launches & pre-order campaigns",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/launchpad",
+    "preview": "https://hanzo.app/templates/launchpad.webp"
+  },
+  {
+    "slug": "waitlist",
+    "title": "Viral Waitlist",
+    "category": "Landing",
+    "description": "Monochromatic, brand-neutral viral waitlist with referral tracking and queue position backed by Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Referral Queue",
+      "Waitlist Rank",
+      "Email Capture",
+      "Hanzo Base"
+    ],
+    "useCase": "Viral beta waitlists & launch queues",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/waitlist",
+    "preview": "https://hanzo.app/templates/waitlist.webp"
+  },
+  {
+    "slug": "agenda",
+    "title": "Sched Agenda",
+    "category": "Business",
+    "description": "Multi-track conference schedule and event timetable with speaker profiles and personal session bookmarking.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Multi-Track Grid",
+      "Session Bookmarks",
+      "Speaker Bios",
+      "Hanzo Base"
+    ],
+    "useCase": "Conferences, summits & event schedules",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/agenda",
+    "preview": "https://hanzo.app/templates/agenda.webp"
+  },
+  {
+    "slug": "devlog",
+    "title": "Devlog",
+    "category": "Portfolio",
+    "description": "Multi-author engineering blog with technical topic tags, clean typography, and signed-in publishing via Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Multi-Author",
+      "Topic Filtering",
+      "Live Publishing",
+      "Hanzo Base"
+    ],
+    "useCase": "Engineering blogs & technical writing",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/devlog",
+    "preview": "https://hanzo.app/templates/devlog.webp"
+  },
+  {
+    "slug": "dispatch",
+    "title": "Dispatch Newsletter",
+    "category": "SaaS",
+    "description": "Public newsletter issue archive with reader signup capture and a signed-in author publishing studio on Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Issue Archive",
+      "Subscriber Capture",
+      "Author Studio",
+      "Hanzo Base"
+    ],
+    "useCase": "Independent newsletters & digests",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/dispatch",
+    "preview": "https://hanzo.app/templates/dispatch.webp"
+  },
+  {
+    "slug": "epk",
+    "title": "Pressroom EPK",
+    "category": "Portfolio",
+    "description": "Electronic press kit and release hub for recording artists with bio, discography, tour dates, and press assets.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Artist Bio",
+      "Release Hub",
+      "Tour Dates",
+      "Press Assets"
+    ],
+    "useCase": "Musician & artist electronic press kits",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/epk",
+    "preview": "https://hanzo.app/templates/epk.webp"
+  },
+  {
+    "slug": "essays",
+    "title": "Longform Essays",
+    "category": "Portfolio",
+    "description": "Minimalist personal essay publication designed for distraction-free longform reading and writing on Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Serif Typography",
+      "Reading Time",
+      "Author Notes",
+      "Hanzo Base"
+    ],
+    "useCase": "Personal essayists & writers",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/essays",
+    "preview": "https://hanzo.app/templates/essays.webp"
+  },
+  {
+    "slug": "habits",
+    "title": "Habit Streak",
+    "category": "App",
+    "description": "Daily habit builder with streak counters and a 365-day GitHub-style check-in calendar heatmap on Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Calendar Heatmap",
+      "Streak Counter",
+      "Daily Check-Ins",
+      "Hanzo Base"
+    ],
+    "useCase": "Personal habit & productivity trackers",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/habits",
+    "preview": "https://hanzo.app/templates/habits.webp"
+  },
+  {
+    "slug": "links",
+    "title": "Onepage Links",
+    "category": "Portfolio",
+    "description": "Self-hosted link-in-bio profile page with live outbound click counters and instant link editing on Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Link-in-Bio",
+      "Click Analytics",
+      "Profile Editor",
+      "Hanzo Base"
+    ],
+    "useCase": "Creator link-in-bio pages",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/links",
+    "preview": "https://hanzo.app/templates/links.webp"
+  },
+  {
+    "slug": "magazine",
+    "title": "Issue Press",
+    "category": "Portfolio",
+    "description": "Issue-based digital magazine with cover stories, editorial spreads, and archival issue browsing on Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Issue Archive",
+      "Cover Spreads",
+      "Editorial Layout",
+      "Hanzo Base"
+    ],
+    "useCase": "Digital magazines & publications",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/magazine",
+    "preview": "https://hanzo.app/templates/magazine.webp"
+  },
+  {
+    "slug": "meetup",
+    "title": "Gather Meetup",
+    "category": "Social Media",
+    "description": "Community meetup organizer with upcoming event pages, attendee RSVP lists, and host management on Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Event Pages",
+      "One-Click RSVP",
+      "Attendee List",
+      "Hanzo Base"
+    ],
+    "useCase": "Developer meetups & community chapters",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/meetup",
+    "preview": "https://hanzo.app/templates/meetup.webp"
+  },
+  {
+    "slug": "photoessay",
+    "title": "Photoessay",
+    "category": "Portfolio",
+    "description": "Cinematic full-bleed visual photo essay scroller with sequenced story chapters and captions on Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Cinematic Scroll",
+      "Story Blocks",
+      "EXIF Captions",
+      "Hanzo Base"
+    ],
+    "useCase": "Photography portfolios & visual stories",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/photoessay",
+    "preview": "https://hanzo.app/templates/photoessay.webp"
+  },
+  {
+    "slug": "rally",
+    "title": "Event Rally",
+    "category": "Landing",
+    "description": "Single-event RSVP party and gathering page \u2014 one event, one bold page, and one-tap guest list on Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "One-Tap RSVP",
+      "Guest Wall",
+      "Event Countdown",
+      "Hanzo Base"
+    ],
+    "useCase": "Single-event invites & launch parties",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/rally",
+    "preview": "https://hanzo.app/templates/rally.webp"
+  },
+  {
+    "slug": "reading",
+    "title": "Reading Shelf",
+    "category": "Portfolio",
+    "description": "Personal bookshelf and reading progress tracker logging currently reading, finished books, and notes on Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Bookshelf Grid",
+      "Reading Progress",
+      "Book Notes",
+      "Hanzo Base"
+    ],
+    "useCase": "Personal reading logs & book clubs",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/reading",
+    "preview": "https://hanzo.app/templates/reading.webp"
+  },
+  {
+    "slug": "resume",
+    "title": "Curriculum Resume",
+    "category": "Portfolio",
+    "description": "Polished, print-friendly online curriculum vitae and career timeline editable live via Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Print-Ready CV",
+      "Role Timeline",
+      "Skill Matrix",
+      "Hanzo Base"
+    ],
+    "useCase": "Executive resumes & developer CVs",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/resume",
+    "preview": "https://hanzo.app/templates/resume.webp"
+  },
+  {
+    "slug": "setlist",
+    "title": "Band Setlist",
+    "category": "Hospitality",
+    "description": "Touring band show calendar and historical concert setlist archive backed by Hanzo Base.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Tour Calendar",
+      "Setlist Archive",
+      "Venue Log",
+      "Hanzo Base"
+    ],
+    "useCase": "Live music acts & touring bands",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/setlist",
+    "preview": "https://hanzo.app/templates/setlist.webp"
+  },
+  {
+    "slug": "smartlink",
+    "title": "Release Smartlink",
+    "category": "Landing",
+    "description": "Single-release music smart link page routing fans to Spotify, Apple Music, Vinyl, and Bandcamp with click stats.",
+    "framework": "Vite + React 19 + @hanzo/gui + @hanzo/base",
+    "features": [
+      "Streaming Links",
+      "Album Artwork",
+      "Outbound Tracking",
+      "Hanzo Base"
+    ],
+    "useCase": "Music release & podcast smartlinks",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/smartlink",
+    "preview": "https://hanzo.app/templates/smartlink.webp"
+  },
+  {
+    "slug": "swiftui",
+    "title": "SwiftUI Starter",
+    "category": "Mobile",
+    "description": "Native iOS 17 SwiftUI starter kit with TabView, NavigationStack, Hanzo IAM PKCE auth, and swift-testing.",
+    "framework": "SwiftUI + iOS 17",
+    "features": [
+      "SwiftUI",
+      "NavigationStack",
+      "Hanzo IAM",
+      "swift-testing"
+    ],
+    "useCase": "Native iOS 17 applications",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/swiftui",
+    "preview": "https://hanzo.app/templates/swiftui.webp"
+  },
+  {
+    "slug": "swiftui-chat",
+    "title": "SwiftUI AI Chat",
+    "category": "Mobile",
+    "description": "Native iOS 17 streaming AI chat client using @Observable and AsyncThrowingStream wired to Hanzo /v1/chat/completions.",
+    "framework": "SwiftUI + iOS 17",
+    "features": [
+      "Streaming SSE",
+      "@Observable",
+      "Zen AI Gateway",
+      "Native iOS"
+    ],
+    "useCase": "Native iOS AI assistant apps",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/swiftui-chat",
+    "preview": "https://hanzo.app/templates/swiftui-chat.webp"
+  },
+  {
+    "slug": "android-compose-jetchat",
+    "title": "Compose Jetchat",
+    "category": "Mobile",
+    "description": "Android Jetpack Compose conversational messaging and AI chat starter with Material You dynamic theming.",
+    "framework": "Jetpack Compose + Kotlin",
+    "features": [
+      "Material 3",
+      "Jetpack Compose",
+      "Chat UI",
+      "Kotlin Coroutines"
+    ],
+    "useCase": "Android messaging & AI chat apps",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/android-compose-jetchat",
+    "preview": "https://hanzo.app/templates/android-compose-jetchat.webp"
+  },
+  {
+    "slug": "android-compose-jetnews",
+    "title": "Compose Jetnews",
+    "category": "Mobile",
+    "description": "Android Jetpack Compose editorial news and article reader adaptable across phones, foldables, and tablets.",
+    "framework": "Jetpack Compose + Kotlin",
+    "features": [
+      "Adaptive Layout",
+      "Material 3",
+      "Article Reader",
+      "Jetpack Compose"
+    ],
+    "useCase": "Android media & news readers",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/android-compose-jetnews",
+    "preview": "https://hanzo.app/templates/android-compose-jetnews.webp"
+  },
+  {
+    "slug": "android-compose-jetsnack",
+    "title": "Compose Jetsnack",
+    "category": "Mobile",
+    "description": "Android Jetpack Compose mobile commerce and food ordering app with custom animations and cart checkout flow.",
+    "framework": "Jetpack Compose + Kotlin",
+    "features": [
+      "Mobile Commerce",
+      "Custom Transitions",
+      "Cart Flow",
+      "Jetpack Compose"
+    ],
+    "useCase": "Android delivery & shopping apps",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/android-compose-jetsnack",
+    "preview": "https://hanzo.app/templates/android-compose-jetsnack.webp"
+  },
+  {
+    "slug": "android-expo-nativewind",
+    "title": "Expo NativeWind",
+    "category": "Mobile",
+    "description": "Universal Expo Router and React Native starter styled with NativeWind (Tailwind CSS v4) for iOS, Android, and Web.",
+    "framework": "Expo + React Native + NativeWind",
+    "features": [
+      "NativeWind",
+      "Expo Router",
+      "Universal App",
+      "TypeScript"
+    ],
+    "useCase": "Cross-platform Tailwind mobile apps",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/android-expo-nativewind",
+    "preview": "https://hanzo.app/templates/android-expo-nativewind.webp"
+  },
+  {
+    "slug": "android-expo-tabs",
+    "title": "Expo Tabs Starter",
+    "category": "Mobile",
+    "description": "Expo Router multi-tab mobile starter with typed routes, modal sheets, and dark/light theme support.",
+    "framework": "Expo + React Native + TS",
+    "features": [
+      "Typed Routes",
+      "Bottom Tabs",
+      "Modal Sheets",
+      "Dark Mode"
+    ],
+    "useCase": "Multi-tab iOS & Android apps",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/android-expo-tabs",
+    "preview": "https://hanzo.app/templates/android-expo-tabs.webp"
+  },
+  {
+    "slug": "android-flutter-animations",
+    "title": "Flutter Animations",
+    "category": "Mobile",
+    "description": "Flutter implicit and explicit physics animations showcase with hero transitions and staggered motion curves.",
+    "framework": "Flutter 3 + Dart",
+    "features": [
+      "Hero Transitions",
+      "Physics Curves",
+      "Staggered Motion",
+      "Material 3"
+    ],
+    "useCase": "Motion-rich Flutter mobile apps",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/android-flutter-animations",
+    "preview": "https://hanzo.app/templates/android-flutter-animations.webp"
+  },
+  {
+    "slug": "android-flutter-forms",
+    "title": "Flutter Forms Kit",
+    "category": "Mobile",
+    "description": "Flutter multi-step form validation, input formatters, and data submission kit ready for Hanzo Base.",
+    "framework": "Flutter 3 + Dart",
+    "features": [
+      "Form Validation",
+      "Multi-Step Wizard",
+      "Input Masks",
+      "Material 3"
+    ],
+    "useCase": "Data-entry & onboarding mobile apps",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/android-flutter-forms",
+    "preview": "https://hanzo.app/templates/android-flutter-forms.webp"
+  },
+  {
+    "slug": "android-flutter-material3",
+    "title": "Flutter Material 3",
+    "category": "Mobile",
+    "description": "Comprehensive Flutter Material 3 component gallery with dynamic color schemes, typography, and elevation tokens.",
+    "framework": "Flutter 3 + Dart",
+    "features": [
+      "Material 3",
+      "Dynamic Color",
+      "Adaptive Navigation",
+      "Component Spec"
+    ],
+    "useCase": "Material You Flutter applications",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/android-flutter-material3",
+    "preview": "https://hanzo.app/templates/android-flutter-material3.webp"
+  },
+  {
+    "slug": "android-flutter-routing",
+    "title": "Flutter Declarative Routing",
+    "category": "Mobile",
+    "description": "Flutter deep-linking and declarative URL routing starter with auth guards and nested navigation shells.",
+    "framework": "Flutter 3 + Dart",
+    "features": [
+      "Deep Linking",
+      "Auth Guards",
+      "Nested Nav",
+      "GoRouter"
+    ],
+    "useCase": "Multi-route production Flutter apps",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/android-flutter-routing",
+    "preview": "https://hanzo.app/templates/android-flutter-routing.webp"
+  },
+  {
+    "slug": "android-rn-obytes",
+    "title": "React Native Production Kit",
+    "category": "Mobile",
+    "description": "Opinionated React Native + Expo production template with Zustand state, React Query, MMKV storage, and Zod forms.",
+    "framework": "Expo + React Native + TS",
+    "features": [
+      "React Query",
+      "Zustand",
+      "MMKV Storage",
+      "Zod Forms"
+    ],
+    "useCase": "Enterprise React Native apps",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/android-rn-obytes",
+    "preview": "https://hanzo.app/templates/android-rn-obytes.webp"
+  },
+  {
+    "slug": "devtool",
+    "title": "Devtool Landing",
+    "category": "SaaS",
+    "description": "Developer tool and CLI marketing site with interactive terminal demos, benchmark charts, and docs navigation.",
+    "framework": "Next.js 15 + React 19 + TS",
+    "features": [
+      "Terminal Demo",
+      "Benchmarks",
+      "Docs Shell",
+      "Pricing"
+    ],
+    "useCase": "Developer tools & SDK sites",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/devtool",
+    "preview": "https://hanzo.app/templates/devtool.webp"
+  },
+  {
+    "slug": "quantum",
+    "title": "Quantum Analytics",
+    "category": "Dashboard",
+    "description": "Dark-mode quantitative analytics and AI telemetry dashboard with real-time streaming charts and command bar.",
+    "framework": "React 19 + Vite + TS",
+    "features": [
+      "Realtime Charts",
+      "Telemetry Grid",
+      "Command Bar",
+      "Dark UI"
+    ],
+    "useCase": "Quantitative & AI ops dashboards",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/quantum",
+    "preview": "https://hanzo.app/templates/quantum.webp"
+  },
+  {
+    "slug": "saas",
+    "title": "SaaS Core",
+    "category": "SaaS",
+    "description": "Multi-tenant B2B SaaS application shell with team workspaces, billing settings, API key management, and audit logs.",
+    "framework": "Next.js 15 + React 19 + TS",
+    "features": [
+      "Multi-Tenant",
+      "API Key Manager",
+      "Team Billing",
+      "Audit Logs"
+    ],
+    "useCase": "B2B SaaS products & portals",
+    "tier": 1,
+    "rating": 5,
+    "source": "https://github.com/hanzo-apps/saas",
+    "preview": "https://hanzo.app/templates/saas.webp"
+  },
+  {
+    "slug": "social-feed",
+    "title": "Social Feed",
+    "category": "Social Media",
+    "description": "Real-time community social feed with rich media posts, nested replies, reactions, and user profiles.",
+    "framework": "Next.js 15 + React 19 + TS",
+    "features": [
+      "Activity Stream",
+      "Nested Replies",
+      "Media Uploads",
+      "Profiles"
+    ],
+    "useCase": "Community networks & social apps",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/social-feed",
+    "preview": "https://hanzo.app/templates/social-feed.webp"
+  },
+  {
+    "slug": "startup",
+    "title": "Startup Launch",
+    "category": "Landing",
+    "description": "Crisp venture-backed startup landing page with customer logos, interactive product tour, and conversion pricing.",
+    "framework": "Next.js 15 + React 19 + TS",
+    "features": [
+      "Product Tour",
+      "Social Proof",
+      "Pricing Tiers",
+      "FAQ"
+    ],
+    "useCase": "High-growth startup websites",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/startup",
+    "preview": "https://hanzo.app/templates/startup.webp"
+  },
+  {
+    "slug": "unfixed",
+    "title": "Unfixed Studio",
+    "category": "Portfolio",
+    "description": "Avant-garde creative studio and design agency showcase with fluid typography and editorial case studies.",
+    "framework": "Next.js 15 + React 19 + TS",
+    "features": [
+      "Fluid Typography",
+      "Case Studies",
+      "Smooth Scroll",
+      "Editorial"
+    ],
+    "useCase": "Design studios & creative agencies",
+    "tier": 2,
+    "rating": 4,
+    "source": "https://github.com/hanzo-apps/unfixed",
+    "preview": "https://hanzo.app/templates/unfixed.webp"
+  }
+]
