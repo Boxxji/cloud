@@ -40,6 +40,7 @@ package openapi
 
 import (
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -435,7 +436,7 @@ func Mount(app *zip.App, info Info, servers ...Server) {
 		doc  *Document
 		err  error
 	)
-	app.Get(Path, func(c *zip.Ctx) error {
+	app.Raw(http.MethodGet, Path, func(c *zip.Ctx) error {
 		once.Do(func() { doc, err = Spec(app, info, servers...) })
 		if err != nil {
 			return zip.ErrInternal(err.Error())

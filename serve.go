@@ -2,11 +2,14 @@ package cloud
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -152,8 +155,6 @@ func Serve(specs []MountSpec, enable []string) error {
 	// middleware_tracing.go.
 	app.Use(TracingMiddleware())
 
-	app.Use(middleware.Logger(deps.Logger))
-
 	// Edge policy. Runs BEFORE identity by design:
 	//   - EdgeCORS answers the browser OPTIONS preflight (which carries no
 	//     credentials) and short-circuits it, so a preflight never reaches auth.
@@ -210,10 +211,16 @@ func Serve(specs []MountSpec, enable []string) error {
 			continue
 		}
 		name := spec.Name
-		app.Get("/v1/"+name+"/health", func(c *zip.Ctx) error {
+		app.Raw(http.MethodGet, "/v1/"+name+"/health", func(c *zip.Ctx) error {
 			return c.JSON(200, map[string]string{"service": name, "status": "ok"})
 		})
 	}
+
+	// Top-level liveness/readiness on the main app so callers over the ZAP socket
+	// (`hanzo network start` probes GET /healthz on host.zap.sock; #4) and over the
+	// HTTP API listener get `200 {"status":"ok"}` instead of falling through to the
+	// console SPA catch-all.
+	mountHealth(app)
 
 	if err := MountAll(app, specs, cfg, deps); err != nil {
 		return fmt.Errorf("mount: %w", err)
@@ -224,10 +231,15 @@ func Serve(specs []MountSpec, enable []string) error {
 	// — no second copy of any business logic: each call is replayed in-process
 	// through this Fiber app (see zapface). Mounted AFTER MountAll so every /v1
 	// route exists before the dispatcher captures the app.
-	app.Get("/zap", zapface.Handler(app.Fiber(), zapface.Options{
+	app.Raw(http.MethodGet, "/zap", zapface.Handler(app.Fiber(), zapface.Options{
 		OriginPatterns: cfg.ZAPWebOrigins,
 		Logger:         deps.Logger,
 	}))
+
+	// GET /v1 — the capability index: what this deployment mounted, read from the
+	// same specs MountAll just mounted. Unauthenticated, for the reason the
+	// document below is.
+	mountIndex(app, specs, cfg)
 
 	// GET /v1/openapi.json — the THIRD projection of the same route table. ZAP
 	// replays the /v1 handlers, the console renders them, and this DESCRIBES
@@ -248,21 +260,6 @@ func Serve(specs []MountSpec, enable []string) error {
 		},
 		openapi.Server{URL: serverURL(cfg.Domain)},
 	)
-
-	// Install zip's own deferred projections of the typed-op registry — the MCP
-	// endpoint at /mcp, the typed OpenAPI document, the op-call plane — BEFORE the
-	// console catch-all below.
-	//
-	// zip installs these itself, but from Listen, which is AFTER everything mounted
-	// here. Fiber matches in registration order and the catch-all matches
-	// everything, so a /mcp registered after it is a route the router can never
-	// reach: the endpoint existed and still answered 404. Prepare is idempotent
-	// (sync.Once), so Listen's own call becomes a no-op and this is purely a
-	// question of who registers first.
-	//
-	// It has to be here rather than earlier for the same reason openapi.Mount is:
-	// the projections read the COMPLETE op registry, so they run after MountAll.
-	app.Prepare()
 
 	// Mounted LAST, after every /v1 route, the /zap plane, the health contract and
 	// the projections above, this registers the terminal catch-all: the embedded
@@ -286,6 +283,10 @@ func Serve(specs []MountSpec, enable []string) error {
 	// can, because zip.Op is the same value on every door while the request path
 	// is not (note.go).
 	app.Authorize(Rule())
+
+	if err := prepareZAPSocket(cfg.ZAPListenAddr); err != nil {
+		return fmt.Errorf("zap socket: %w", err)
+	}
 
 	// Health/metrics listener (HealthListenAddr, default 127.0.0.1:9090). Serves
 	// the liveness/readiness contract (/healthz, /readyz) on a port SEPARATE from
@@ -312,9 +313,9 @@ func Serve(specs []MountSpec, enable []string) error {
 			"brand", cfg.Brand,
 			"domain", cfg.Domain,
 		)
-		// ONE app, TWO transports: ZAP (plaintext TCP, loopback by default) and
-		// HTTP. Both serve the identical route surface, so /v1/* answers over
-		// either. Serve returns the first listener error.
+		// ONE app, TWO transports: ZAP (plaintext TCP or unix socket) and
+		// HTTP. Both serve the identical route surface, so /v1/* and /healthz
+		// answer over either. Serve returns the first listener error.
 		listenErr <- app.Listen(cfg.ZAPListenAddr, "http://"+cfg.ListenAddr)
 	}()
 
@@ -348,6 +349,58 @@ func Serve(specs []MountSpec, enable []string) error {
 	// BEFORE teardown means no subsystem is torn down while a request still uses
 	// it. A hook error is joined into the returned error, never fatal to the others.
 	return app.ShutdownWithContext(shutdownCtx)
+}
+
+// zapUnixSocketPath returns the filesystem path for a unix-socket ZAP listener
+// address, or ("", false) for TCP listeners and Linux abstract sockets (@name).
+func zapUnixSocketPath(addr string) (string, bool) {
+	path := strings.TrimPrefix(strings.TrimSpace(addr), "zap://")
+	if path == "" || strings.HasPrefix(path, "@") {
+		return "", false
+	}
+	if strings.HasPrefix(path, "/") || strings.HasPrefix(path, "./") || strings.HasSuffix(path, ".sock") {
+		return path, true
+	}
+	return "", false
+}
+
+// prepareZAPSocket prepares a unix domain socket path before Serve binds it.
+// If the path already exists, it is removed only when os.Lstat reports a unix
+// socket (os.ModeSocket); regular files, directories, and symlinks are never
+// deleted and fail closed.
+func prepareZAPSocket(addr string) error {
+	path, ok := zapUnixSocketPath(addr)
+	if !ok {
+		return nil
+	}
+	info, err := os.Lstat(path)
+	if err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return fmt.Errorf("zap listen path %q exists and is not a unix socket (mode %s)", path, info.Mode())
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove stale zap socket %q: %w", path, err)
+		}
+		return nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("lstat zap socket %q: %w", path, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create zap socket directory for %q: %w", path, err)
+	}
+	return nil
+}
+
+// mountHealth registers /healthz and /readyz on the main zip.App so both the
+// ZAP listener (including the CLI's unix socket) and the HTTP API listener
+// answer liveness/readiness probes directly (#4).
+func mountHealth(app *zip.App) {
+	ok := func(c *zip.Ctx) error {
+		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+	}
+	app.Raw(http.MethodGet, "/healthz", ok)
+	app.Raw(http.MethodGet, "/readyz", ok)
 }
 
 // healthMux is the liveness/readiness + metrics contract on the ops port

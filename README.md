@@ -13,7 +13,7 @@ the whole dependency, and every default address is on this machine.
 
 ## Run locally
 
-Requires Go 1.26.5 and `openssl`.
+Requires Go 1.27.1 and `openssl`.
 
 ```bash
 git clone https://github.com/hanzoai/cloud && cd cloud
@@ -45,6 +45,7 @@ Check it:
 curl 127.0.0.1:9090/healthz
 curl -X POST 127.0.0.1:8080/v1/base/collections/notes -d '{"doc":{"title":"hello"}}'
 curl 127.0.0.1:8080/v1/base/collections/notes
+curl 127.0.0.1:8080/v1                  # the capabilities this process serves
 curl 127.0.0.1:8080/v1/openapi.json     # every route this process serves
 ```
 

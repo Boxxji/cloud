@@ -90,8 +90,8 @@ func doorApp(t *testing.T) *doorRig {
 	app.Authorize(Rule())
 
 	run2 := func(ctx context.Context, in *probeIn) (*probeOut, error) { return &probeOut{OK: true}, nil }
-	zip.Post[probeIn, probeOut](app, "/v1/probe/run", run2, zip.WithOperationID("probe_run"))
-	zip.Get[probeIn, probeOut](app, "/v1/probe/list", run2, zip.WithOperationID("probe_list"))
+	app.Post[probeIn, probeOut]("/v1/probe/run", run2, zip.WithOperationID("probe_run"))
+	app.Get[probeIn, probeOut]("/v1/probe/list", run2, zip.WithOperationID("probe_list"))
 	// ZAP FIRST, and the order is load-bearing. The MCP door and the op-call
 	// plane are installed when the app is first served, so a handler taken before
 	// that answers 404 on both — which reads exactly like the gap this file is

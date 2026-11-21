@@ -87,7 +87,7 @@ func Mount(app *zip.App, deps cloud.Deps) error {
 	}
 	s := &service{
 		dataDir: deps.DataDir,
-		embed:   newEmbedder(deps.Embed, ""), // embeddings ride the read-only (pk-) embed credential
+		embed:   newEmbedder(deps.Embed, ""),            // embeddings ride the read-only (pk-) embed credential
 		synth:   newSynth(deps.AI, deps.AIDefaultModel), // synthesis is chat completion → M2M
 		log:     deps.Logger.New("subsystem", "code"),
 		stores:  cloud.NewOrgStore(deps.DataDir, "code", openStore),
@@ -95,15 +95,15 @@ func Mount(app *zip.App, deps cloud.Deps) error {
 	mounted = s
 
 	g := app.Group("/v1/code")
-	g.Get("/search", s.handleSearch)
-	g.Post("/context", s.handleContext)
-	g.Get("/ask", s.handleAsk)
-	g.Post("/ask", s.handleAsk)
-	g.Post("/index", s.handleIndex)
+	g.Raw(http.MethodGet, "/search", s.handleSearch)
+	g.Raw(http.MethodPost, "/context", s.handleContext)
+	g.Raw(http.MethodGet, "/ask", s.handleAsk)
+	g.Raw(http.MethodPost, "/ask", s.handleAsk)
+	g.Raw(http.MethodPost, "/index", s.handleIndex)
 	// Repo-inspection primitives (the zread contract over the org's own index):
 	// tree = get_repo_structure, file = read_file.
-	g.Get("/tree", s.handleTree)
-	g.Get("/file", s.handleFile)
+	g.Raw(http.MethodGet, "/tree", s.handleTree)
+	g.Raw(http.MethodGet, "/file", s.handleFile)
 
 	s.log.Info("code surface mounted (native)",
 		"brand", deps.Brand, "semantic", s.embed.Enabled(), "synth", s.synth.Enabled())

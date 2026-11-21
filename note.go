@@ -102,8 +102,8 @@ func matched(c *zip.Ctx) string {
 // refusal is recorded under the name of what was refused rather than under the
 // name of the door somebody knocked at.
 func Rule() zip.Authorizer {
-	return func(ctx context.Context, op zip.Op, _ any) error {
+	return func(ctx context.Context, op zip.Op, _ any) (zip.Decision, error) {
 		Note(ctx, op)
-		return nil
+		return zip.Decision{Effect: zip.Allow}, nil
 	}
 }

@@ -2,6 +2,7 @@ native/flags/target/
 node_modules/
 *.test
 /cloud
+/bin/
 /.dev/
 
 # Key material a local run writes beside the binary. Secrets belong in KMS, and

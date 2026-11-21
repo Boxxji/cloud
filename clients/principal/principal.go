@@ -126,6 +126,35 @@ func Org(c *zip.Ctx) (string, bool) {
 	return strings.Clone(org), true
 }
 
+// OrgFrom is Org for a typed op, which holds a context and not the request.
+// zip.CallerOf reads the same identity headers Org reads, so the same two facts
+// decide it: a validated principal (X-User-Id, set only from a verified credential)
+// and a non-empty org within MaxOrgLen. The org is trimmed and cloned, never folded.
+func OrgFrom(ctx context.Context) (string, bool) {
+	c := zip.CallerOf(ctx)
+	if strings.TrimSpace(c.User) == "" {
+		return "", false
+	}
+	org := strings.TrimSpace(c.Org)
+	if org == "" || len(org) > MaxOrgLen {
+		return "", false
+	}
+	return strings.Clone(org), true
+}
+
+// Acting is the org a call acts for, or the refusal that names why there is none:
+// 401 when nobody validated is signed in, 403 when the caller names no org. A write
+// asks it where a read asks OrgFrom, so the two refusals are never mistaken for one.
+func Acting(ctx context.Context) (string, error) {
+	if strings.TrimSpace(zip.CallerOf(ctx).User) == "" {
+		return "", zip.ErrUnauthorized("a validated principal is required")
+	}
+	if org, ok := OrgFrom(ctx); ok {
+		return org, nil
+	}
+	return "", zip.ErrForbidden("X-Org-Id required")
+}
+
 // Owner resolves the caller's HOME org — the identity + BILLING anchor: the
 // validated IAM `owner` claim, minted by the gateway (and by cloud's own identity
 // boundary, SanitizeIdentity) as the X-User-Owner header. It is DISTINCT from Org

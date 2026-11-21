@@ -3,7 +3,7 @@
 # Pure-Go CGO_ENABLED=0 links github.com/hanzoai/sqlite + sqlcipher so encryption
 # at rest (CLOUD_KMS_MASTER_KEY_REF) works out of the box with no C libraries.
 
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 ARG TARGETOS=linux
 ARG TARGETARCH
 ARG VERSION=dev

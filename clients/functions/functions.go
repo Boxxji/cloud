@@ -175,33 +175,33 @@ func routes(app *zip.App, s *cloud.Service[state]) {
 	mounted = s
 	g := app.Group("/v1/functions")
 
-	zip.Get[ListIn, ListOut](g, "", list(s),
+	g.Get[ListIn, ListOut]("", list(s),
 		zip.WithOperationID("functions_list"),
 		zip.WithSummary("List the functions in this namespace"),
 		zip.WithTags("functions"))
 
-	zip.Post[CreateIn, Function](g, "", create(s),
+	g.Post[CreateIn, Function]("", create(s),
 		zip.WithOperationID("functions_create"),
 		zip.WithSummary("Register a function, replacing any of the same name"),
 		zip.WithTags("functions"),
 		zip.WithStatus(201))
 
-	zip.Get[GetIn, GetOut](g, "/:name", get(s),
+	g.Get[GetIn, GetOut]("/:name", get(s),
 		zip.WithOperationID("functions_get"),
 		zip.WithSummary("Read one function and its recent invocations"),
 		zip.WithTags("functions"))
 
-	zip.Delete[DeleteIn, DeleteOut](g, "/:name", remove(s),
+	g.Delete[DeleteIn, DeleteOut]("/:name", remove(s),
 		zip.WithOperationID("functions_delete"),
 		zip.WithSummary("Remove one function"),
 		zip.WithTags("functions"))
 
-	zip.Post[InvokeIn, InvokeOut](g, "/:name/invoke", invoke(s),
+	g.Post[InvokeIn, InvokeOut]("/:name/invoke", invoke(s),
 		zip.WithOperationID("functions_invoke"),
 		zip.WithSummary("Run one function and record the invocation"),
 		zip.WithTags("functions"))
 
-	zip.Get[InvocationsIn, InvocationsOut](g, "/:name/invocations", history(s),
+	g.Get[InvocationsIn, InvocationsOut]("/:name/invocations", history(s),
 		zip.WithOperationID("functions_invocations"),
 		zip.WithSummary("Read one function's invocation ledger"),
 		zip.WithTags("functions"))

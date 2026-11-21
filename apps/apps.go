@@ -17,9 +17,19 @@ package apps
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
+	"path/filepath"
+
+	luxlog "github.com/luxfi/log"
+	"github.com/zap-proto/zip"
 
 	"github.com/hanzoai/cloud"
+	"github.com/hanzoai/cloud/apps/blueprint"
+	"github.com/hanzoai/cloud/apps/template"
+	"github.com/hanzoai/cloud/cek"
+	"github.com/hanzoai/cloud/clients/principal"
 
 	// In-repo subsystem packages (clients/*). Each exports a Mount (and, where it
 	// owns process-lifetime resources, a Shutdown); Wire references them directly.
@@ -49,24 +59,24 @@ import (
 func Wire() []cloud.MountSpec {
 	return []cloud.MountSpec{
 		// Insights feature-flag evaluation seam (no routes; a hot value plane).
-		{Name: "flags", Mount: flags.Mount, Shutdown: flags.Shutdown, OwnsHealth: true},
+		{Name: "flags", Mount: flags.Mount, Shutdown: flags.Shutdown, OwnsHealth: true, Description: "Feature flags: ship it dark, then turn it on for who you pick."},
 		// Embedded KMS secrets plane /v1/kms/*. OwnsHealth: serves its own
 		// fail-closed /v1/kms/health. Fails closed until CLOUD_KMS_MASTER_KEY_REF.
-		{Name: "kms", Mount: kms.Mount, OwnsHealth: true},
+		{Name: "kms", Mount: kms.Mount, OwnsHealth: true, Description: "Secret custody: your org's secrets sealed at rest."},
 		// Embedded runtime edge (/v1/ingress/*). STAGED — edge listeners stay off
 		// unless the operator names "ingress" in CLOUD_ENABLE.
-		{Name: "ingress", Mount: ingress.Mount, Shutdown: ingress.Shutdown},
+		{Name: "ingress", Mount: ingress.Mount, Shutdown: ingress.Shutdown, Description: "Your edge: automatic TLS certificates and hostname routing."},
 		// /v1/s3/buckets/* + /v1/s3/health. OwnsHealth (real fail-closed probe).
-		{Name: "storage", Mount: storage.Mount, OwnsHealth: true},
+		{Name: "storage", Mount: storage.Mount, OwnsHealth: true, Prefix: "/v1/s3", Description: "Object storage: your buckets and the files in them."},
 		// The /v1/dns forward head: relays the console DNS dashboard to the DNS
 		// control plane under the caller's own validated bearer.
-		{Name: "dns", Mount: dns.Mount},
-		{Name: "code", Mount: code.Mount, Shutdown: code.Shutdown},
-		{Name: "session", Mount: session.Mount, Shutdown: ctxShutdown(session.Shutdown)},
-		{Name: "security", Mount: security.Mount, Shutdown: ctxShutdown(security.Shutdown), OwnsHealth: true},
-		{Name: "exec", Mount: exec.Mount},
-		{Name: "gateway", Mount: gateway.Mount},
-		{Name: "audit", Mount: auditlog.Mount},
+		{Name: "dns", Mount: dns.Mount, Description: "Your DNS records, relayed to the DNS control plane under your own bearer."},
+		{Name: "code", Mount: code.Mount, Shutdown: code.Shutdown, Description: "Search and symbols across your repos, for you and your agents."},
+		{Name: "session", Mount: session.Mount, Shutdown: ctxShutdown(session.Shutdown), Prefix: "/v1/code/sessions", Description: "Live coding-agent runs: list them, watch them, steer them."},
+		{Name: "security", Mount: security.Mount, Shutdown: ctxShutdown(security.Shutdown), OwnsHealth: true, Description: "Secret scanning for your code: submit sources, get findings."},
+		{Name: "exec", Mount: exec.Mount, Description: "The code interpreter: run a snippet in a sandbox and move files."},
+		{Name: "gateway", Mount: gateway.Mount, Description: "Live control of the edge policy your API applies to every request."},
+		{Name: "audit", Mount: auditlog.Mount, Description: "Your org's tamper-evident audit trail."},
 
 		// The local apps. Each is a REAL implementation over the embedded store,
 		// not a relay to a cluster: the dev edition is meant to be a working
@@ -76,15 +86,23 @@ func Wire() []cloud.MountSpec {
 		// Every route in these is a typed op, which is why they need no
 		// per-app integration work: one declaration is simultaneously the REST
 		// route, the OpenAPI schema, the MCP tool and the generated SDK method.
-		{Name: "base", Mount: base.Mount, Shutdown: base.Shutdown},
-		{Name: "kv", Mount: kv.Mount, Shutdown: kv.Shutdown},
-		{Name: "tasks", Mount: tasks.Mount, Shutdown: tasks.Shutdown},
+		{Name: "base", Mount: base.Mount, Shutdown: base.Shutdown, Description: "A document store per org: collections of JSON records."},
+		{Name: "kv", Mount: kv.Mount, Shutdown: kv.Shutdown, Description: "Your key-value store: versioned values your apps read and write."},
+		{Name: "tasks", Mount: tasks.Mount, Shutdown: tasks.Shutdown, Description: "Durable work: a lease and acknowledge queue."},
 		// STAGED (see stagedSubsystems): functions RUNS CODE, so it is linked in
 		// every build but mounts only when an operator names it.
-		{Name: "functions", Mount: functions.Mount, Shutdown: functions.Shutdown},
+		{Name: "functions", Mount: functions.Mount, Shutdown: functions.Shutdown, Description: "Serverless code: publish it and call it over HTTP."},
+
+		// Apps that import zip and nothing of their host: the same package mounts in
+		// any host that hands it a router and the few things it reads. Each takes
+		// only what it names, so an entry here is an adapter from cloud.Deps to
+		// that and nothing more.
+		{Name: "blueprint", Mount: logged("blueprint", blueprint.Mount), OwnsHealth: true, Description: "What a template costs to run: its bill of images and a compute-cost estimate."},
+
+		{Name: "template", Mount: templates, Shutdown: template.Shutdown, Description: "Starter kits you can deploy as they come, and your org's own."},
 
 		// Runtime wasm/proxy plugins — mounts dead last.
-		{Name: "plugins", Mount: plugin.Mount},
+		{Name: "plugins", Mount: plugin.Mount, Description: "Runtime plugins, wasm and proxy, mounted under /v1/plugins."},
 	}
 }
 
@@ -101,6 +119,57 @@ func ServeSingle(name string) error {
 		}
 	}
 	return fmt.Errorf("ServeSingle: unknown app %q", name)
+}
+
+// logged adapts an app that asks its host for a router and a logger to the mount
+// contract: the logger is scoped to the app's name, as cloud.Mount scopes it.
+func logged(name string, mount func(*zip.App, luxlog.Logger) error) cloud.MountFunc {
+	return func(app *zip.App, deps cloud.Deps) error {
+		return mount(app, deps.Logger.New("subsystem", name))
+	}
+}
+
+// templates adapts the starter-kit gallery to cloud.Deps: the caller is whoever the
+// identity boundary validated, and the private kits live in a database under the
+// data directory.
+func templates(app *zip.App, deps cloud.Deps) error {
+	return template.Mount(app, template.Deps{
+		Log:    deps.Logger.New("subsystem", "template"),
+		Org:    principal.OrgFrom,
+		Acting: principal.Acting,
+		Open:   opener(deps.DataDir, "templates"),
+	})
+}
+
+// opener opens {dataDir}/{name}.db through cek, so it is encrypted at rest under
+// the deployment's key, and applies the app's schema in one transaction before
+// handing the database over. One connection, because one writer owns the file.
+func opener(dataDir, name string) func(context.Context, func(context.Context, *sql.Tx) error) (*sql.DB, error) {
+	return func(ctx context.Context, migrate func(context.Context, *sql.Tx) error) (*sql.DB, error) {
+		if dataDir == "" {
+			return nil, errors.New("empty DataDir")
+		}
+		db, err := cek.Open(filepath.Join(dataDir, name+".db"))
+		if err != nil {
+			return nil, err
+		}
+		db.SetMaxOpenConns(1)
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		if err := migrate(ctx, tx); err != nil {
+			_ = tx.Rollback()
+			_ = db.Close()
+			return nil, err
+		}
+		if err := tx.Commit(); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		return db, nil
+	}
 }
 
 // ctxShutdown adapts a subsystem's zero-arg Shutdown() error to the

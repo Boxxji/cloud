@@ -81,7 +81,7 @@ func routes(app *zip.App, s *cloud.Service[state]) {
 	g := app.Group("/v1/kv")
 
 	// Plain /v1/kv list
-	g.Get("", func(c *zip.Ctx) error {
+	g.Raw(http.MethodGet, "", func(c *zip.Ctx) error {
 		org, ok := principal.Org(c)
 		if !ok {
 			return zip.ErrForbidden("X-Org-Id required")
@@ -120,7 +120,7 @@ func routes(app *zip.App, s *cloud.Service[state]) {
 	})
 
 	// Single key /v1/kv/:key
-	g.Get("/:key", func(c *zip.Ctx) error {
+	g.Raw(http.MethodGet, "/:key", func(c *zip.Ctx) error {
 		org, ok := principal.Org(c)
 		if !ok {
 			return zip.ErrForbidden("X-Org-Id required")
@@ -152,7 +152,7 @@ func routes(app *zip.App, s *cloud.Service[state]) {
 		})
 	})
 
-	g.Put("/:key", func(c *zip.Ctx) error {
+	g.Raw(http.MethodPut, "/:key", func(c *zip.Ctx) error {
 		org, ok := principal.Org(c)
 		if !ok {
 			return zip.ErrForbidden("X-Org-Id required")
@@ -208,7 +208,7 @@ func routes(app *zip.App, s *cloud.Service[state]) {
 		})
 	})
 
-	g.Delete("/:key", func(c *zip.Ctx) error {
+	g.Raw(http.MethodDelete, "/:key", func(c *zip.Ctx) error {
 		org, ok := principal.Org(c)
 		if !ok {
 			return zip.ErrForbidden("X-Org-Id required")

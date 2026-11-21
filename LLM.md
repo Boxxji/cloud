@@ -5,12 +5,15 @@ One Go binary that mounts every subsystem from a single composition root (`apps.
 Base (`/v1/base` document/KV/SQLite store), Tasks (`/v1/tasks` durable lease/ack queue),
 Functions (`/v1/functions` staged runner), KMS (`/v1/kms` embedded `luxfi/kms`), S3, Search,
 Edge, Feature Flags, Audit, Plugin runtime (`/v1/plugins`), OpenAPI (`/v1/openapi.json`),
-and MCP (`/mcp` JSON-RPC 2.0).
+and MCP (`/mcp` JSON-RPC 2.0). `GET /v1` is the capability index: the subsystems this process mounted, each
+with its address and a sentence on what it is for (`MountSpec.Description`).
 
 **Canonical AI instructions**: `LLM.md` is the canonical instruction file in this repository.
 `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md` are tracked symlinks to `LLM.md`.
 
 ## Build, Run & Test
+
+The stack is Go 1.27.1 and `github.com/zap-proto/zip` v1.37.45 (the version the private build runs). A route is a typed op (`app.Get[In, Out](path, fn)`) or, where a handler owns its whole response, a raw one (`app.Raw(method, path, handler)`).
 
 ```bash
 make dev      # CGO_ENABLED=0 go build ./cmd/cloud, mints .dev/master.key (0600), serves 127.0.0.1:8080
@@ -46,3 +49,165 @@ make hooks    # git config core.hooksPath .githooks (public-only pre-push guard)
 3. **Staged Subsystems**: Subsystems that execute arbitrary code or alter ingress (`functions`, `iam`, `ingress`) only mount when explicitly listed in `CLOUD_ENABLE_STAGED`.
 4. **Fail-Closed External Integrations**: Optional sibling services (`S3_*`, `HANZO_DNS_URL`, `CODE_EXEC_UPSTREAM`, `CLOUD_AI_ZAP_ADDR`) report 503 clearly when unconfigured rather than faking success.
 5. **Public-Only Repository Guard**: `.githooks/pre-push` enforces that `github.com/hanzoai/cloud` carries zero commits from non-public remotes and zero non-public Go module imports (`Apache-2.0 OR MIT`).
+
+## Apps: one source each
+
+An app under `apps/<name>` imports `zip`, the standard library and public modules, and nothing of its host: not `github.com/hanzoai/cloud` itself and not another of this repo's packages (`apps/imports_test.go` fails the build on one). It exports `Mount(app *zip.App, ...) error`, taking the router and exactly what it reads from its host, and `apps.Wire()` adapts `cloud.Deps` to that. An app written this way mounts unchanged in any host that hands it those values, which is how the private build runs the same source.
+
+An app is private only when its job is one of:
+
+- **M** moving or pricing money: billing, commerce, payouts, plans and prices, balances, resale at our prices.
+- **A** operating the platform as SuperAdmin: fleet, host and platform-wide control.
+- **P** our production estate: our cluster's build and deploy plane, our data tier, our private model layer.
+- **H** one private program: a runtime or a network's onboarding that is not a product anyone else runs.
+
+Everything else is OSS. An OSS app that still needs a private package is OSS with a host seam to cut, not private: the seam is the work, not the verdict.
+
+Moved here so far: `blueprint`, `template`. The private build deletes its copy as each one lands and imports this module's.
+
+| app | class | reason |
+|---|---|---|
+| account | OSS | API keys and org onboarding; the billing-subject pin moves behind a host seam |
+| ad | OSS | paid-ad campaigns over the org's own connected accounts |
+| admin | PRIVATE | A: the SuperAdmin operator console |
+| admission | PRIVATE | A: operator launch control and waitlist for our hosted services |
+| affiliate | PRIVATE | M: partner commission payouts |
+| agents | OSS | autonomous agents for an org |
+| ai | PRIVATE | M: the model API on our upstream vendor accounts, plan caps and spend gates |
+| allowance | PRIVATE | M: plan caps and spend metering |
+| amqp | OSS | AMQP 0-9-1 adapter on the message bus |
+| answer | OSS | researched answers with sources |
+| ask | OSS | plain-language questions answered over an org's own numbers |
+| auditlog | OSS | tamper-evident audit trail (a local twin already ships) |
+| author | PRIVATE | M: royalty payouts to open-source authors |
+| auto | OSS | workflows on a schedule or a webhook |
+| base | OSS | managed Base (a local twin already ships) |
+| benchmark | OSS | model benchmark scores |
+| billing | PRIVATE | M: balances, spend and cards |
+| blueprint | OSS | MOVED: template compute-cost estimate and bill of images |
+| books | PRIVATE | M: the double-entry ledger of the platform's own money |
+| bot | OSS | a bot doing work on a desktop |
+| campaign | OSS | go-to-market campaigns across paid, organic and email |
+| captable | OSS | cap table |
+| catalog | OSS | one place to browse projects, apps and sites |
+| ci | OSS | CI dashboard |
+| cloudflare | OSS | the org's own Cloudflare account, managed |
+| cms | OSS | CMS content model fixtures |
+| code | OSS | code search and symbols (a local twin already ships) |
+| coding | OSS | autonomous coding runs |
+| commerce | PRIVATE | M: checkout, subscriptions and invoices |
+| company | PRIVATE | M: incorporation sold through our partner accounts |
+| compliance | OSS | KYC/KYB records and accreditation; the vendor adapter is a seam |
+| compute | OSS | machines, GPUs and clusters through a configured Visor |
+| content | OSS | marketing content from draft to published |
+| crawl | OSS | a web page as clean markdown |
+| crm | OSS | sales and hiring model |
+| dataroom | OSS | secure document room |
+| dataset | OSS | per-org datasets for the risk model plane |
+| deploy | PRIVATE | A: SuperAdmin control of our CD (sync, roll back) |
+| destination | OSS | events forwarded to ad and analytics tools |
+| dns | OSS | DNS records (a local relay already ships) |
+| domain | PRIVATE | M: domains resold through our registrar account |
+| email | OSS | commercial mail through the org's own provider |
+| engine | OSS | serving-runtime management plane |
+| entitlement | PRIVATE | M: what the plan grants |
+| environment | OSS | what a codebase is before its agent starts |
+| erp | OSS | ERP business model fixtures |
+| esign | OSS | documents out for signature |
+| eval | OSS | scoring a model on your own data |
+| event | OSS | product analytics |
+| exec | OSS | code interpreter (a local twin already ships) |
+| experiment | OSS | A/B testing |
+| explorer | OSS | block indexer status |
+| flags | OSS | feature flags (a local twin already ships) |
+| flow | OSS | agent workflow canvas |
+| form | OSS | forms |
+| framework | OSS | document types you define |
+| functions | OSS | serverless functions (a local twin already ships) |
+| gateway | OSS | live edge policy (a local twin already ships) |
+| git | OSS | Git hosting for an org |
+| graph | OSS | an org's entities and relations |
+| guide | OSS | guided company building |
+| help | OSS | support desk |
+| iam | OSS | identity provider mount |
+| index | OSS | full-text search over an org's data |
+| ingress | OSS | edge TLS and hostname routing (a local twin already ships) |
+| kafka | OSS | Kafka adapter on the message bus |
+| kms | OSS | secret custody (a local twin already ships) |
+| knowledge | OSS | team wiki and agent memory |
+| kv | OSS | key-value store (a local twin already ships) |
+| label | OSS | ground-truth labels for the risk model plane |
+| leaderboard | OSS | who uses AI most, opt-in |
+| legal | OSS | company paperwork drafted, signed, filed |
+| library | OSS | everything a person made, in one place |
+| link | OSS | AI login manager registry |
+| lsp | OSS | live code intelligence |
+| market | OSS | what trades on each chain |
+| marketing | OSS | lifecycle email drips |
+| marketplace | PRIVATE | M: settlement between orgs |
+| meet | OSS | virtual office rooms |
+| ml | OSS | model serving |
+| mq | OSS | queue and stream admin |
+| network | OSS | networking surface |
+| node | OSS | an org's machines |
+| notify | OSS | transactional email and SMS through the org's own provider |
+| o11y | OSS | logs, metrics and traces; in-cluster defaults become config |
+| patent | OSS | who conceived what, and when the machine was asked |
+| patrol | OSS | estate watch: sites, tours, incidents |
+| plan | PRIVATE | M: the plan catalog and its prices |
+| platform | PRIVATE | P: PaaS build and deploy on our cluster and runner pool |
+| plugin | PRIVATE | A: SuperAdmin control of what each host runs |
+| pref | OSS | per-person settings |
+| pricing | PRIVATE | M: our price list and vendor costs |
+| principals | PRIVATE | M: an org as payer or payee, with screening |
+| projects | OSS | where sites live: create, deploy, roll back |
+| prompt | OSS | versioned prompt library |
+| provider | OSS | connect third-party accounts; vendor client ids become config |
+| provisioning | PRIVATE | P: one-click add-ons on our production data tier |
+| pubsub | OSS | message bus |
+| reference | OSS | lookup data for the risk model plane |
+| referral | PRIVATE | M: attribution that feeds affiliate payables |
+| registry | OSS | container and package registry management |
+| research | OSS | every experiment kept and comparable |
+| reward | PRIVATE | M: points that convert to money |
+| risk | OSS | per-org scoring models |
+| s3 | OSS | object storage buckets (a local twin already ships) |
+| sandbox | OSS | the sandbox compute primitive |
+| sbom | OSS | components inside a container image |
+| search | OSS | one ranked result set over an org's data |
+| security | OSS | secret scanning (a local twin already ships) |
+| seo | PRIVATE | M: a measurement vendor resold at metered prices |
+| settings | OSS | per-product org settings |
+| share | OSS | a public URL for a service on your own machine |
+| sites | OSS | published sites |
+| skills | OSS | the skill catalogue an AI client reads |
+| social | OSS | posting to every social account |
+| space | OSS | drives, folders and files |
+| standing | PRIVATE | M: the priced cost of keeping a company |
+| studio | OSS | Studio workflow backend |
+| sync | OSS | data sync between endpoints |
+| task | OSS | boards and work items |
+| tax | PRIVATE | M: payee tax forms for payouts |
+| taxonomy | OSS | the product catalogue's categories and tags |
+| team | OSS | shared documents and files |
+| tel | PRIVATE | M: carrier numbers and calls resold |
+| template | OSS | MOVED: starter-kit gallery |
+| tools | OSS | everything an org can call, in one list |
+| train | PRIVATE | M: per-second billing windows and our executor fleet |
+| translate | OSS | text translation |
+| transport | OSS | one inbox for the chat apps you connect |
+| treasury | PRIVATE | M: the reserve fund behind payouts |
+| trust | OSS | trust centre |
+| usage | PRIVATE | M: what an org ran and what it cost |
+| validator | PRIVATE | H: one network's validator onboarding program |
+| wallet | PRIVATE | M: key custody for value |
+| web3 | OSS | chain-access surface |
+| webhook | OSS | webhook endpoints and delivery |
+| websearch | OSS | web search and page fetch for agents |
+| workflow | OSS | durable workflows |
+| world | OSS | live news feed filtered to a project |
+| worlds | PRIVATE | H: relay to a private runtime |
+| x402 | PRIVATE | M: pay-per-request payments |
+| zen | PRIVATE | P: our private model-serving layer |
+
+Three more apps have a plugin and no source directory in the private build, because each is an external module: `authz` and `metrics` are OSS modules, `licensing` is private.

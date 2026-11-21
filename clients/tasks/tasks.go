@@ -155,32 +155,32 @@ func routes(app *zip.App, s *cloud.Service[state]) {
 	// OpenAPI document publishes and what a generated SDK calls. fiber matches
 	// both spellings, so this never showed up as a broken request; it showed up
 	// as a document describing a path nobody writes by hand.
-	zip.Post[SubmitIn, Task](app, "/v1/tasks", submit(s),
+	app.Post[SubmitIn, Task]("/v1/tasks", submit(s),
 		zip.WithOperationID("tasks_submit"),
 		zip.WithSummary("Enqueue a task"),
 		zip.WithTags("tasks"),
 		zip.WithStatus(201))
-	zip.Get[ListIn, ListOut](app, "/v1/tasks", list(s),
+	app.Get[ListIn, ListOut]("/v1/tasks", list(s),
 		zip.WithOperationID("tasks_list"),
 		zip.WithSummary("List tasks, newest first"),
 		zip.WithTags("tasks"))
-	zip.Post[LeaseIn, Task](g, "/lease", lease(s),
+	g.Post[LeaseIn, Task]("/lease", lease(s),
 		zip.WithOperationID("tasks_lease"),
 		zip.WithSummary("Lease the next queued task"),
 		zip.WithTags("tasks"))
-	zip.Get[GetIn, Task](g, "/:id", get(s),
+	g.Get[GetIn, Task]("/:id", get(s),
 		zip.WithOperationID("tasks_get"),
 		zip.WithSummary("Read one task"),
 		zip.WithTags("tasks"))
-	zip.Post[CompleteIn, Task](g, "/:id/complete", complete(s),
+	g.Post[CompleteIn, Task]("/:id/complete", complete(s),
 		zip.WithOperationID("tasks_complete"),
 		zip.WithSummary("Complete a leased task"),
 		zip.WithTags("tasks"))
-	zip.Post[FailIn, Task](g, "/:id/fail", fail(s),
+	g.Post[FailIn, Task]("/:id/fail", fail(s),
 		zip.WithOperationID("tasks_fail"),
 		zip.WithSummary("Fail a leased task, requeueing it while attempts remain"),
 		zip.WithTags("tasks"))
-	zip.Delete[CancelIn, Task](g, "/:id", cancel(s),
+	g.Delete[CancelIn, Task]("/:id", cancel(s),
 		zip.WithOperationID("tasks_cancel"),
 		zip.WithSummary("Cancel a task"),
 		zip.WithTags("tasks"))

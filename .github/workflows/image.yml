@@ -15,7 +15,49 @@ permissions:
   packages: write
 
 jobs:
+  check:
+    runs-on: [linux-amd64]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Configure git credentials for Go modules
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          CFG="${RUNNER_TEMP}/gitconfig-ci"
+          : > "${CFG}"
+          if [ -n "${GH_PAT:-}" ]; then
+            GIT_CONFIG_GLOBAL="${CFG}" git config --global \
+              url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "https://github.com/"
+          fi
+          {
+            echo "GIT_CONFIG_GLOBAL=${CFG}"
+            echo "GIT_CONFIG_NOSYSTEM=1"
+            echo "GONOSUMDB=github.com/luxfi/*,github.com/hanzoai/*,github.com/hanzos3/*,github.com/zap-proto/*"
+          } >> "$GITHUB_ENV"
+
+      - name: Vet and test (CGO_ENABLED=0)
+        env:
+          CGO_ENABLED: "0"
+          GOWORK: "off"
+        run: |
+          set -euo pipefail
+          go vet ./...
+          go test ./...
+
   publish:
+    needs: check
     runs-on: [linux-amd64]
     timeout-minutes: 20
     steps:
@@ -44,7 +86,7 @@ jobs:
           {
             echo "GIT_CONFIG_GLOBAL=${CFG}"
             echo "GIT_CONFIG_NOSYSTEM=1"
-            echo "GONOSUMDB=github.com/luxfi/*,github.com/hanzoai/*,github.com/hanzos3/*"
+            echo "GONOSUMDB=github.com/luxfi/*,github.com/hanzoai/*,github.com/hanzos3/*,github.com/zap-proto/*"
           } >> "$GITHUB_ENV"
 
       - name: Build multi-arch static binaries (CGO_ENABLED=0)
@@ -60,8 +102,6 @@ jobs:
           fi
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
           echo "SHORT_SHA=${SHORT_SHA}" >> "$GITHUB_ENV"
-
-          go vet ./...
 
           for arch in amd64 arm64; do
             mkdir -p "dist/linux-${arch}"
