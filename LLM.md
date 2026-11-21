@@ -57,8 +57,6 @@ make hooks    # git config core.hooksPath .githooks (public-only pre-push guard)
 
 Beside it: `sdk/driver/{postgres,kv,s3}` (the hanzo-sql, KV and object-store backends; `postgres.Declare` names the subsystems that live on hanzo-sql), and the test kits `sdk/sqltest`, `sdk/sqlcheck`, `sdk/driver/kv/kvtest`, `sdk/coord/coordtest`. Tests that exercise a billing ledger, the private app registry or the private host live with those.
 
-The module builds with no credentials: `GOENV=off GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org GOFLAGS=-mod=readonly go build ./...` is the first step of CI, so a dependency the public proxy does not serve fails there.
-
 ## Apps: one source each
 
 An app under `apps/<name>` imports zip, the standard library and public modules, and nothing of its host: not `github.com/hanzoai/cloud` itself and not another of this repo's packages (`apps/imports_test.go` fails the build on one). It exports `Mount(app *zip.App, ...) error`, taking the router and exactly what it reads from its host, and `apps.Wire()` adapts `cloud.Deps` to that. An app written this way mounts unchanged in any host that hands it those values, which is how the private build runs the same source.

@@ -10,13 +10,8 @@ import (
 	"testing"
 )
 
-// What sdk/ may import is what the public module can reach: itself and public
-// modules. Never an app or any other package of this repository, never a private
-// module, and never a production backend: a package here names an interface and
-// ships its local default (SQLite, local disk, in-process), and the backend for
-// hanzo-sql, hanzo-kv, hanzo-s3, the cross-pod bus or a remote KMS registers into that
-// interface from the host. The backends and their test kits are the packages under
-// sdk/driver and sdk/sqltest, and only they link those clients.
+// sdk/ imports itself and public modules only, and links a production backend (hanzo-sql,
+// hanzo-kv, hanzo-s3, the bus, a remote KMS) only under sdk/driver and the test kits.
 const module = "github.com/hanzoai/cloud/"
 
 // backends are the production clients the rest of sdk/ must not link.
