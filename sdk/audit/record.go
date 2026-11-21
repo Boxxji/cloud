@@ -1,0 +1,200 @@
+package audit
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"time"
+)
+
+// Actor identifies WHO performed the action. It is populated ONLY from a
+// validated principal (the sanitized X-User-* headers SanitizeIdentity mints
+// from a verified IAM JWT), never from a raw client header — so an actor can
+// never be forged by the request that is being audited. A service principal
+// (M2M / no user sub) records Org with an empty Sub.
+type Actor struct {
+	// Org is the tenant the action was taken IN — the EFFECTIVE org (X-Org-Id).
+	// For all but one caller this is also the actor's own org. Empty for an
+	// unauthenticated request.
+	Org string `json:"org"`
+	// Sub is the user id (IAM `sub`/`preferred_username`). Empty for a service
+	// principal or an anonymous request.
+	Sub string `json:"sub"`
+	// Email is the validated user email, when present.
+	Email string `json:"email,omitempty"`
+
+	// Home is the actor's OWN org (the validated home-org claim, X-User-Owner),
+	// recorded ONLY when it DIFFERS from Org — i.e. ONLY when this action was
+	// taken by a platform SuperAdmin acting INSIDE ANOTHER TENANT.
+	//
+	// Recording it conditionally is what makes the field MEAN something: a
+	// non-empty Home is, by construction, an impersonation event. Without it an
+	// admin org-switch is indistinguishable from a native member of the target
+	// org, because Org alone says "lux" in both cases — the impersonation fact
+	// was being destroyed at the moment of recording.
+	//
+	// HASH COMPATIBILITY (why omitempty is load-bearing, not style): the chain
+	// hashes the canonical JSON of the record (canonicalBytes). An omitempty
+	// field that is empty marshals to NOTHING, so every pre-existing record —
+	// and every ordinary same-org record written from now on — produces byte-
+	// identical canonical JSON to before this field existed. Existing hashes
+	// still verify. See TestVerify_HomeFieldIsHashCompatible.
+	Home string `json:"home,omitempty"`
+
+	// Act is the operator behind an impersonated principal — a SuperAdmin signed
+	// in AS this actor for a support session (IAM's `imp`, with the operator in
+	// `act`). Org, Sub and Email above stay the person's, because the authority
+	// exercised was theirs; Act names who was at the keyboard. Zero for everyone
+	// acting as themselves, and then omitted from the canonical JSON (omitzero),
+	// so every record without one hashes exactly as before it existed.
+	Act Act `json:"act,omitzero"`
+
+	// Agent is who acted FOR this actor when nobody was impersonating them: act.sub
+	// of a delegated token — the deployment that ran the person's work in a
+	// sandbox, which made the call the person is billed for. Org, Sub and Email
+	// stay the person's. Empty for everyone acting as themselves, and then
+	// omitted from the canonical JSON, so every record without one hashes exactly
+	// as before it existed.
+	Agent string `json:"agent,omitempty"`
+}
+
+// Act is the operator IAM names in an impersonation token's `act` claim.
+type Act struct {
+	// Sub is the operator's IAM subject.
+	Sub string `json:"sub"`
+	// Owner is the org of the operator's IAM row: "admin" for a SuperAdmin.
+	Owner string `json:"owner,omitempty"`
+	// Name is the operator's IAM username.
+	Name string `json:"name,omitempty"`
+}
+
+// Resource identifies WHAT was acted upon: a type (e.g. "org", "role",
+// "secret", "provider-config", "credit") and its id. For a plain HTTP mutation
+// with no finer resource semantics, Type is the route family and ID is empty —
+// the Action verb + path already pin the object.
+type Resource struct {
+	Type string `json:"type"`
+	ID   string `json:"id,omitempty"`
+}
+
+// AuthContext records HOW the actor authenticated and what authority they held
+// at decision time — the AC-* evidence (was this a SuperAdmin? by what
+// credential?). Method is "jwt" | "api-key" | "none". IsAdmin is the VALIDATED
+// SuperAdmin bit (owner == AdminOrg), never a raw X-User-IsAdmin.
+type AuthContext struct {
+	Method  string `json:"method"`
+	IsAdmin bool   `json:"isAdmin"`
+}
+
+// Outcome is the result of the action: whether it was allowed and what
+// happened. Result is "success" | "deny" | "error". Status is the HTTP status.
+// Reason is a short, non-sensitive explanation for a deny/error (e.g.
+// "SuperAdmin required", "insufficient_balance") — never a secret, never a
+// raw upstream error body.
+type Outcome struct {
+	Result string `json:"result"`
+	Status int    `json:"status"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// Record is one audit event. The JSON tags ARE the on-disk and on-wire contract.
+//
+// Field order in the struct is deliberate but IRRELEVANT to the hash: the chain
+// hashes the CANONICAL (sorted-key) JSON of the record with Hash/PrevHash zeroed
+// (see canonicalBytes), so re-ordering fields or adding an omitempty field can
+// never change an existing record's hash.
+type Record struct {
+	// Seq is the strictly-increasing chain position (0-based). It is assigned by
+	// the Recorder under its lock, so it is a true total order with no gaps.
+	Seq uint64 `json:"seq"`
+
+	// Time is the UTC event timestamp (RFC3339Nano).
+	Time time.Time `json:"time"`
+
+	// Actor / Action / Resource / Auth / Outcome — the AU-3 "content of audit
+	// records" core: who, what, on what, how-authenticated, with what result.
+	Actor    Actor       `json:"actor"`
+	Action   string      `json:"action"`
+	Resource Resource    `json:"resource"`
+	Auth     AuthContext `json:"auth"`
+	Outcome  Outcome     `json:"outcome"`
+
+	// SourceIP + UserAgent — the AU-3 "source of the event" fields.
+	SourceIP  string `json:"sourceIp,omitempty"`
+	UserAgent string `json:"userAgent,omitempty"`
+
+	// RequestID correlates the record to the request-line log and any downstream
+	// trace (the X-Request-Id the pipeline mints).
+	RequestID string `json:"requestId,omitempty"`
+
+	// Method + Path are the HTTP verb and route for a request-sourced event.
+	Method string `json:"method,omitempty"`
+	Path   string `json:"path,omitempty"`
+
+	// Before / After capture a mutation's prior and resulting state for the
+	// AU-required "before/after" on config-affecting changes. They are populated
+	// ONLY by explicit emit points and ONLY after Redact has stripped secrets —
+	// the HTTP middleware never sets them (it never reads bodies), so a secret in
+	// a request body can never leak here. Raw JSON so any shape round-trips.
+	Before json.RawMessage `json:"before,omitempty"`
+	After  json.RawMessage `json:"after,omitempty"`
+
+	// PrevHash is the hash of record Seq-1 (hex). For the genesis record (Seq 0)
+	// it is genesisPrevHash. Hash is this record's hash. Neither participates in
+	// its own hash computation (both are zeroed in canonicalBytes).
+	PrevHash string `json:"prevHash"`
+	Hash     string `json:"hash"`
+}
+
+// genesisPrevHash is the PrevHash of the first record in a fresh chain: 32 zero
+// bytes, hex-encoded. A non-empty, fixed anchor so the genesis record's hash is
+// still a function of a known constant (not the empty string, which would be
+// indistinguishable from "field omitted").
+const genesisPrevHash = "0000000000000000000000000000000000000000000000000000000000000000"
+
+// canonicalBytes returns the deterministic byte string a record hashes over: the
+// record with Hash AND PrevHash zeroed, marshaled by encoding/json (which sorts
+// struct fields in declaration order and, critically, is stable for a given
+// struct — the SAME bytes on every machine and every run). Zeroing PrevHash here
+// means the hash covers only the record's OWN content; the link to the previous
+// record is added explicitly in computeHash by appending prevHash. This keeps
+// the two concerns separable and the math obvious.
+//
+// We marshal a copy with the two hash fields cleared rather than a parallel
+// struct so there is exactly ONE definition of a record's fields (DRY): add a
+// field to Record and it is covered by the hash automatically.
+func canonicalBytes(r Record) ([]byte, error) {
+	r.Hash = ""
+	r.PrevHash = ""
+	return json.Marshal(r)
+}
+
+// computeHash returns the hex SHA-256 of (canonical(record) || prevHash-bytes).
+// The prevHash is folded in as its RAW hex string bytes — the exact value stored
+// in the record's PrevHash field — so the verifier reproduces it byte-for-byte
+// from stored data alone. Any change to the record's content OR to which record
+// precedes it changes this output, which is the whole tamper-evidence property.
+func computeHash(r Record, prevHash string) (string, error) {
+	body, err := canonicalBytes(r)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	h.Write(body)
+	h.Write([]byte(prevHash))
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// seal finalizes a record into position seq linked to prevHash: it stamps Seq
+// and PrevHash, computes Hash, and returns the sealed record ready to append.
+// The Recorder calls this under its lock so seq/prevHash reflect the true head.
+func seal(r Record, seq uint64, prevHash string) (Record, error) {
+	r.Seq = seq
+	r.PrevHash = prevHash
+	hash, err := computeHash(r, prevHash)
+	if err != nil {
+		return Record{}, err
+	}
+	r.Hash = hash
+	return r, nil
+}

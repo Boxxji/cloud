@@ -1,0 +1,198 @@
+package cloud
+
+// gate.go is the ONE authorization gate of the data plane.
+//
+// HIP-0519 §"The one predicate set": every authorization check reads the SAME
+// three predicates — principal.Validated (a principal is present at all),
+// principal.Super (platform sudo, owner == the admin org), and
+// principal.IsOrgAdmin (admin of one's OWN org). A subsystem that spells its own
+// gate is a second rule, and two rules for one fact drift apart; seven of them
+// drift seven ways.
+//
+// TWO VALUES, ONE RULE. Authority is what a caller HAS, reduced to exactly those
+// three facts. Scope is what a route REQUIRES. Admits is the whole rule, in one
+// expression, over the two — and where it admits either admin scope it writes
+// `Super || OrgAdmin` explicitly, so the superset is visible AT the gate rather
+// than hidden inside a predicate. Guard is that rule's standard application to a
+// handler.
+//
+// WHAT IS NOT HERE. Authentication: identity is verified exactly once, at the
+// edge, against IAM (middleware_identity.go); this reads the assertion that
+// minted and answers an authorization question about it. Nor anything a
+// subsystem does BESIDES authorization — store readiness, key syntax, per-op
+// billing, the shape of a refusal, the tenant confinement applied after a
+// caller is admitted. Those compose AROUND the gate, so each app keeps its own
+// business and none of them keeps a copy of the rule.
+
+import (
+	"context"
+
+	"github.com/hanzoai/cloud/sdk/principal"
+	"github.com/zap-proto/zip"
+)
+
+// Authority is a caller reduced to the three facts an authorization check may
+// read. The two admin bits stay APART — conflating them is a privilege
+// escalation: Super is cross-tenant platform sudo, OrgAdmin administers only its
+// own org and is never platform-privileged.
+type Authority struct {
+	Validated bool // a credential was verified — the identity middleware MINTED X-User-Id
+	Super     bool // platform authority: principal.Super, owner == "admin"
+	OrgAdmin  bool // admin OF ITS OWN org — org-scoped, self-service
+}
+
+// AuthorityOf reads one off an HTTP request: the three predicates, and nothing
+// else. It is the ONE extraction — a transport that carries identity some other
+// way (a delegated capability on the internal plane) fills the same value from
+// its own fields and reaches the identical verdict, because the verdict is
+// Scope.Admits and not the extraction.
+func AuthorityOf(c *zip.Ctx) Authority {
+	return Authority{
+		Validated: principal.Validated(c),
+		Super:     principal.Super(c),
+		OrgAdmin:  principal.IsOrgAdmin(c),
+	}
+}
+
+// AuthorityIn reads the same three facts off a typed op's CONTEXT, for the
+// preamble that holds no *zip.Ctx. Same extraction, same verdict — AuthorityOf
+// is asked through the request this finds.
+//
+// IT EXISTS BECAUSE A ROUTE IS NOT THE ONLY WAY IN. zip records a typed op and
+// its route's handler as two fields of one entry and wraps only the handler, so
+// a gate installed as middleware — handed to Group, composed through With, or
+// installed at the root and bounded by path — runs for REST and for nothing
+// else, while MCP, the call plane, the graph and the CLI invoke the op directly
+// and the identity middleware has already authenticated whoever is calling. An
+// operation that requires authority therefore asks for it HERE, in its own
+// preamble, which is the one place every way in passes through.
+//
+// Fail-closed off the HTTP path: no request, no verified claim, no authority.
+//
+// OrgAdmin is a fact about the org the request acts in (principal.Org), and it is
+// reported only for that org. A context re-pointed at another tenant
+// (principal.WithActing, which cloud.As uses) carries no org-admin authority
+// there — the same rule cloud.As applies to the caller it states — so an op that
+// resolves its tenant with principal.Acting and its authority here can never pair
+// one org with another org's admin bit. Super is cross-tenant and is unaffected.
+func AuthorityIn(ctx context.Context) Authority {
+	c, ok := Request(ctx)
+	if !ok {
+		return Authority{}
+	}
+	a := AuthorityOf(c)
+	if acting, ok := principal.OrgFrom(ctx); ok {
+		if home, _ := principal.Org(c); acting != home {
+			a.OrgAdmin = false
+		}
+	}
+	return a
+}
+
+// Scope is how much authority a route REQUIRES. It is a closed set: there are
+// three kinds of check in the platform, and a fourth would be a new rule, not a
+// new constant.
+type Scope int
+
+const (
+	// Member admits any validated principal. It is the check on a TENANT surface,
+	// where the caller's own org is the whole of what it may reach — the gate
+	// establishes that a principal exists, and the handler's own org resolution
+	// confines it.
+	Member Scope = iota
+	// Admin admits a SuperAdmin OR an admin of its own org. It is the check on an
+	// administrative READ, where a tenant admin sees its own and platform sudo
+	// sees everything — again, the confinement is the handler's.
+	Admin
+	// Super admits platform sudo alone. It is the check on an act against SHARED
+	// platform state, which no customer-org admin may take however much authority
+	// they hold inside their own org.
+	Super
+)
+
+// Admits is the whole authorization rule. Nothing else in the platform decides
+// this question.
+func (s Scope) Admits(a Authority) bool {
+	if !a.Validated {
+		return false // fail closed: no principal, no authority, at every scope
+	}
+	switch s {
+	case Member:
+		return true
+	case Admin:
+		return a.Super || a.OrgAdmin
+	case Super:
+		return a.Super
+	}
+	return false
+}
+
+// Guard applies the rule to a handler in the standard way: an inadmissible
+// caller is refused — 401 when nobody attested it, 403 when it lacks the scope —
+// before the handler runs, so nothing behind the gate ever observes an
+// unauthorized request.
+//
+// A subsystem whose REFUSAL has a different shape (the deploy console sends a
+// browser navigation to sign-in) calls Admits directly instead. That is a
+// difference in the answer, not in the rule — the rule is still read from here.
+func Guard(s Scope, h zip.Handler) zip.Handler {
+	return func(c *zip.Ctx) error {
+		if a := AuthorityOf(c); !s.Admits(a) {
+			return s.refuse(a)
+		}
+		return h(c)
+	}
+}
+
+// Gate is Guard as GROUP middleware: the same rule, applied to everything
+// registered behind it rather than to one handler.
+//
+// It is the third form of one gate and the last one needed — Guard wraps a
+// handler, Refusal is the line a typed op writes because there is no handler to
+// wrap, and this Nexts. Five subsystems had written their own group gate, and
+// each spelled the refusal itself, so the sentence a caller reads depended on
+// which endpoint it knocked at.
+func Gate(s Scope) zip.Handler {
+	return func(c *zip.Ctx) error {
+		if a := AuthorityOf(c); !s.Admits(a) {
+			return s.refuse(a)
+		}
+		return c.Next()
+	}
+}
+
+// Refusal is what this scope answers an inadmissible caller with, and Guard's
+// own answer. It exists because a TYPED op cannot be guarded by wrapping:
+// zip.Get[In, Out] takes a handler that receives a context and its decoded In, so
+// there is no zip.Handler for Guard to compose around and the gate becomes the
+// first line INSIDE the op (apps/platform/ops.go). The rule is still Admits and
+// the sentence is still refusal, so the two forms of the one gate cannot answer
+// differently.
+//
+// It is a METHOD on the scope rather than a function taking one, because the
+// sentence is derived from the scope — a caller is told what it lacks in the
+// vocabulary of the check it failed — and because Refuse is already the name of
+// the 402 every SPEND gate renders (middleware_spend.go). Two refusals that mean
+// different things do not share a name.
+//
+// Member refuses only a caller nobody attested, so its refusal is the 401 that
+// names the missing key (principal.Unauthenticated). An admin scope refuses both
+// kinds of caller and, holding no authority here, says what the scope requires.
+func (s Scope) Refusal() error {
+	switch s {
+	case Admin:
+		return zip.ErrForbidden("admin required")
+	case Super:
+		return zip.ErrForbidden("SuperAdmin required")
+	}
+	return principal.Unauthenticated()
+}
+
+// refuse is Refusal for a gate that holds the caller's authority, and so can
+// tell an unknown caller (401) from a known one without the scope (403).
+func (s Scope) refuse(a Authority) error {
+	if !a.Validated {
+		return principal.Unauthenticated()
+	}
+	return s.Refusal()
+}

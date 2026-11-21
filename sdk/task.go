@@ -1,0 +1,92 @@
+package cloud
+
+import (
+	"context"
+	"errors"
+)
+
+// task.go is the inversion layer between the native task store (apps/task)
+// and the surfaces that FEED it work items without importing it — today the GitHub
+// App webhook + backfill (clients/integrations), tomorrow any provider that mirrors
+// external issues into the one Hanzo work-item store. It is the same idiom as
+// sync.go's SyncFunc and git_import.go's GitImporter: the todo registers its
+// sink here at Mount; feeders call UpsertIssue with NO import of the todo package,
+// so nothing imports todo except apps (which mounts it). One direction,
+// no cycles.
+
+// IssueUpsert is a provider-agnostic external work item mirrored into the native
+// todo, keyed idempotently by ExtRef so a webhook redelivery or a backfill re-run
+// UPDATES the same row instead of duplicating it. Flat + string-typed so it crosses
+// from feeder to todo without importing the todo's domain types.
+//
+//   - Org         the tenant (resolved from the signed installation, never a header).
+//   - Project     the IAM project scope; "" ⇒ the org's default project store.
+//   - ProjectKey  the todo team the item files under (e.g. "GH"); ensured on first use.
+//   - ProjectName the display name for that team when it is first created (e.g. "GitHub").
+//   - Repo        the git repo the item belongs to — the per-repo filter discriminator.
+//   - ExtRef      the external anchor + idempotency key (e.g. "github:owner/repo#123").
+//   - Kind/Source what it IS / which surface opened it ("issue"|"pr" / "git").
+//   - State       the upstream open/closed state; the todo maps it to a board column.
+//   - Labels      upstream label names (the todo joins them for storage).
+//   - Channel     the conversation the item was asked for in (client.Reply.Address);
+//     bound once, and "" leaves a bound row alone.
+type IssueUpsert struct {
+	Org         string
+	Project     string
+	ProjectKey  string
+	ProjectName string
+	Repo        string
+	ExtRef      string
+	Kind        string
+	Source      string
+	Title       string
+	Description string
+	State       string // "open" | "closed"
+	Assignee    string
+	Labels      []string
+	Channel     string
+}
+
+// IssueUpsertResult reports what the upsert did — Created (a new row) vs updated,
+// plus the todo identity, so a feeder can log/count precisely (the backfill count).
+type IssueUpsertResult struct {
+	Created    bool
+	Number     int
+	Identifier string // KEY-<number>
+	Channel    string // the conversation the row is bound to, "" for none
+}
+
+// IssueSink is the todo's upsert entry the sink registers at Mount; feeders reach
+// it via UpsertIssue. A function, not a todo noun — the one implementation
+// (apps/task) registers it, and the feeders never see the store.
+type IssueSink func(ctx context.Context, in IssueUpsert) (IssueUpsertResult, error)
+
+// issueSink is the registered sink (nil until the todo mounts). Read on the
+// webhook path, written once at Mount (before serving), so a plain var suffices —
+// the same discipline as syncFn / gitImporter.
+var issueSink IssueSink
+
+// RegisterIssueSink installs the todo upsert sink. nil-safe.
+func RegisterIssueSink(fn IssueSink) { issueSink = fn }
+
+// ErrIssueSinkUnavailable is returned when the todo is not mounted — fail-closed,
+// never a silent success, so a feeder logs precisely rather than dropping the item.
+var ErrIssueSinkUnavailable = errors.New("cloud: issue sink not registered")
+
+// UpsertIssue mirrors one external work item into the native todo via the
+// registered sink, or over the plane when the todo is not co-resident.
+//
+// The FEEDER is integrations (it holds the GitHub App and verifies the webhook)
+// and the STORE is the todo app's, so the sink is nil on exactly the path
+// that has work to file. Every mirrored issue and every backfill row was refused
+// with "todo issue sink not registered" while the todo was serving its own
+// surface in the next process.
+func UpsertIssue(ctx context.Context, in IssueUpsert) (IssueUpsertResult, error) {
+	if issueSink != nil {
+		return issueSink(ctx, in)
+	}
+	if up := peersOf().UpsertIssue; up != nil {
+		return up(ctx, in)
+	}
+	return IssueUpsertResult{}, ErrNoPeer
+}

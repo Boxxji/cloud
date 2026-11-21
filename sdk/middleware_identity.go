@@ -1,0 +1,876 @@
+package cloud
+
+// SanitizeIdentity — the in-binary identity trust boundary.
+//
+// THE PROBLEM. zip.Ctx.Org()/IsAdmin()/User() read the X-Org-Id / X-User-IsAdmin
+// / X-User-Id request headers verbatim. In production the gateway
+// (hanzoai/gateway) is the sole author of those headers: it strips any
+// client-supplied copy and re-injects them from a validated IAM JWT (HIP-0026).
+// cloud TRUSTS that contract. A deployment that is also reachable WITHOUT the
+// gateway in front (directly in-cluster, or on a second public host) has paths on
+// which a caller can simply send `X-User-IsAdmin: true` and every cloud admin gate
+// (principal.Super) believes it. That is the forgeable-admin trust boundary.
+//
+// THE FIX. This middleware runs FIRST — before BillingGate and every subsystem —
+// and rewrites the request's identity headers so each downstream principal.Super /
+// c.Org() / c.User() reflects a VALIDATED principal, never a raw client header.
+// It is ONE place; every existing IsAdmin()/Org() reader (pricing admin
+// catalog + /v1/pricing/sync, provisioning, ml, eval, plan) becomes
+// trustworthy without touching a single handler.
+//
+// ADMIN IS SUPERADMIN, AND SUPERADMIN IS owner == "admin". The cloud admin surfaces
+// (global catalog writes, the literal "admin" org bucket, the CD plane) mean
+// platform authority, not "admin of my own org". Both facts are decided here, from
+// the signed membership set:
+//
+//	X-User-IsAdmin       ⟸ sudo — a PERSON whose own org, the first entry of
+//	                       `orgs`, is the reserved admin org.
+//	X-User-IsOrgAdmin    ⟸ authz.Claims.OrgAdmin(effOrg) — admin/owner role in the
+//	                       org the request ACTS in. Never platform authority.
+//
+// There is no `isAdmin` claim in this picture, in either direction. IAM mints one
+// into NEITHER token — internal/oidc/jwt.go's Claims struct has no such field, and
+// (*Signer).claims is the single place an Identity becomes a claim set, so the
+// access token and the id_token carry the same claims but for aud/tokenType/nonce.
+// The bit exists only as a user-row column that /v1/iam/userinfo and whoami report
+// in a RESPONSE BODY. Anything here that appeared to read it was reading a claim
+// that is never sent.
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/hanzoai/authz"
+	"github.com/hanzoai/cloud/sdk/brand"
+	"github.com/hanzoai/cloud/sdk/principal"
+	luxlog "github.com/luxfi/log"
+	"github.com/zap-proto/zip"
+)
+
+// cookieTokenNames are the session-cookie names that may carry an IAM access
+// token (mirrors edge.Cookie). hanzo_iam_token is the cookie the ai
+// the embedded account layer SETS after login (ai/controllers/account.go iamTokenCookieName)
+// — it MUST be read here too, or the embedded console (whose browser holds only
+// that httpOnly cookie, no Authorization header) resolves to no principal and
+// every org-scoped /v1 endpoint (agents/gpus/machines/platform/orgs/…) 403s
+// "X-Org-Id required". The JWT is present in the browser; this reads the right name.
+//
+// __Host-hanzo_iam_token is FIRST and is the name a first-party sign-in should
+// mint (clients/deploy does). The __Host- prefix is enforced by the browser: such
+// a cookie may only be set Secure, Path=/, and WITHOUT a Domain attribute, so a
+// sibling *.hanzo.ai host cannot set a Domain=.hanzo.ai cookie of the same name to
+// shadow it. The unprefixed names stay for the clients that already mint them (ai's
+// account.go, clients/team), and are read only if no un-shadowable cookie is present.
+var cookieTokenNames = []string{"__Host-hanzo_iam_token", "hanzo_iam_token", "iam_access_token", "access_token", "hanzo_token"}
+
+// The five authority headers cloud mints beside authz's — which brand's IAM
+// vouched for the principal, an application acting as itself, its memberships,
+// the API key it arrived on, and whether it is off the waitlist — are defined,
+// and each is documented, in sdk/principal: the leaf both this boundary and
+// the host's GraphQL relay (client.relayed) strip by, so the two cannot disagree
+// about what a caller may not assert.
+const (
+	HeaderUserBrand    = principal.HeaderUserBrand
+	HeaderUserIsApp    = principal.HeaderUserIsApp
+	HeaderUserOrgs     = principal.HeaderUserOrgs
+	HeaderKey          = principal.HeaderKey
+	HeaderUserApproved = principal.HeaderUserApproved
+)
+
+// Two categories of name reach this boundary and they are RESTORED differently,
+// which is the distinction to keep in mind reading the passes below.
+//
+// AUTHORITY is who the caller is — user, org, owner, brand, admin bits. A
+// downstream may trust it precisely because a client copy never survives ingress;
+// it is re-injected from a validated principal and from nothing else.
+//
+// An org SUB-SCOPE (X-Project-Id, X-App-Id, X-Billing-Account-Id) NARROWS within
+// an org and is not authority, so sanitizeSubScopes restores it in a separate pass
+// and per header: X-Project-Id is written from the validated `project` claim and
+// then checked non-foreign to the effective org, X-App-Id is a caller attribution
+// hint forwarded as-is, and X-Billing-Account-Id names WHO PAYS so it is minted
+// from the validated `billing_account` claim. The raw client copy is never a
+// source for any of them.
+//
+// Both categories are REMOVED the same way, by the one list below. They used to be
+// two lists that also spelled what to remove, which is two places for one fact to
+// go stale in.
+
+// stripped is every identity name ingress DELETES: ingress.Stripped, the one list
+// (see it for what is in it and why X-Request-Id is not).
+var stripped = principal.Stripped
+
+// SanitizeIdentity returns the identity-trust-boundary middleware.
+//
+// Per request:
+//   - ALWAYS delete every header in stripped (a client copy never
+//     survives — this alone kills X-User-IsAdmin forgery).
+//   - Validate a Bearer / Basic / session-cookie JWT, if present:
+//     SuperAdmin (sudo — a person whose own org, the first entry of the signed
+//     `orgs` set, is the reserved admin org; owner == "admin"). A membership of the
+//     admin org held from a brand org is not it, and the isAdmin bit is not a
+//     second term.
+//     → X-User-IsAdmin=true; X-Org-Id = the requested org when present
+//     (admin org-switch), else the home org.
+//     any other principal (incl. org admins, normal users)
+//     → X-Org-Id = a requested org its membership set names, other than the
+//     reserved one, else its own; NO admin. A client org cannot widen scope.
+//   - No / invalid / opaque-API-key credential:
+//     → NO identity at all: no user, no admin, no org. The client's X-Org-Id
+//     is deleted with every other authority header and nothing puts it back.
+//
+// AN ORG IS AUTHORITY. Every surface downstream that scopes by org reads
+// X-Org-Id, and not every one of them also asks whether a principal stands
+// behind it — an embedded module with its own identity reading is exactly the
+// kind that does not. So the org is written only for a principal this boundary
+// validated, and a request it could not attribute arrives org-less everywhere,
+// which every org gate refuses.
+//
+// FAIL MODE. If the validator can't verify a token (JWKS unreachable on a cold
+// cache, issuer/audience misconfigured), the request resolves anonymous and every
+// gate fails SECURE: no user, no org, no admin. Never fails OPEN. The availability
+// cost is bounded to COLD caches: the edge key cache is stale-on-error (a warm
+// cache keeps validating through a transient JWKS outage), so only a from-cold
+// JWKS failure degrades to anonymous-403.
+// The reserved admin org is NOT a parameter. It is the ISSUER's constant — IAM
+// hardcodes it (store.IsSuperAdmin: `owner == "admin"`, and the reserved-org set
+// beneath it) and authz publishes it as authz.AdminOrg — so a consumer-side knob
+// could only ever let cloud DISAGREE with the token contract it is reading. That
+// was not hypothetical: this file's own test doc asserted "Hanzo pins it to
+// 'hanzo'", which, had anyone set IAM_ADMIN_ORG that way, would have handed
+// platform sudo to every member of the hanzo org while IAM considered none of
+// them a SuperAdmin. Production never set it, so the default carried the truth by
+// luck. A knob whose only reachable non-default setting is an estate-wide
+// escalation is not configuration; it is a loaded footgun, and it is now gone.
+func SanitizeIdentity(v *Boundary) zip.Handler {
+	// The boundary this process installs is the one whose verdict on a confined
+	// token the model API reads (Confined): one verifier, not a second.
+	if v != nil {
+		warden.Store(v)
+	}
+	return func(c *zip.Ctx) error {
+		req := c.Fiber().Request()
+
+		// Capture the requested org + the attribution sub-scopes before stripping
+		// (the org a validated principal selects; the app / billing-account
+		// attribution hints), then delete every authority header AND
+		// every sub-scope header, so nothing a client sent survives as identity OR
+		// scope. X-Project-Id is NOT captured: it is written from the validated
+		// `project` claim below (claims.renderProject), never from a client value. A
+		// client org bearing a whitespace/control/format rune is refused here (not trimmed):
+		// trimming would collapse "acme " onto "acme", and the injective org
+		// boundary must never fold two distinct org identifiers into one.
+		selected := string(req.Header.Peek("X-Org-Id"))
+		cliOrg := selected
+		if principal.OrgHasUnsafeRune(cliOrg) {
+			cliOrg = ""
+		}
+		cliApp := strings.TrimSpace(string(req.Header.Peek("X-App-Id")))
+		for _, h := range stripped {
+			req.Header.Del(h)
+		}
+
+		// Every exit that resolves NOBODY is charged the per-IP limit the edge
+		// deferred to here (nobody): a credential that is no one is anonymous
+		// traffic with a header attached, and is counted as such.
+		if err := twoCredentials(c); err != nil {
+			return nobody(c, err, false)
+		}
+		claims, refused, strike := validatedPrincipal(c, v, cliOrg)
+		if refused != nil {
+			return nobody(c, refused, strike)
+		}
+		if claims != nil {
+			if err := claims.admits(c); err != nil {
+				return err
+			}
+			// The org is taken verbatim from the validated principal and validated,
+			// never trimmed: a whitespace/control/format-bearing owner is a
+			// non-injective org identifier (TrimSpace / transport OWS-trim would
+			// collapse "acme " onto "acme"), so it grants NO org-scoping — the request
+			// resolves org-less and every org() gate fails closed with 403,
+			// rather than folding two IAM orgs onto one namespace.
+			// The USER's org, from the signed membership set — NOT the `owner` claim,
+			// which carries the APPLICATION's org and is therefore chosen by whichever
+			// app the caller authenticated through (see idClaims.homeOrg). Everything
+			// below — the billing anchor, the SuperAdmin predicate, the effective org —
+			// reads this ONE value, so both defects close together.
+			owner := claims.homeOrg()
+			if principal.OrgHasUnsafeRune(owner) {
+				owner = ""
+			}
+			// FAIL CLOSED on a token that names no home org (no `orgs` claim: minted
+			// before IAM v1.33.0, or a machine token). Falling back to claims.Owner
+			// would reinstate the app-selected tenant this fix removes, so an
+			// unresolvable home org grants NO scoping at all: the request continues
+			// org-less and every org() gate refuses it. Logged, not silent — a real
+			// legacy principal must be visible to us, not merely denied. Bounded by
+			// token TTL: a re-auth mints the claim.
+			// WARN, not Debug: the expected rate is ~zero (IAM has minted `orgs` since
+			// v1.33.0 and live is far past it), so if this ever becomes noisy the noise
+			// IS the alarm — it means legacy principals are real and being denied, which
+			// we must learn immediately rather than infer from support tickets. Carries
+			// the AUDIENCE so the offending CLIENT is named, not just the user: IAM sets
+			// aud to the minting app's clientId (oidc/jwt.go audienceFor).
+			if owner == "" {
+				slog.Warn("identity: token names no home org (orgs claim absent or unsafe) — refusing org scope",
+					"sub", claims.Subject, "aud", claims.Audience)
+			}
+			if id := claims.userID(); id != "" {
+				req.Header.Set(authz.HeaderUser, id)
+			}
+			// A SuperAdmin impersonation token: the claims above are the TARGET's, and
+			// the operator behind them is named here, from the verified `act`, in the
+			// header zip forwards across every plane hop with the identity it re-points.
+			// Every reader that must not mistake the operator's acts for the target's
+			// reads this one fact — the event plane stamps it onto each row.
+			if claims.operator.Sub != "" {
+				req.Header.Set(zip.HeaderActedBy, claims.operator.Sub)
+			}
+			// X-User-Name is the IAM USERNAME (the `name` half of <owner>/<name>),
+			// stamped DISTINCT from X-User-Id (the UUID subject). The gateway path
+			// historically minted X-User-Id==name so <owner>/X-User-Id resolved; the
+			// in-binary direct-Bearer path stamps X-User-Id==sub (a UUID), which broke
+			// IAM's mint-user-keys/get-user (owner/uuid → "password or code is
+			// incorrect"). resolveCaller prefers this header for the owner/name key and
+			// falls back to X-User-Id, so both paths mint keys correctly. Like every
+			// authorityHeader it is stripped on ingress (line ~97) and re-injected here
+			// ONLY from validated claims — never a client value.
+			if uname := claims.username(); uname != "" {
+				req.Header.Set(authz.HeaderUserName, uname)
+			}
+			if claims.Email != "" {
+				req.Header.Set(authz.HeaderUserEmail, claims.Email)
+			}
+			// X-User-Owner is the HOME org — the validated `owner` claim, minted
+			// here DISTINCT from X-Org-Id (the effective org set below). It is the
+			// identity + BILLING anchor: for a normal principal it equals X-Org-Id,
+			// but for a SuperAdmin org-switch it stays the admin org while X-Org-Id
+			// becomes the switched-into org — so the billing gate + debit (which key
+			// on principal.Owner/BillingOrg) always land on the admin ledger, never
+			// the org being acted on. Minted for EVERY validated principal, before the
+			// switch, so it is independent of the effective-org decision. An unsafe/
+			// empty owner mints nothing (billing then fails closed with no home org).
+			if owner != "" {
+				req.Header.Set(authz.HeaderUserOwner, owner)
+			}
+			// The brand whose IAM actually minted this token, from the `iss` the
+			// verifier just checked the signature against. It is stamped for every
+			// validated principal whose issuer a brand claims, and for no other:
+			// an issuer the registry does not know mints NOTHING, so a consumer
+			// sees "no brand" rather than the default brand asserted over a
+			// stranger's token.
+			if id, ok := brand.ForIssuer(claims.Issuer); ok {
+				req.Header.Set(HeaderUserBrand, id)
+			}
+			// The membership set itself, for the surfaces that must OFFER a choice
+			// rather than make one: the orgs the token acts in (Tenancy), never a
+			// directory or a brand org held as a plain member, which no switch
+			// admits. Minted before the effective-org decision, so it describes the
+			// token and not the outcome of the switch below.
+			if set := orgSlugs(claims.Tenancy()); set != "" {
+				req.Header.Set(HeaderUserOrgs, set)
+			}
+			// effOrg is the org actually acted as. Sub-scopes are validated against
+			// THIS org (a SuperAdmin viewing org X may legitimately carry X's project;
+			// a project owned by neither is refused).
+			//
+			// The switch is Acts. The client's X-Org-Id is a SELECTION and nothing
+			// more: a SuperAdmin may select any org, anyone else an org its signed
+			// `orgs` set names other than the reserved admin org, and anything else is
+			// discarded — the request stays in the caller's own org, reading its own
+			// data and billing its own ledger — and recorded (principal.Unopen), so a
+			// write that moves money for an org refuses instead of landing in this
+			// one. A key principal carries no `orgs`, so it never switches; an
+			// application switches only into an org that granted it membership, which
+			// IAM signs into its `orgs`.
+			//
+			// `owner` stays the anchor rather than the leaf's own Home(): an API key's
+			// org comes from the key's subject, and an application's from the `owner`
+			// its own row carries, and the claims hold neither as Orgs[0]. An owner that
+			// is empty or unrepresentable (OrgHasUnsafeRune) grants no org scope at all,
+			// so every org gate downstream refuses.
+			//
+			// What a person acts in unselected is the first org their membership set
+			// opens (defaultOrg), which for most is the home. A plain member of an org
+			// the platform runs is opened none of it, so the request continues
+			// org-less, exactly like an unrepresentable owner.
+			var effOrg string
+			if owner != "" {
+				if sudo(&claims.Claims) {
+					req.Header.Set(authz.HeaderUserAdmin, "true")
+				}
+				effOrg = claims.defaultOrg(owner)
+				if cliOrg != "" && cliOrg != effOrg && Acts(&claims.Claims, cliOrg) {
+					effOrg = cliOrg
+				}
+				if effOrg != "" {
+					req.Header.Set(authz.HeaderOrg, effOrg)
+				}
+			}
+			if selected != "" && selected != effOrg {
+				unopened(c, claims, selected, effOrg)
+				principal.Unopen(c, selected)
+			}
+			if selected == "" {
+				principal.Default(c)
+			}
+			// X-User-IsOrgAdmin marks a validated principal that is an admin OF ITS OWN
+			// ORG — the IAM `isAdmin` bit (claims.IsAdmin). It is minted on the SAME
+			// predicate in BOTH switch arms, so it covers a real SuperAdmin (admin of
+			// the admin org) AND an ORG admin (admin of their own org). GuardScoped
+			// requires it, so a validated but NON-admin member of an org is refused from
+			// the org-scoped admin panels (the same denial an unvalidated caller gets),
+			// closing the same-tenant over-visibility gap. It stays owner-scoped and safe:
+			// a MACHINE principal (type == "application", or the owner-bound KMS-sync
+			// audience) is EXCLUDED — mirroring the SuperAdmin guard above — so the machine
+			// path grants NEITHER global NOR org admin, and the audience widening can never
+			// be leveraged into an admin surface. Like every authorityHeader it is stripped
+			// on ingress and re-injected ONLY here from validated claims, unforgeable.
+			// Asked through authz.Claims.OrgAdmin — the same published predicate, for
+			// the same reason: one reading of one claim, owned by the party that signs
+			// it. It answers from the EFFECTIVE org's role in the signed membership set
+			// (`orgs[].role`, folding owner into admin), and it SCOPES the legacy
+			// `isAdmin` bit to the HOME org (`c.IsAdmin && org == c.Home()`).
+			//
+			// That scoping is the fix this line needed. It read `claims.IsAdmin ||
+			// isOrgAdmin(...)` — an UNSCOPED disjunct, so a token carrying the bit would
+			// have been org-admin in whatever org it switched INTO, not just its own.
+			// The term is inert against IAM today (IAM mints no isAdmin claim at all),
+			// which is precisely why it could sit there reading wrong: a dead term
+			// cannot fail a test. Scoped to home, it is correct whether or not some
+			// issuer ever starts minting it — forward-safe rather than accidentally-safe.
+			//
+			// Keyed on effOrg, not the home org: the bit must describe the org the
+			// request ACTS in, so switching to an org you merely belong to never carries
+			// admin across. The machine exclusion is inside OrgAdmin (Claims.Machine),
+			// so a client_credentials identity is granted neither admin scope.
+			if orgAdmin(claims, effOrg) {
+				req.Header.Set(authz.HeaderUserOrgAdmin, "true")
+			}
+			// The credential's KIND, beside its role, because they answer different
+			// questions and only this boundary can answer the first: an application
+			// acting as itself is proved by the token's SHAPE (appPrincipal), which no
+			// header downstream still carries. Written only where an org RESOLVED, so
+			// the fact never arrives without the org it is about.
+			if effOrg != "" && appPrincipal(claims) {
+				req.Header.Set(HeaderUserIsApp, "true")
+			}
+			if claims.subjectOrg != "" && claims.key != "" {
+				// The key's row lives where it is filed, which is not where it acts
+				// when the caller selected another org.
+				req.Header.Set(HeaderKey, cmp.Or(claims.keyOrg, claims.subjectOrg)+"/"+claims.key)
+			}
+			sanitizeSubScopes(c, effOrg, claims.renderProject(), cliApp, claims.renderBillingAccount())
+			// The boundary's own attestation, parked where no client can reach it
+			// (principal.Mint). The headers above are the contract everything
+			// DOWNSTREAM reads; this is the fact a middleware reads when it cannot
+			// prove it is downstream — see principal.Mint.
+			holder, client := holderOf(claims)
+			principal.Mint(c, principal.Principal{
+				Org: effOrg, User: claims.userID(), Subject: strings.TrimSpace(claims.Subject), Kind: claims.kind(), Stable: claims.stable(),
+				// Carried from the credential IAM resolved, never from the request.
+				Limit:  claims.grant,
+				Key:    claims.key,
+				Holder: holder, Client: client,
+				// The operator behind an impersonation, from the verified `act`.
+				Act: claims.operator,
+				// Who acts for the subject otherwise: a delegated token's deployment.
+				Agent: claims.agent,
+			})
+			return c.Continue()
+		}
+
+		// No verified principal: no user, no admin, no org, no sub-scope. The org the
+		// client named stays deleted — it names a principal nobody validated, and an
+		// org is authority to whatever scopes by it. An opaque bearer that is not a
+		// JWT arrives here too, and is nobody for the same reason.
+		//
+		// The boundary RAN and found nobody. Recorded as such — an EMPTY attestation,
+		// which is a different fact from no attestation at all.
+		principal.Mint(c, principal.Principal{})
+		// Only a credential that was checked and found to be nobody is a strike
+		// (validatedPrincipal): an IAM blip, an expired session and a credential this
+		// boundary does not read must not bar the address that presented them.
+		if err := nobody(c, nil, strike); err != nil {
+			return err
+		}
+		return c.Continue()
+	}
+}
+
+// IdentityMiddleware builds the identity trust-boundary middleware from cfg: it
+// constructs the IAM JWT validator (trusted-issuer set, JWKS, audience allowlist)
+// and returns SanitizeIdentity bound to the admin org. This is the ONE constructor
+// for the boundary, so Serve and integration tests wire it identically — no second
+// copy of the validator-construction glue to drift.
+func IdentityMiddleware(cfg *Config) zip.Handler {
+	return SanitizeIdentity(BoundaryOf(cfg))
+}
+
+// BoundaryOf is the validator the boundary for cfg checks credentials with.
+func BoundaryOf(cfg *Config) *Boundary {
+	return newIdentityValidator(cfg.IAMIssuer, cfg.JWKSURL, 0)
+}
+
+// sanitizeSubScopes re-injects the org SUB-SCOPES (X-Project-Id, X-App-Id) for a
+// VALIDATED principal, the raw client copies having been deleted on ingress. It
+// is the project/app half of the trust boundary:
+//
+//   - project is the caller's validated `project` claim (claims.renderProject — empty
+//     for the default project, so the header stays absent ⟺ default). It is
+//     re-injected only when NON-foreign to org (projectIsForeign): the caller's own
+//     claim survives; a project REGISTERED to a different org is refused (dropped),
+//     which drops an admin's own-org project when a SuperAdmin (effOrg = the
+//     switched-to org) views another org. The header is now server-minted, so a
+//     surviving X-Project-Id is claim-backed — principal.ValidatedProject trusts it.
+//   - X-App-Id is a caller LABEL, not an isolation boundary: NO cloud subsystem
+//     scopes access by it (git/security/eval scope by org + optional project, and
+//     platform scopes apps by route params under the validated org), and an app is
+//     always nested under an org-owned project, so the un-forgeable org column
+//     bounds any mislabel to the caller's OWN subtree. It is forwarded as-is on the
+//     validated path (a compute_usage attribution dimension) and dropped on the
+//     anonymous path. If apps ever become a cross-org-consumed key, add a symmetric
+//     appIsForeign guard here — the resolver already carries the org.
+//
+// With no effective org (an unsafe/absent owner) NOTHING is re-injected: an
+// org-less request carries no scope.
+func sanitizeSubScopes(c *zip.Ctx, org, project, app, billingAccount string) {
+	if org == "" {
+		return
+	}
+	req := c.Fiber().Request()
+	if project != "" && !projectIsForeign(c.Context(), org, project) {
+		req.Header.Set(authz.HeaderProject, project)
+	}
+	if app != "" {
+		req.Header.Set(authz.HeaderApp, app)
+	}
+	// X-Billing-Account-Id names WHO PAYS, so it is written from the validated
+	// `billing_account` claim (claims.renderBillingAccount) and never from a client
+	// value — the raw copy is deleted on ingress and not restored here. It used to
+	// be forwarded as-is, which was defensible only while it was a mere attribution
+	// hint that no debit read. It is not one anymore: ai/object.Payer now resolves
+	// the paying Account from this claim, so a restored client copy would be a caller
+	// naming its own payer — the whole thing the claim exists to prevent. Absent when
+	// IAM minted no account (a pre-claim token); Payer then falls back.
+	if billingAccount != "" {
+		req.Header.Set(authz.HeaderBillingAccount, billingAccount)
+	}
+}
+
+// validatedPrincipal extracts a token (Bearer, Basic, then session cookie) and
+// validates it. Returns nil when the credential is absent, a publishable pk-,
+// or invalid — so a bad credential yields anonymity, never trust. A nil validator
+// (unconfigured) also yields nil: the sanitizer still strips authority headers,
+// so forgery stays dead even with no validator.
+//
+// The error is for the cases a holder can act on: a secret key IAM refused
+// because it expired, was revoked or switched off, or because its holder may not
+// act in the org it is filed in (keyRefusal), and a confined token that did not
+// verify (confined.go). Each is answered 401 or 403 saying so, rather than
+// continuing anonymous — or 503 when only IAM could say, and did not.
+//
+// strike is that the credential was checked and is nobody — the case the edge
+// holds against the address that presented it (strike): a key IAM refused by name
+// (a key_* reason), or a token that does not verify. It is NOT an expired token,
+// which verified and merely ran out (a browser holding yesterday's session); not a
+// publishable key, which never becomes a principal by design; not a key IAM
+// said nothing about (keyRefused); and not a confined token IAM could not vouch
+// for or whose run is over (confinedStrike).
+//
+// selected is the org the client asked to act in (X-Org-Id). A token's switch is
+// decided below the boundary from its signed membership set; a key carries none,
+// so the key's own resolution asks IAM whether its holder acts there
+// (iamKeys.resolveIn) — the selection never silently falls back to the key's org,
+// which would bill the wrong tenant.
+func validatedPrincipal(c *zip.Ctx, v *Boundary, selected string) (claims *idClaims, refusal error, strike bool) {
+	if v == nil {
+		return nil, nil, false
+	}
+	tok := CallerToken(c)
+	if tok == "" {
+		return nil, nil, false
+	}
+	// An opaque API key is not a JWT: resolve it to the same principal a JWT yields,
+	// so key auth and session auth mint one identity. An unresolved key stays
+	// anonymous (nil) — a bad key never grants trust.
+	if IsAPIKey(tok) {
+		// A PUBLISHABLE key never becomes a principal. pk- ships in browser
+		// bundles by design ("stored verbatim, safe to show"), so resolving it
+		// here would hand every visitor a reading credential for the org that
+		// owns it. It stays resolvable through OrgForKey — that is how the ingest
+		// endpoint attributes a beacon to a tenant — but resolvable is not
+		// authenticated.
+		if IsPublishableKey(tok) {
+			return nil, nil, false
+		}
+		if v.keys == nil {
+			return nil, nil, false
+		}
+		a := v.keys.resolveIn(c.Context(), tok, selected)
+		return a.claims, keyRefusal(a.why), a.claims == nil && a.why != "" && a.why != keyOrgNotOpen
+	}
+	// Parse ONCE. A ZAP socket replays its credential on every frame, so without
+	// this the same token was signature-verified per call on an already
+	// authenticated connection. A hit requires the same token bytes that
+	// validated, so this is a memo of the verification — not a second way to be
+	// trusted. See identity_cache.go.
+	claims = v.claims.get(tok, time.Now())
+	if claims == nil {
+		var err error
+		if claims, err = v.validate(tok); err != nil {
+			// A confined token is verified or refused, never nobody (confined.go).
+			if presentsConfined(tok) {
+				return nil, confinedRefusal(err), confinedStrike(err)
+			}
+			return nil, nil, !errors.Is(err, jwt.ErrTokenExpired)
+		}
+		v.claims.put(tok, claims)
+	}
+	// A confined token is honoured only while IAM still holds its grant, asked on
+	// every request through a short memo — a cached verification included, since
+	// a revocation is exactly what a cached verification does not know.
+	if claims.confined {
+		if err := v.live.check(c.Context(), tok, claims.ExpiresAt); err != nil {
+			return nil, confinedRefusal(err), confinedStrike(err)
+		}
+	}
+	return claims, nil, false
+}
+
+// confinedStrike reports whether a confined token's refusal is the edge's to hold
+// against the address that presented it (strike): a token that does not verify.
+// Not IAM failing to answer (its delegation keys or the grant unreachable), and
+// not a token that verified and is over — expired, or revoked when its run ended.
+func confinedStrike(err error) bool {
+	return !errors.Is(err, errDelegationKeys) && !errors.Is(err, errLivenessUnsure) &&
+		!errors.Is(err, jwt.ErrTokenExpired) && !errors.Is(err, errRevoked)
+}
+
+// Glance is what the boundary can say about a request's credential without asking
+// IAM, for the edge, which runs before it and must not make it ask.
+type Glance struct {
+	// Somebody is that the credential is a principal, told without asking: a JWT
+	// verified against the cached JWKS (or remembered verified), or an API key whose
+	// cached answer is a principal. An uncached key, a key IAM refused, a forged
+	// token and a credential the boundary does not read are not.
+	Somebody bool
+	// Rate is a key principal's own rate a minute (Grant.Rate), 0 for none.
+	Rate int
+}
+
+// glance looks at the credential c presents the way validatedPrincipal will, and
+// says what it can without asking IAM. It verifies a JWT here — locally, and
+// remembered for the boundary, which then reads the memo — so the edge calls it only
+// on the rare paths that need to know.
+func (v *Boundary) Glance(c *zip.Ctx) Glance {
+	tok := CallerToken(c)
+	if v == nil || tok == "" || IsPublishableKey(tok) {
+		return Glance{}
+	}
+	if IsAPIKey(tok) {
+		if v.keys == nil {
+			return Glance{}
+		}
+		if a, ok := v.keys.known(tok); ok && a.claims != nil {
+			return Glance{Somebody: true, Rate: a.claims.grant.Rate()}
+		}
+		return Glance{}
+	}
+	if v.claims.get(tok, time.Now()) != nil {
+		return Glance{Somebody: true}
+	}
+	claims, err := v.validate(tok)
+	if err != nil {
+		return Glance{}
+	}
+	v.claims.put(tok, claims)
+	return Glance{Somebody: true}
+}
+
+// unopened records a request whose X-Org-Id named an org its caller may not act
+// in. The boundary discards such a selection and the request runs in the caller's
+// default org (fallback), or in none. That is to become a refusal, 403
+// org_not_open, and this line counts who sends one first: the client by its user
+// agent's product token and the page origin, the caller by kind and subject, and
+// whether the caller holds a membership there that does not open (member: a
+// plain member of an org the platform runs) or none at all (removed, or never).
+// It names no credential and no org. It writes to the process logger, the one
+// every request line goes to.
+func unopened(c *zip.Ctx, claims *idClaims, selected, acted string) {
+	luxlog.Default().Info("identity: a selected org is not open to its caller",
+		"kind", string(claims.kind()), "user", claims.userID(),
+		"held", authz.IsHeldOrg(selected), "member", slices.ContainsFunc(claims.Orgs, func(m authz.Membership) bool { return m.Org == selected }),
+		"fallback", acted != "",
+		"agent", product(c.Header("User-Agent")), "origin", pageHost(c),
+		"method", c.Method(), "area", area(c.Path()))
+}
+
+// product is a user agent's first product token ("hanzo/8.5.732",
+// "Mozilla/5.0"), printable and bounded, for counting clients.
+func product(ua string) string {
+	ua, _, _ = strings.Cut(strings.TrimSpace(ua), " ")
+	return printable(ua, 48)
+}
+
+// pageHost is the host of the page a browser request came from (Origin, else
+// Referer), bounded, for telling one of our apps from another.
+func pageHost(c *zip.Ctx) string {
+	for _, h := range []string{"Origin", "Referer"} {
+		if u, err := url.Parse(c.Header(h)); err == nil && u.Host != "" {
+			return printable(u.Host, 64)
+		}
+	}
+	return ""
+}
+
+// area is a path's first two segments ("/v1/s3"), the surface a request is for.
+func area(path string) string {
+	segs := strings.SplitN(strings.TrimPrefix(path, "/"), "/", 3)
+	if len(segs) > 2 {
+		segs = segs[:2]
+	}
+	return printable("/"+strings.Join(segs, "/"), 64)
+}
+
+// printable keeps the visible ASCII of s, at most n bytes of it.
+func printable(s string, n int) string {
+	var b strings.Builder
+	for i := 0; i < len(s) && b.Len() < n; i++ {
+		if s[i] > 0x20 && s[i] < 0x7f {
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
+}
+
+// keyRefusal is the boundary's answer to a secret key IAM owns and resolved to
+// nobody: the key itself ended (expired, revoked, disabled), or its holder may not
+// act in the org it is filed in. Each is refused saying which, so a key whose
+// holder lost their standing is never served as anonymous and never acts anywhere
+// else.
+//
+// The standing is IAM's to decide, at the one place that reads the holder's row:
+// a key acts in its org while its holder's membership opens that org
+// (iam store.Acts, authz's Claims.opens asked of one row), and IAM answers
+// key_not_tenant or key_foreign_user when it does not. The boundary takes the org
+// IAM names and never derives a second one.
+//
+// An unknown key stays anonymous: a vendor's sk- wears the same prefix and the
+// model API's provider table owns it, so IAM not knowing a key says nothing about
+// its holder. So does an unreachable IAM, which says nothing at all.
+func keyRefusal(why string) error {
+	r, ok := keyRefusals[why]
+	if !ok {
+		return nil
+	}
+	return &zip.HTTPError{Status: r.status, Code: why, Msg: r.msg}
+}
+
+// keyRefusals is each reason IAM gives for a key it owns and refuses, as the
+// status and sentence its holder reads; the reason itself rides as the code.
+var keyRefusals = map[string]struct {
+	status int
+	msg    string
+}{
+	"key_expired":         {http.StatusUnauthorized, "this API key has expired; extend its expiry or create a new key"},
+	"key_revoked":         {http.StatusUnauthorized, "this API key was revoked; create a new key"},
+	"key_disabled":        {http.StatusUnauthorized, "this API key is disabled"},
+	"key_holder_disabled": {http.StatusUnauthorized, "this API key's holder is suspended or deleted, and the key ended with them"},
+	"key_dangling_user":   {http.StatusUnauthorized, "this API key's holder no longer exists; create a new key"},
+	"key_superadmin":      {http.StatusUnauthorized, "no API key acts for an account of the admin org; sign in instead"},
+	"key_not_tenant": {http.StatusForbidden, "this API key's holder does not act in the org it was created in: " +
+		"an org the platform runs is acted in by its owners and admins, and a brand's directory by no one; " +
+		"create a key in an org you act in"},
+	"key_foreign_user": {http.StatusForbidden, "this API key's holder is not a member of the org it was created in; " +
+		"create a key in an org you belong to"},
+	keyOrgNotOpen: {http.StatusForbidden, "this API key's holder does not act in the org selected by X-Org-Id; " +
+		"select an org you are a member of, or send none to act in the key's own org"},
+}
+
+// keyOrgNotOpen is IAM's refusal of an org a key's caller selected and its holder
+// does not act in (iam store.KeyOrgNotOpen). The key itself is good, so it is a
+// 403 for this request and never a strike against the address.
+const keyOrgNotOpen = "key_org_not_open"
+
+// admits applies the credential's grant to this request's address. A key limited
+// to some capabilities, or to reading, is refused everywhere else, here, where
+// every request passes once. The capability is the app the routing table names
+// for the address (manifest.OwnerOf); a person's token carries no grant and is
+// never asked.
+//
+// A DOOR names no capability: over MCP, the call plane and the graph the address
+// is the door and the operation is in the payload. So a door is decided at the
+// op-invoke seam, on the operation it reached (Permit).
+//
+// The address is asked as the router will match it (RoutePath): the router folds
+// case and a trailing slash, so asking about the spelling the client sent would let
+// /v1/BILLING reach billing while being judged as some other capability.
+func (c *idClaims) admits(z *zip.Ctx) error {
+	path := RoutePath(z.Path())
+	// A confined token reaches its model addresses and nothing else, a door
+	// included (confined.go). A refusal is logged with who acted: it is code in a
+	// sandbox reaching past its run, which is worth seeing before it succeeds.
+	if c.confined {
+		err := inferenceOnly(path, z.Method())
+		if err == nil {
+			err = noRetrieval(z)
+		}
+		if err != nil {
+			slog.Warn("identity: a delegated token reached past model calls",
+				"sub", c.Subject, "org", c.Home(), "agent", c.agent, "method", z.Method(), "path", path)
+		}
+		return err
+	}
+	if len(c.grant) == 0 || isDoor(path) {
+		return nil
+	}
+	return permit(c.grant, path, z.Method())
+}
+
+// permit is the grant's answer for one ROUTED address and method: nil, or the 403
+// that says what the key may not do there.
+func permit(g Grant, path, method string) error {
+	capability := appOwning(path)
+	write := true
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		write = false
+	}
+	if g.Permits(capability, write) {
+		return nil
+	}
+	name := capability
+	if name == "" {
+		name = path
+	}
+	if write && g.Permits(capability, false) {
+		return zip.Errorf(http.StatusForbidden, "this API key may only read %s; edit its permissions to write", name)
+	}
+	return zip.Errorf(http.StatusForbidden, "this API key may not reach %s; edit its permissions to allow it", name)
+}
+
+// Permit is the op-invoke half of the grant: the same decision the boundary
+// makes on an address, made on the operation a door reached. A request that
+// addressed its operation directly was decided at the boundary, and an
+// in-process invoke carries no credential, so neither is asked again.
+func Permit() zip.Authorizer {
+	return func(ctx context.Context, op zip.Op, _ any) (zip.Decision, error) {
+		allow := zip.Decision{Effect: zip.Allow}
+		c, live := Request(ctx)
+		if !live || Matched(c) == op.Path {
+			return allow, nil
+		}
+		p, ok := principal.Minted(c)
+		if !ok || len(p.Limit) == 0 {
+			return allow, nil
+		}
+		return allow, permit(Grant(p.Limit), RoutePath(op.Path), op.Method)
+	}
+}
+
+// CallerToken resolves the credential token a request presents, in the SAME
+// precedence SanitizeIdentity trusts, and returns it UNCHANGED (validation is the
+// caller's job). It is the ONE token-resolution both the identity boundary
+// (validatedPrincipal) and the downstream bearer relay (CallerBearer) read, so the
+// two can never disagree on which credential identifies the caller:
+//
+//  1. request Bearer (Authorization), then X-Authorization Bearer, then Basic
+//     password (the go/.netrc proxy idiom), then an API key in X-Api-Key (the
+//     wire Anthropic's clients speak, which the model API also reads),
+//  2. a JWT-bearing session cookie (cookieTokenNames).
+//
+// The returned token is NOT trusted here: validatedPrincipal feeds it through
+// v.validate (sig/iss/aud/exp), and CallerBearer relays it to a target that
+// re-validates it. Empty when the request carries no credential.
+// Presented is the credential the caller PUT ON THIS REQUEST, and empty when it
+// put none there — the header half of CallerToken, exactly, and nothing after it.
+//
+// The split is not cosmetic. A credential a caller presents cannot be supplied by
+// a cross-site page (a browser will not set these headers for one), while an
+// AMBIENT credential — a cookie — is sent by any page that can reach us. That is
+// the whole anti-CSRF distinction, so apps/account asks this rather than deciding
+// for itself what an explicit credential looks like.
+//
+// IT IS A CROSS-HEADER PRECEDENCE, and that is why it has to be one function
+// rather than one parse applied twice. Basic is read from Authorization ONLY: a
+// Basic value under X-Authorization is not a credential to this reader, so a gate
+// that judged the two headers with the same per-header rule called such a request
+// explicit while the boundary below fell through to the cookie — and the cookie
+// then authenticated the write the gate had just excused. One question, one
+// answer, one SHAPE.
+func Presented(c *zip.Ctx) string {
+	tok := bearerFromAuth(c.Header("Authorization"))
+	if tok == "" {
+		tok = bearerFromAuth(c.Header("X-Authorization"))
+	}
+	if tok == "" {
+		tok = basicFromAuth(c.Header("Authorization"))
+	}
+	if tok == "" {
+		if k := strings.TrimSpace(c.Header(headerAPIKey)); IsAPIKey(k) {
+			tok = k
+		}
+	}
+	return tok
+}
+
+// headerAPIKey is where Anthropic's wire carries a key. The model API reads it,
+// so the boundary must too, or a key sent there would skip everything a key's
+// policy says.
+const headerAPIKey = "X-Api-Key"
+
+// twoCredentials refuses a request that carries an API key in X-Api-Key and a
+// different credential in Authorization: the boundary would judge one and the
+// model API might act on the other.
+func twoCredentials(c *zip.Ctx) error {
+	k := strings.TrimSpace(c.Header(headerAPIKey))
+	if k == "" {
+		return nil
+	}
+	if tok := Presented(c); tok != "" && tok != k {
+		return zip.Errorf(http.StatusUnauthorized, "this request carries two different credentials; send one")
+	}
+	return nil
+}
+
+func CallerToken(c *zip.Ctx) string {
+	tok := Presented(c)
+	if tok == "" {
+		for _, name := range cookieTokenNames {
+			if val := c.Fiber().Cookies(name); val != "" {
+				tok = val
+				break
+			}
+		}
+	}
+	return tok
+}
+
+// CallerBearer returns the caller's validated JWT bearer for RELAY to a downstream
+// org-scoped service (e.g. the DNS control plane) that authorizes on the caller's
+// OWN identity and derives the org from the token's `owner` claim. It returns the
+// SAME token SanitizeIdentity validated the principal with (CallerToken), UNCHANGED
+// -- cloud substitutes NO service credential of its own, so tenant isolation carries
+// across the hop: a caller in org A relays an org-A token and can reach only org A.
+//
+// An opaque API key (pk-/sk-) is NOT a relayable bearer -- an OIDC target cannot
+// validate it and forwarding it would leak the key -- so it returns "". Empty when
+// the request carries no validatable bearer; the relay then sends no Authorization
+// and the downstream fails closed on its own gate.
+func CallerBearer(c *zip.Ctx) string {
+	tok := CallerToken(c)
+	if tok == "" || IsAPIKey(tok) {
+		return ""
+	}
+	return tok
+}

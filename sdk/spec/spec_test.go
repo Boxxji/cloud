@@ -1,0 +1,375 @@
+package spec
+
+import (
+	"context"
+	"net/http"
+	"testing"
+
+	luxlog "github.com/luxfi/log"
+	"github.com/zap-proto/zip"
+)
+
+// The product axis must be mechanical — first segment after /v1/, no judgment.
+// The "" cases are the honesty boundary: a segment that is not a product name
+// gets no tag rather than a fabricated one.
+func TestProduct(t *testing.T) {
+	for _, tc := range []struct{ path, want string }{
+		{"/v1/kms/orgs/:org/secrets", "kms"},
+		{"/v1/billing/usage", "billing"},
+		{"/v1/billing/ledger", "billing"}, // apps/billing serves it beside commerce's merchant half
+		{"/v1/billing", "billing"},
+		{"/v1/billing/*", "billing"}, // a catch-all still names its product
+		{"/v1/openapi.json", ""},     // a file, not a product
+		{"/v1/*", ""},                // a wildcard, not a product
+		{"/v1/:id", ""},              // a param, not a product
+		{"/v1/", ""},
+		{"/health", ""},           // not under /v1
+		{"/.well-known/jwks", ""}, // not under /v1
+		{"/tasks/*", ""},          // not under /v1
+		{"/v2/kms/keys", ""},      // house law: there is no v2
+	} {
+		if got := Product(tc.path); got != tc.want {
+			t.Errorf("Product(%q) = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
+// fiber :param → OpenAPI {param}, and a fiber wildcard becomes a named
+// {wildcardN} because "*1" is not a legal URI-template name.
+func TestTranslate(t *testing.T) {
+	for _, tc := range []struct {
+		in     string
+		want   string
+		params []string
+	}{
+		{"/v1/billing/usage", "/v1/billing/usage", nil},
+		{"/v1/kms/orgs/:org/secrets", "/v1/kms/orgs/{org}/secrets", []string{"org"}},
+		{"/v1/kms/orgs/:org/secrets/*", "/v1/kms/orgs/{org}/secrets/{wildcard1}", []string{"org", "wildcard1"}},
+		{"/v1/a/:x/b/:y", "/v1/a/{x}/b/{y}", []string{"x", "y"}},
+		{"/v1/*", "/v1/{wildcard1}", []string{"wildcard1"}},
+	} {
+		got, params := Translate(tc.in)
+		if got != tc.want {
+			t.Errorf("translate(%q) path = %q, want %q", tc.in, got, tc.want)
+		}
+		if len(params) != len(tc.params) {
+			t.Fatalf("translate(%q) params = %v, want %v", tc.in, params, tc.params)
+		}
+		for i := range params {
+			if params[i] != tc.params[i] {
+				t.Errorf("translate(%q) params = %v, want %v", tc.in, params, tc.params)
+			}
+		}
+	}
+}
+
+// THE LOAD-BEARING FACT, pinned so a zip/fiber bump that changes it fails here.
+//
+// It just did, which is this test doing its job rather than failing at it.
+//
+// The fact USED to be: a duplicate registration and a middleware chain produce
+// the SAME observable route — one entry, N chained handlers — so they are
+// indistinguishable through the public API, and therefore this generator must
+// never read the handler count and "handlers > 1 means collision" is not a
+// fleet-wide truth.
+//
+// From zip v1.24 the first half is no longer constructible: a duplicate
+// registration is REFUSED at composition time rather than merged into the
+// existing entry. The conclusion is unchanged and now rests on something
+// stronger — the generator still must not read the handler count, because a
+// count above one can ONLY be a chain now that a collision cannot reach the
+// registry at all.
+//
+// So both halves are pinned: the chain still projects to exactly one operation,
+// and the duplicate is still refused. If either moves, the generator's
+// assumption about handler counts has to be revisited, which is what this test
+// exists to force.
+func TestChainYieldsOneOperationAndDuplicateIsRefused(t *testing.T) {
+	// (a) a legitimate chain: ONE registration, middleware + terminal handler —
+	// the apps/commerce/mount.go shape. One route entry, two handlers.
+	chain := newApp()
+	chain.Raw(http.MethodGet, "/v1/bot",
+		func(c *zip.Ctx) error { return c.Next() },
+		func(c *zip.Ctx) error { return c.JSON(200, "run") },
+	)
+
+	// zip registers a GET as GET plus an automatic HEAD companion, so ONE
+	// registration is two route ENTRIES. That is not a collision and is measured
+	// here rather than assumed: the GET is what carries the chain, and the HEAD is
+	// fiber's own and is dropped from the projection below.
+	handlers := -1
+	for _, r := range chain.Fiber().GetRoutes(true) {
+		if r.Method == "GET" && r.Path == "/v1/bot" {
+			handlers = len(r.Handlers)
+			break
+		}
+	}
+	if handlers < 0 {
+		t.Fatalf("the chain registered no GET /v1/bot at all: %v", chain.Fiber().GetRoutes(true))
+	}
+	if handlers != 2 {
+		t.Fatalf("the chain should carry 2 chained handlers; got %d — if this "+
+			"diverged, the handler count became meaningful and this package should revisit it",
+			handlers)
+	}
+
+	// And it projects to exactly one operation.
+	doc, err := Of(chain, Info{Title: "t", Version: "v1"})
+	if err != nil {
+		t.Fatalf("chain: Spec: %v", err)
+	}
+	item, ok := doc.Paths["/v1/bot"]
+	if !ok || len(item) != 1 || item["get"] == nil {
+		t.Fatalf("chain: want exactly one get operation at /v1/bot, got %v", doc.Paths)
+	}
+
+	// (b) a genuine duplicate: two separate registrations of one pattern. zip
+	// refuses to compose it, so it can never reach this generator. The refusal
+	// arrives as a panic out of the composition step (Registry, reached here
+	// through Fiber), which is why this is asserted with a recover rather than an
+	// error return.
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("zip composed a duplicate registration of GET /v1/bot — " +
+					"a collision can reach the registry again, so the generator can no " +
+					"longer assume a handler count above one is always a chain")
+			}
+		}()
+		dup := newApp()
+		dup.Raw(http.MethodGet, "/v1/bot", func(c *zip.Ctx) error { return c.JSON(200, "machine") })
+		dup.Raw(http.MethodGet, "/v1/bot", func(c *zip.Ctx) error { return c.JSON(200, "run") })
+		_ = dup.Fiber()
+	}()
+}
+
+// Middleware matches path prefixes and is not an operation — fiber's own
+// GetRoutes(true) filter drops it, and Live must use it.
+func TestLiveDropsMiddleware(t *testing.T) {
+	app := newApp()
+	app.Use(zip.H(func(c *zip.Ctx) error { return c.Next() }))
+	app.Raw(http.MethodGet, "/v1/kms/health", func(c *zip.Ctx) error { return c.JSON(200, "ok") })
+
+	live := Live(app)
+	if len(live) != 1 {
+		t.Fatalf("Live() = %d routes, want 1 (the Use() middleware must not be an operation): %+v", len(live), live)
+	}
+	if live[0].Path != "/v1/kms/health" {
+		t.Errorf("Live()[0].Path = %q", live[0].Path)
+	}
+}
+
+// CONNECT has no OpenAPI Path Item field, and HEAD cannot be stated stably
+// (fiber auto-generates it at startupProcess, not at registration). Live must
+// drop both — see the `methods` doc comment.
+func TestLiveDropsUnrepresentableMethods(t *testing.T) {
+	app := newApp()
+	app.Raw(zip.MethodAll, "/v1/tasks", func(c *zip.Ctx) error { return c.JSON(200, "ok") })
+
+	for _, r := range Live(app) {
+		if r.Method == "CONNECT" || r.Method == "HEAD" {
+			t.Errorf("Live() emitted %s — it is not representable/stable in the document", r.Method)
+		}
+	}
+	// The representable ones from All() survive.
+	got := map[string]bool{}
+	for _, r := range Live(app) {
+		got[r.Method] = true
+	}
+	for _, m := range []string{"GET", "POST", "PUT", "DELETE", "PATCH"} {
+		if !got[m] {
+			t.Errorf("Live() dropped %s, which All() registers and OpenAPI can express", m)
+		}
+	}
+}
+
+// From must reject a duplicate operationId rather than emit a document a
+// generator would mis-consume. This is also what keeps (method,path) injective.
+//
+// The pair below is the residual aliasing the encoding cannot remove: '_' is the
+// separator, so a literal '_' in a segment can alias a '/'. The guard is what
+// makes ids trustworthy, not the encoding.
+func TestFromRejectsDuplicateOperationID(t *testing.T) {
+	rs := []Route{
+		{Method: "GET", Path: "/v1/a/b_c"},
+		{Method: "GET", Path: "/v1/a/b/c"}, // both → get_a_b_c
+	}
+	if _, err := From(rs, Info{Title: "t", Version: "v1"}); err == nil {
+		t.Fatal("From() accepted two routes with the same derived operationId; it must refuse")
+	}
+}
+
+// The pair that found this bug: /v1/pricing-policy and /v1/pricing/policy both
+// existed, and folding '-' into '_' collapsed them onto one id, making the whole
+// document unemittable. The alias has since been deleted, so the routes below are
+// now a constructed case rather than a live one — but hyphenated addresses we do
+// not own (git-upload-pack, delete-batch) are permanent, and nothing stops the
+// next slash-sibling. Pinned so the encoding never regresses.
+func TestOperationIDKeepsHyphenDistinctFromPathSeparator(t *testing.T) {
+	rs := []Route{
+		{Method: "GET", Path: "/v1/pricing-policy"},
+		{Method: "GET", Path: "/v1/pricing/policy"},
+	}
+	doc, err := From(rs, Info{Title: "t", Version: "v1"})
+	if err != nil {
+		t.Fatalf("From: %v — these are two distinct live routes and must yield two distinct ids", err)
+	}
+	got := []string{
+		doc.Paths["/v1/pricing-policy"]["get"].OperationID,
+		doc.Paths["/v1/pricing/policy"]["get"].OperationID,
+	}
+	if got[0] == got[1] {
+		t.Fatalf("both routes derived operationId %q", got[0])
+	}
+	// The leading /v1 is not in an id — it names nothing that every address does
+	// not already carry — so what distinguishes these two is the hyphen alone,
+	// which is the whole point of the pair.
+	if got[0] != "get_pricing-policy" || got[1] != "get_pricing_policy" {
+		t.Errorf("ids = %v, want [get_pricing-policy get_pricing_policy]", got)
+	}
+}
+
+// The document shape: 3.1.0, product tags, path params required, and no
+// fabricated responses.
+func TestFromShape(t *testing.T) {
+	rs := []Route{
+		{Method: "GET", Path: "/v1/kms/orgs/:org/secrets"},
+		{Method: "POST", Path: "/v1/kms/orgs/:org/secrets"},
+		{Method: "GET", Path: "/v1/billing/usage"},
+	}
+	doc, err := From(rs, Info{Title: "Hanzo Cloud", Version: "v1"}, Server{URL: "https://api.hanzo.ai"})
+	if err != nil {
+		t.Fatalf("From: %v", err)
+	}
+	if doc.OpenAPI != "3.1.0" {
+		t.Errorf("openapi = %q, want 3.1.0", doc.OpenAPI)
+	}
+	if len(doc.Tags) != 2 || doc.Tags[0].Name != "billing" || doc.Tags[1].Name != "kms" {
+		t.Errorf("tags = %+v, want sorted [billing kms]", doc.Tags)
+	}
+	item, ok := doc.Paths["/v1/kms/orgs/{org}/secrets"]
+	if !ok {
+		t.Fatalf("missing translated path; have %v", doc.Paths)
+	}
+	if len(item) != 2 || item["get"] == nil || item["post"] == nil {
+		t.Fatalf("path item should carry get+post, got %v", item)
+	}
+	get := item["get"]
+	if len(get.Tags) != 1 || get.Tags[0] != "kms" {
+		t.Errorf("tags = %v, want [kms]", get.Tags)
+	}
+	if len(get.Parameters) != 1 {
+		t.Fatalf("parameters = %+v, want 1", get.Parameters)
+	}
+	if p := get.Parameters[0]; p.Name != "org" || p.In != "path" || !p.Required || p.Schema["type"] != "string" {
+		t.Errorf("param = %+v, want {org path required string}", p)
+	}
+	if get.OperationID == item["post"].OperationID {
+		t.Errorf("get and post share operationId %q", get.OperationID)
+	}
+}
+
+func TestFoldGivesTypedOpsSchemaAndLeavesRawRoutesAlone(t *testing.T) {
+	app := newApp()
+	app.Raw(http.MethodPost, "/v1/kms/orgs/:org/secrets", func(c *zip.Ctx) error { return c.JSON(200, "ok") })
+	app.Get("/v1/kms/orgs/:org/secrets", func(ctx context.Context, in *secretIn) (*secretOut, error) {
+		return &secretOut{}, nil
+	}, zip.WithOperationID("kmsListSecrets"), zip.WithSummary("List secret names"))
+
+	doc, err := Of(app, Info{Title: "Hanzo Cloud", Version: "v1"})
+	if err != nil {
+		t.Fatalf("Spec: %v", err)
+	}
+	item := doc.Paths["/v1/kms/orgs/{org}/secrets"]
+	get, post := item["get"], item["post"]
+	if get == nil || post == nil {
+		t.Fatalf("path item should carry both the typed get and the raw post, got %v", item)
+	}
+
+	if get.OperationID != "kmsListSecrets" || get.Summary != "List secret names" {
+		t.Errorf("typed op = %q/%q, want the registry's own identity", get.OperationID, get.Summary)
+	}
+	if r, ok := get.Responses.(map[string]any); !ok || r["200"] == nil {
+		t.Errorf("typed op has no 200 response; the Out type is evidence for one (got %T)", get.Responses)
+	}
+	if len(get.Tags) != 1 || get.Tags[0] != "kms" {
+		t.Errorf("tags = %v, want the router's product tag [kms]", get.Tags)
+	}
+	// :org is a path param and `limit` a query param, both derived from the
+	// pattern and the In type — the router alone could only name the first.
+	in := map[string]string{}
+	for _, p := range get.Parameters {
+		in[p.Name] = p.In
+	}
+	if in["org"] != "path" || in["limit"] != "query" {
+		t.Errorf("parameters = %+v, want org in path and limit in query", get.Parameters)
+	}
+	if doc.Components == nil || doc.Components.Schemas["secretOut"] == nil {
+		t.Errorf("components carry no secretOut schema: %+v", doc.Components)
+	}
+
+	// The raw route keeps exactly the four structural facts and invents nothing.
+	if post.Responses != nil || post.RequestBody != nil || post.Description != "" {
+		t.Errorf("raw route gained detail it has no evidence for: %+v", post)
+	}
+}
+
+// A registry entry with no live route means the two readings disagree about a
+// path. That is a generator bug, and refusing beats emitting an operation
+// nothing serves.
+func TestFoldRefusesATypedOpWithNoLiveRoute(t *testing.T) {
+	doc, err := From(nil, Info{Title: "Hanzo Cloud", Version: "v1"})
+	if err != nil {
+		t.Fatalf("From: %v", err)
+	}
+	err = Fold(doc, Registry{Ops: map[string]*Operation{
+		"GET /v1/kms/ghost": {OperationID: "ghost"},
+	}})
+	if err == nil {
+		t.Fatal("Fold accepted an operation the router does not serve")
+	}
+}
+
+// A legacy ADDRESS is a fact only the serving code knows: `/v1/iam/get-users`
+// and `/v1/iam/users` are two live routes with no relation the route table can
+// see. So the serving code declares it with the `compat` tag, and the fold has to
+// carry that declaration out — hanzoai/openapi's merge reads it to keep the old
+// spelling out of the published document, and without it the customer surface
+// carries two of everything: two SDK methods, two docs entries, two CLI commands.
+//
+// The product tag stays FIRST, because that is the axis a generator files an
+// operation under. `compat` rides second.
+func TestFoldCarriesTheCompatDeclarationOutOfTheRegistry(t *testing.T) {
+	app := newApp()
+	app.Get("/v1/kms/keys", func(ctx context.Context, in *secretIn) (*secretOut, error) {
+		return &secretOut{}, nil
+	}, zip.WithOperationID("kmsListKeys"), zip.WithSummary("List keys"))
+	app.Get("/v1/kms/get-keys", func(ctx context.Context, in *secretIn) (*secretOut, error) {
+		return &secretOut{}, nil
+	}, zip.WithOperationID("kmsGetKeys"), zip.WithSummary("List keys (legacy verb)"), zip.WithTags(Compat))
+
+	doc, err := Of(app, Info{Title: "Hanzo Cloud", Version: "v1"})
+	if err != nil {
+		t.Fatalf("Spec: %v", err)
+	}
+	canonical := doc.Paths["/v1/kms/keys"]["get"]
+	if len(canonical.Tags) != 1 || canonical.Tags[0] != "kms" {
+		t.Errorf("canonical tags = %v, want the product tag alone [kms]", canonical.Tags)
+	}
+	legacy := doc.Paths["/v1/kms/get-keys"]["get"]
+	if len(legacy.Tags) != 2 || legacy.Tags[0] != "kms" || legacy.Tags[1] != Compat {
+		t.Errorf("legacy tags = %v, want [kms compat] — product first, the declaration second", legacy.Tags)
+	}
+}
+
+func newApp() *zip.App {
+	return zip.New(zip.Config{Logger: luxlog.New("test"), DisableStartupMessage: true})
+}
+
+type secretIn struct {
+	Org   string `json:"org"`
+	Limit int    `json:"limit"`
+}
+type secretOut struct {
+	Names []string `json:"names"`
+}
