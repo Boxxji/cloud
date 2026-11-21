@@ -528,9 +528,7 @@ func Sibling(host, label string) string {
 // It is here, beside the apex it derives from, because two packages need the
 // SAME answer and neither can hold it for the other: package cloud resolves
 // Config.Domain from it, and apps/sites (a leaf that must never import the root
-// package) resolves the self-domain floor from it. Each used to spell the
-// literal "api.hanzo.ai" for itself, so the deployment's own host was stated
-// twice, brand-blind in both places, and nothing made the two agree.
+// package) resolves the self-domain floor from it.
 func APIHost(id string) string { return "api." + For(id).Domain }
 
 // GitHost is the code-hosting host of brand `id`: git.<that brand's apex> —

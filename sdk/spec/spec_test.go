@@ -94,9 +94,7 @@ func TestChainYieldsOneOperationAndDuplicateIsRefused(t *testing.T) {
 	)
 
 	// zip registers a GET as GET plus an automatic HEAD companion, so ONE
-	// registration is two route ENTRIES. That is not a collision and is measured
-	// here rather than assumed: the GET is what carries the chain, and the HEAD is
-	// fiber's own and is dropped from the projection below.
+	// registration is two route ENTRIES.
 	handlers := -1
 	for _, r := range chain.Fiber().GetRoutes(true) {
 		if r.Method == "GET" && r.Path == "/v1/bot" {

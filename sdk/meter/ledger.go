@@ -10,10 +10,8 @@ package meter
 // shared backends, and a [Client] is a Ledger behind the meter's own rules.
 //
 // With nothing registered a process meters nothing: [Free] allows every call and
-// charges none, which is the whole deployment when it is a laptop or a library user.
-// A process that was TOLD to bill — a named deployment (CLOUD_ENV) or a commerce
-// BaseURL — and has no ledger linked refuses instead, because a binary that
-// quietly stopped debiting is a revenue outage that looks like success.
+// charges none, which is the whole deployment when it is a laptop or a library
+// user.
 
 import (
 	"context"

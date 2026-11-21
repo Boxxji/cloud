@@ -598,9 +598,8 @@ func (f *flaky) Members(ctx context.Context, set string, ttl time.Duration) ([]R
 }
 
 // THE LIVE SET HOLDS STILL THROUGH A KV OUTAGE. A pod whose KV stops answering
-// keeps the set it last read: had it aged to itself, two live pods would each elect
-// themselves owner of every org. A peer that dies in the outage keeps its orgs until
-// the KV answers again.
+// keeps the set it last read: had it aged to itself, two live pods would each
+// elect themselves owner of every org.
 func TestALiveSetHoldsStillThroughAnOutage(t *testing.T) {
 	t.Parallel()
 	kv := newMem()

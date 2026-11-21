@@ -348,11 +348,7 @@ func LoadConfig() *Config {
 		Replicas:   getenvInt("CLOUD_REPLICAS", 0),
 		OpenStores: env.Or("CLOUD_OPEN_STORES", ""),
 		IAMStore:   env.Or(IAMStoreEnv, ""),
-		// Domain left empty here; derived from Brand below unless pinned — the
-		// literal "api.hanzo.ai" default used to live here, which meant a lux
-		// deployment that pinned nothing answered with Hanzo's host in every URL
-		// it built about itself.
-		Domain: env.Or("CLOUD_DOMAIN", ""),
+		Domain:     env.Or("CLOUD_DOMAIN", ""),
 		// IAMIssuer left empty here; resolved from Brand below unless pinned.
 		IAMIssuer:         env.Or("CLOUD_IAM_ISSUER", ""),
 		JWKSURL:           env.Or("CLOUD_JWKS_URL", ""),
@@ -380,12 +376,8 @@ func LoadConfig() *Config {
 	// THE BINARY KNOWS WHICH APP IT IS; a deployment does not restate it.
 	//
 	// cfg.Enable is set by Listen from the app the plugin was built as — one
-	// process per app, and plugin/<app>/main.go names it. CLOUD_ENABLE/--enable
-	// used to state the same set a SECOND time, from the values file, and the
-	// only thing a second source of truth can add is disagreement: the list named
-	// an app that does not exist and omitted one every child needs. Neither is
-	// representable now. Empty still means all, which is what production has
-	// always run.
+	// process per app, and plugin/<app>/main.go names it. Neither is representable
+	// now. Empty still means all, which is what production has always run.
 	flagsOnce.Do(func() {
 		flag.StringVar(&cfg.Brand, "brand", cfg.Brand, "white-label brand")
 		flag.StringVar(&cfg.Domain, "domain", cfg.Domain, "primary domain")
@@ -406,10 +398,7 @@ func LoadConfig() *Config {
 	// etc. — never silently defaulting every brand to iam.hanzo.ai.
 	//
 	// issuerFor is THE resolution, shared with the package-level IAMIssuer()
-	// (iamurl.go). That function used to read CLOUD_IAM_ISSUER raw and stop, so on
-	// any deployment that let the brand supply the issuer — the documented happy
-	// path — this field held "https://lux.id" while IAMIssuer() held "". The two
-	// cannot differ now because there is one function.
+	// (iamurl.go). The two cannot differ now because there is one function.
 	cfg.IAMIssuer = iam.IssuerFor(cfg.IAMIssuer, cfg.Brand)
 
 	// The deployment's own public API host, by the same rule and for the same

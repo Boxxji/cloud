@@ -37,10 +37,8 @@ func aiTracer() trace.Tracer { return otel.Tracer("hanzo.ai/cloud") }
 // time to first token, in milliseconds: from the moment the model was asked to the
 // first delta of content it sent back.
 //
-// It is measured inside the model call and nowhere else, so nothing that happened
-// before the call — a session's sandbox coming back from a park, a pod moved off
-// a lost node (sdk/activation) — can be inside it. The two are separate facts on
-// separate spans; a turn's latency is their sum only for a reader who adds them.
+// The two are separate facts on separate spans; a turn's latency is their sum
+// only for a reader who adds them.
 //
 // A completion that is not streamed has no first token to see and carries no
 // such attribute, rather than its whole duration under this name.

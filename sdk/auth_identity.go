@@ -2,11 +2,9 @@ package cloud
 
 // In-binary IAM identity — the trust anchor for SanitizeIdentity.
 //
-// It no longer MIRRORS anything. This file used to say it mirrored the gateway's
-// validator and explain why cloud could not import it: the gateway is a heavyweight
-// module and already imports cloud, so importing it back would braid a cycle. Both
-// halves were true, and the conclusion — write our own — is what produced a third
-// independent reading of what an IAM token means.
+// It no longer MIRRORS anything. Both halves were true, and the conclusion —
+// write our own — is what produced a third independent reading of what an IAM
+// token means.
 //
 // The reading is hanzoai/authz now, and the check is hanzoai/authz/edge. The leaf is
 // 148 packages with one non-stdlib dependency and imports nothing from cloud or the
@@ -43,9 +41,7 @@ import (
 // idClaims is what a token proved, plus the one thing cloud resolves itself.
 //
 // The CLAIMS are authz.Claims — the definition IAM signs — embedded rather than
-// restated. This struct used to restate them, and the restatement is where the drift
-// lived: it declared a `type` claim IAM emits nowhere and read it as the machine
-// discriminator, so every machine principal arrived as a human.
+// restated.
 type idClaims struct {
 	authz.Claims
 
@@ -191,11 +187,10 @@ func (c *idClaims) stable() bool { return c.Subject != "" || c.subjectOrg != "" 
 // the distinct-from-userID() value stamped as X-User-Name so the direct-Bearer
 // path builds owner/name correctly — the gateway historically wrote
 // X-User-Id==name, which userID() (sub-first) breaks on the in-binary path.
-// PREFERRED_USERNAME FIRST, and `name` only as a legacy fallback. The order used
-// to be reversed on the belief that IAM's `name` claim carried IAM's canonical
-// username. It does not: OIDC gives `name` DISPLAY semantics and IAM fills it from
-// User.DisplayName, so a real token read `name = "Zach Kelling"` — a human label
-// with a space in it, not the `<name>` half of `<owner>/<name>`.
+// PREFERRED_USERNAME FIRST, and `name` only as a legacy fallback. It does not:
+// OIDC gives `name` DISPLAY semantics and IAM fills it from User.DisplayName, so
+// a real token read `name = "Zach Kelling"` — a human label with a space in it,
+// not the `<name>` half of `<owner>/<name>`.
 //
 // The cost landed on the money path, which addresses a wallet as `<org>/<username>`
 // (sdk/meter/wallet.go). Preferring `name` addressed `hanzo/Zach Kelling`,
@@ -230,10 +225,6 @@ func (c *idClaims) username() string {
 // (cert-hanzo/cert-lux/cert-zoo/...), keyed by the token kid, so a single
 // jwksURL verifies all brands. Only the issuer-string comparison had to widen.
 type Boundary struct {
-	// verifier is the estate's ONE credential check (hanzoai/authz/edge): the JWKS
-	// reader, the algorithm allowlist, kid-bound key selection, the issuer allowlist
-	// and expiry. cloud used to hold its own of each, and each was a chance to differ
-	// from the edge about what a token proves.
 	verifier *edge.Verifier
 	// issuers is the trusted-issuer set the verifier above holds, kept for the one
 	// other key a token here may be signed by: IAM's delegation key, which the
@@ -442,12 +433,7 @@ func (c *idClaims) defaultOrg(owner string) string {
 // clientCredentialsGrant — and the version this binary embeds emits it, which
 // is the question the old copy never asked.
 //
-// There is nothing else to ask. Two shape readings used to stand here, one
-// matching an owner-bound KMS audience and one matching sub/azp/aud; both were
-// answering the question the claim now answers, and one of them answered it
-// WRONG — it required the sole audience to equal azp, which a machine token
-// minted with `?resource=` does not satisfy, so a legitimate program was refused
-// for naming what it was for.
+// There is nothing else to ask.
 //
 // The API key stays out by its own fact: an sk- key resolves to a PERSON's row,
 // which is what subjectOrg records, so its authority is that person's and reading
@@ -629,10 +615,6 @@ func orgAdmin(claims *idClaims, org string) bool {
 	return claims.OrgAdmin(org)
 }
 
-// The org-admin fact is authz.Claims.OrgAdmin's to state (see orgAdmin above).
-// cloud used to re-derive it here, folding the role vocabulary itself; that
-// derivation is deleted rather than kept beside the published one, because two
-// readings of one claim is exactly the condition this package exists to end.
 // Its history is worth keeping: matching only "admin" once locked every
 // self-serve founder out of their own org, since IAM writes RoleOwner for
 // whoever CREATES an org (EnsureMembership(..., RoleOwner), so a new org is not
@@ -663,12 +645,7 @@ func orgSlugs(orgs []authz.Membership) string {
 // validate parses raw, verifies its signature against the JWKS, and enforces
 // issuer/audience/expiry. Returns the claims on success, an error otherwise.
 func (v *Boundary) validate(raw string) (*idClaims, error) {
-	// Everything a token has to prove is proved in ONE place. This function used to
-	// hold its own algorithm allowlist, its own key selection, its own issuer set
-	// comparison and its own expiry check — four opportunities to answer differently
-	// from the edge about the same token, and the key selection did: it fell back to
-	// trying every RSA key in the JWKS, so a token naming one key was accepted on a
-	// signature from another.
+	// Everything a token has to prove is proved in ONE place.
 	//
 	// Audience is deliberately NOT a gate here, which is why the verifier is built
 	// with no allowlist. A valid signature from a trusted issuer already proves IAM
@@ -736,12 +713,6 @@ func (v *Boundary) validateConfined(raw string) (*idClaims, error) {
 	return &idClaims{Claims: *claims, acted: true, confined: true, agent: a.sub}, nil
 }
 
-// APIKeyPrefixes is every opaque-key spelling cloud recognizes at the edge, and
-// the value itself lives in sdk/scrub — a leaf, so a caller that must not
-// link package cloud can still read the authority rather than keeping a copy in
-// step by hand. apps/admission used to keep such a copy, and this comment used to
-// ask the next reader to remember it; admission retired it (middleware.go says
-// why), and the leaf is what makes remembering unnecessary for the next one.
 var APIKeyPrefixes = scrub.Prefixes
 
 // PublishablePrefix is the ONE publishable spelling: pk- is the key you may ship

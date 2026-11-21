@@ -2,10 +2,8 @@ package cloud
 
 // service.go — the ONE subsystem abstraction.
 //
-// Every /v1 subsystem used to declare its own `type svc struct { … }` holding a
-// re-plumbed copy of the shared deps (log, kms, billing, brand) plus its own
-// state, hang handler methods off it, and hand-write a Mount body. That is the
-// same shape copied ~40 times. This collapses it to one generic value.
+// That is the same shape copied ~40 times. This collapses it to one generic
+// value.
 //
 // A subsystem is Base (the shared deps, derived once) + its own typed State.
 // Handlers are FREE FUNCTIONS `func(*Service[S], *zip.Ctx) error` — so a package

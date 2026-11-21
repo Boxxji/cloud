@@ -100,9 +100,7 @@ const (
 // from the validated `billing_account` claim. The raw client copy is never a
 // source for any of them.
 //
-// Both categories are REMOVED the same way, by the one list below. They used to be
-// two lists that also spelled what to remove, which is two places for one fact to
-// go stale in.
+// Both categories are REMOVED the same way, by the one list below.
 
 // stripped is every identity name ingress DELETES: ingress.Stripped, the one list
 // (see it for what is in it and why X-Request-Id is not).
@@ -456,12 +454,11 @@ func sanitizeSubScopes(c *zip.Ctx, org, project, app, billingAccount string) {
 	}
 	// X-Billing-Account-Id names WHO PAYS, so it is written from the validated
 	// `billing_account` claim (claims.renderBillingAccount) and never from a client
-	// value — the raw copy is deleted on ingress and not restored here. It used to
-	// be forwarded as-is, which was defensible only while it was a mere attribution
-	// hint that no debit read. It is not one anymore: ai/object.Payer now resolves
-	// the paying Account from this claim, so a restored client copy would be a caller
-	// naming its own payer — the whole thing the claim exists to prevent. Absent when
-	// IAM minted no account (a pre-claim token); Payer then falls back.
+	// value — the raw copy is deleted on ingress and not restored here. It is not
+	// one anymore: ai/object.Payer now resolves the paying Account from this claim,
+	// so a restored client copy would be a caller naming its own payer — the whole
+	// thing the claim exists to prevent. Absent when IAM minted no account (a
+	// pre-claim token); Payer then falls back.
 	if billingAccount != "" {
 		req.Header.Set(authz.HeaderBillingAccount, billingAccount)
 	}

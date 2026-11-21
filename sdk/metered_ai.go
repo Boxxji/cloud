@@ -12,11 +12,9 @@ package cloud
 // which prices it exactly as it prices the same answer for any caller of
 // api.hanzo.ai — the routed model, its route and rate rows, Enso's fixed prices,
 // zen's retail — and tells the price on the call's Bill (types.Bill). The meter
-// charges that. Before the call it holds the most the call can cost at the model's
-// listed price (ai_rates), never less than a cent, so an empty wallet is refused
-// before a model is asked; the hold is given back when the debit lands. The flat
-// $2-a-million rate it used to charge for every model billed enso-ultra below its
-// cost and the free models above nothing; it is gone.
+// charges that. Before the call it holds the most the call can cost at the
+// model's listed price (ai_rates), never less than a cent, so an empty wallet is
+// refused before a model is asked; the hold is given back when the debit lands.
 //
 // It reuses the SAME commerce path (Meter over Deps.Metering) as every other Hanzo
 // surface. With no meter constructed the wrapper is a transparent pass-through, so
@@ -460,8 +458,6 @@ func MicrosToGateCents(micros int64) int64 {
 	return 1
 }
 
-// EstTokens is a deterministic, provider-agnostic token estimate (~4 chars/token)
-// used to size the pre-call hold before the call's real usage is known.
 func EstTokens(texts ...string) int {
 	var chars int
 	for _, t := range texts {

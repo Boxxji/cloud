@@ -478,12 +478,10 @@ func parseClientAddr(s string) (netip.Addr, bool) {
 
 // ---- carrying the caller's address to a child process -----------------------
 
-// A SUBSYSTEM CANNOT SEE THE CONNECTION. The pod runs one process per subsystem and
-// the host reaches each over a unix socket, so the request a child handles has the
-// SOCKET as its peer — measured empty, and constant whatever it is. Anything a child
-// derives from it is therefore one value for every caller on earth, which is not a
-// degraded answer but a single answer wearing everyone's name, and ai's per-visitor
-// ceiling is keyed on exactly that value.
+// A SUBSYSTEM CANNOT SEE THE CONNECTION. Anything a child derives from it is
+// therefore one value for every caller on earth, which is not a degraded answer
+// but a single answer wearing everyone's name, and ai's per-visitor ceiling is
+// keyed on exactly that value.
 //
 // So the host answers, because the host is where the connection is. IP above is
 // already the ONE hardened definition; the rest of this section only carries it
@@ -553,12 +551,11 @@ var first sync.Once
 // tests assert on. A subsystem reads the header itself rather than deriving an
 // address of its own — ai does, and nothing installs a resolver any more.
 //
-// CLONED, and this is the clone that matters. The value comes back out of a buffer
-// fasthttp reuses between requests, so uncloned it is a view the NEXT caller
-// overwrites — two callers in a row then read one string and become one visitor,
-// which is the very collapse this exists to end, reappearing a layer down. Measured:
-// dropping this clone fails the crossing test; a clone at the writing end changes
-// nothing, because Header.Set already copies.
+// CLONED, and this is the clone that matters. The value comes back out of a
+// buffer fasthttp reuses between requests, so uncloned it is a view the NEXT
+// caller overwrites — two callers in a row then read one string and become one
+// visitor, which is the very collapse this exists to end, reappearing a layer
+// down.
 func IPAcross(r *http.Request) string {
 	return strings.Clone(r.Header.Get(address.Header))
 }
