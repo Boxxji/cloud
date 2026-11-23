@@ -2,9 +2,11 @@ package cloud
 
 // In-binary IAM identity — the trust anchor for SanitizeIdentity.
 //
-// It no longer MIRRORS anything. Both halves were true, and the conclusion —
-// write our own — is what produced a third independent reading of what an IAM
-// token means.
+// It no longer MIRRORS anything. This file used to say it mirrored the gateway's
+// validator and explain why cloud could not import it: the gateway is a heavyweight
+// module and already imports cloud, so importing it back would braid a cycle. Both
+// halves were true, and the conclusion — write our own — is what produced a third
+// independent reading of what an IAM token means.
 //
 // The reading is hanzoai/authz now, and the check is hanzoai/authz/edge. The leaf is
 // 148 packages with one non-stdlib dependency and imports nothing from cloud or the
@@ -25,14 +27,15 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"os"
+	"fmt"
+	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hanzoai/authz"
 	"github.com/hanzoai/authz/edge"
-	"github.com/hanzoai/cloud/sdk/brand"
 	"github.com/hanzoai/cloud/sdk/principal"
 
 	"github.com/hanzoai/cloud/sdk/scrub"
@@ -41,7 +44,9 @@ import (
 // idClaims is what a token proved, plus the one thing cloud resolves itself.
 //
 // The CLAIMS are authz.Claims — the definition IAM signs — embedded rather than
-// restated.
+// restated. This struct used to restate them, and the restatement is where the drift
+// lived: it declared a `type` claim IAM emits nowhere and read it as the machine
+// discriminator, so every machine principal arrived as a human.
 type idClaims struct {
 	authz.Claims
 
@@ -187,10 +192,11 @@ func (c *idClaims) stable() bool { return c.Subject != "" || c.subjectOrg != "" 
 // the distinct-from-userID() value stamped as X-User-Name so the direct-Bearer
 // path builds owner/name correctly — the gateway historically wrote
 // X-User-Id==name, which userID() (sub-first) breaks on the in-binary path.
-// PREFERRED_USERNAME FIRST, and `name` only as a legacy fallback. It does not:
-// OIDC gives `name` DISPLAY semantics and IAM fills it from User.DisplayName, so
-// a real token read `name = "Zach Kelling"` — a human label with a space in it,
-// not the `<name>` half of `<owner>/<name>`.
+// PREFERRED_USERNAME FIRST, and `name` only as a legacy fallback. The order used
+// to be reversed on the belief that IAM's `name` claim carried IAM's canonical
+// username. It does not: OIDC gives `name` DISPLAY semantics and IAM fills it from
+// User.DisplayName, so a real token read `name = "Zach Kelling"` — a human label
+// with a space in it, not the `<name>` half of `<owner>/<name>`.
 //
 // The cost landed on the money path, which addresses a wallet as `<org>/<username>`
 // (sdk/meter/wallet.go). Preferring `name` addressed `hanzo/Zach Kelling`,
@@ -225,11 +231,23 @@ func (c *idClaims) username() string {
 // (cert-hanzo/cert-lux/cert-zoo/...), keyed by the token kid, so a single
 // jwksURL verifies all brands. Only the issuer-string comparison had to widen.
 type Boundary struct {
-	verifier *edge.Verifier
-	// issuers is the trusted-issuer set the verifier above holds, kept for the one
-	// other key a token here may be signed by: IAM's delegation key, which the
-	// public JWKS never carries (delegation.go), and against which a confined token
-	// — and nothing else — is verified.
+	// verifier is the estate's ONE credential check (hanzoai/authz/edge): the JWKS
+	// reader, the algorithm allowlist, kid-bound key selection, the issuer allowlist
+	// and expiry. cloud used to hold its own of each, and each was a chance to differ
+	// from the edge about what a token proves.
+	//
+	// One verifier per provider whose discovery document names it, built from that
+	// document: a token is routed by the issuer it claims (unverified, and only to pick
+	// the verifier), and the verifier then holds it to that issuer and to the keys the
+	// provider's own document points at.
+	sources []*Discovery
+	jwksTTL time.Duration
+	vmu     sync.Mutex
+	held    map[string]heldVerifier
+	// issuers is the trusted-issuer set, kept for the one other key a token here may
+	// be signed by: IAM's delegation key, which the public JWKS never carries
+	// (delegation.go), and against which a confined token — and nothing else — is
+	// verified. It is the issuers the discovery URLs imply, known without a fetch.
 	issuers    []string
 	delegation *delegationKeys
 	// live asks IAM whether a confined token's grant still stands (delegation.go):
@@ -242,24 +260,90 @@ type Boundary struct {
 	claims *identityCache
 }
 
-// newIdentityValidator builds a validator whose trusted-issuer set is the primary
-// issuer UNIONED with every white-label brand issuer (brand.Issuers) plus any
-// WHITELABEL_ISSUERS override. ttl<=0 uses the 15m JWKS default. The union is
-// fail-secure: it only ADDS the known-good brand issuers, never an arbitrary one.
-//
-// Trust is IAM-native: signature (JWKS) + issuer (this set) + expiry. There is NO
-// per-app audience allowlist — the `aud` (a minting app's client_id) is IAM's to
-// assign, not cloud's to mirror, so a new first-party app needs zero cloud change.
-func newIdentityValidator(issuer, jwksURL string, ttl time.Duration) *Boundary {
-	issuers := trustedIssuers(issuer)
-	return &Boundary{
-		verifier:   edge.NewVerifier(jwksURL, issuers, nil, ttl),
-		issuers:    issuers,
+// heldVerifier is a verifier and the JWKS URL it was built for.
+type heldVerifier struct {
+	jwks string
+	v    *edge.Verifier
+}
+
+// newBoundary builds the validator for the providers at urls, each by its OIDC
+// discovery document (discovery.go). Trust is IAM-native: signature (the provider's
+// JWKS) + issuer (the one its document names) + expiry. There is NO per-app audience
+// allowlist — the `aud` (a minting app's client_id) is IAM's to assign, not cloud's
+// to mirror, so a new first-party app needs zero cloud change. ttl<=0 uses the 15m
+// JWKS cache default.
+func newBoundary(urls []string, client *http.Client, ttl time.Duration) (*Boundary, error) {
+	b := &Boundary{
+		jwksTTL:    ttl,
+		held:       map[string]heldVerifier{},
 		delegation: &delegationKeys{},
 		live:       &liveness{},
 		claims:     newIdentityCache(),
 		keys:       sharedKeys(), // ONE resolver+cache, shared with OrgForKey (analytics capture)
 	}
+	for _, u := range urls {
+		d, err := DiscoveryFor(u, client)
+		if err != nil {
+			return nil, err
+		}
+		if slices.Contains(b.issuers, d.Issuer()) {
+			continue
+		}
+		b.sources = append(b.sources, d)
+		b.issuers = append(b.issuers, d.Issuer())
+	}
+	if len(b.sources) == 0 {
+		return nil, errors.New("identity: no OIDC discovery URL, so no issuer to trust")
+	}
+	return b, nil
+}
+
+// verify checks raw against the provider whose issuer it claims. A claim no
+// provider here owns is refused before any key is read; a provider that has never
+// published a document fails closed.
+func (v *Boundary) verify(raw string) (*authz.Claims, error) {
+	iss := claimedIssuer(raw)
+	var src *Discovery
+	for _, d := range v.sources {
+		if d.Issuer() == iss {
+			src = d
+		}
+	}
+	if src == nil {
+		return nil, fmt.Errorf("identity: issuer %q is not trusted", iss)
+	}
+	doc, err := src.Document()
+	if err != nil {
+		return nil, err
+	}
+	v.vmu.Lock()
+	h, ok := v.held[iss]
+	if !ok || h.jwks != doc.JWKSURI {
+		h = heldVerifier{jwks: doc.JWKSURI, v: edge.NewVerifier(doc.JWKSURI, []string{iss}, nil, v.jwksTTL)}
+		v.held[iss] = h
+	}
+	v.vmu.Unlock()
+	return h.v.VerifyRaw(raw)
+}
+
+// claimedIssuer is the `iss` a token CLAIMS, read without trusting it: it only
+// chooses which provider's keys the token is then verified against.
+func claimedIssuer(raw string) string {
+	parts := strings.Split(raw, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	b, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var p struct {
+		Iss string `json:"iss"`
+	}
+	if json.Unmarshal(b, &p) != nil {
+		return ""
+	}
+	return p.Iss
 }
 
 // kmsMachineAudSuffix is the fixed suffix of a per-org PaaS-KMS sync machine
@@ -433,7 +517,12 @@ func (c *idClaims) defaultOrg(owner string) string {
 // clientCredentialsGrant — and the version this binary embeds emits it, which
 // is the question the old copy never asked.
 //
-// There is nothing else to ask.
+// There is nothing else to ask. Two shape readings used to stand here, one
+// matching an owner-bound KMS audience and one matching sub/azp/aud; both were
+// answering the question the claim now answers, and one of them answered it
+// WRONG — it required the sole audience to equal azp, which a machine token
+// minted with `?resource=` does not satisfy, so a legitimate program was refused
+// for naming what it was for.
 //
 // The API key stays out by its own fact: an sk- key resolves to a PERSON's row,
 // which is what subjectOrg records, so its authority is that person's and reading
@@ -615,6 +704,10 @@ func orgAdmin(claims *idClaims, org string) bool {
 	return claims.OrgAdmin(org)
 }
 
+// The org-admin fact is authz.Claims.OrgAdmin's to state (see orgAdmin above).
+// cloud used to re-derive it here, folding the role vocabulary itself; that
+// derivation is deleted rather than kept beside the published one, because two
+// readings of one claim is exactly the condition this package exists to end.
 // Its history is worth keeping: matching only "admin" once locked every
 // self-serve founder out of their own org, since IAM writes RoleOwner for
 // whoever CREATES an org (EnsureMembership(..., RoleOwner), so a new org is not
@@ -645,7 +738,12 @@ func orgSlugs(orgs []authz.Membership) string {
 // validate parses raw, verifies its signature against the JWKS, and enforces
 // issuer/audience/expiry. Returns the claims on success, an error otherwise.
 func (v *Boundary) validate(raw string) (*idClaims, error) {
-	// Everything a token has to prove is proved in ONE place.
+	// Everything a token has to prove is proved in ONE place. This function used to
+	// hold its own algorithm allowlist, its own key selection, its own issuer set
+	// comparison and its own expiry check — four opportunities to answer differently
+	// from the edge about the same token, and the key selection did: it fell back to
+	// trying every RSA key in the JWKS, so a token naming one key was accepted on a
+	// signature from another.
 	//
 	// Audience is deliberately NOT a gate here, which is why the verifier is built
 	// with no allowlist. A valid signature from a trusted issuer already proves IAM
@@ -657,7 +755,7 @@ func (v *Boundary) validate(raw string) (*idClaims, error) {
 	if presentsConfined(raw) {
 		return v.validateConfined(raw)
 	}
-	claims, err := v.verifier.VerifyRaw(raw)
+	claims, err := v.verify(raw)
 	if err != nil {
 		return nil, err
 	}
@@ -713,6 +811,12 @@ func (v *Boundary) validateConfined(raw string) (*idClaims, error) {
 	return &idClaims{Claims: *claims, acted: true, confined: true, agent: a.sub}, nil
 }
 
+// APIKeyPrefixes is every opaque-key spelling cloud recognizes at the edge, and
+// the value itself lives in sdk/scrub — a leaf, so a caller that must not
+// link package cloud can still read the authority rather than keeping a copy in
+// step by hand. apps/admission used to keep such a copy, and this comment used to
+// ask the next reader to remember it; admission retired it (middleware.go says
+// why), and the leaf is what makes remembering unnecessary for the next one.
 var APIKeyPrefixes = scrub.Prefixes
 
 // PublishablePrefix is the ONE publishable spelling: pk- is the key you may ship
@@ -761,40 +865,4 @@ func basicFromAuth(auth string) string {
 		return pass
 	}
 	return user
-}
-
-// trustedIssuers returns the full trusted-issuer set for the in-binary validator:
-// the PRIMARY issuer (the deployment's own brand, cfg.IAMIssuer) UNIONED with every
-// white-label brand issuer (brand.Issuers) and any WHITELABEL_ISSUERS override
-// (comma-separated). Fail-secure: it only ADDS known-good issuers; a nil/empty
-// result is impossible when a primary is set, so the issuer check is always
-// enforced. Duplicates are removed; order is primary-first.
-func trustedIssuers(primary string) []string {
-	out := make([]string, 0, 6)
-	add := func(v string) {
-		v = strings.TrimSpace(v)
-		if v == "" {
-			return
-		}
-		if slices.Contains(out, v) {
-			return
-		}
-		out = append(out, v)
-	}
-	add(primary)
-	for _, iss := range brand.Issuers() {
-		add(iss)
-	}
-	for _, iss := range splitTrim(os.Getenv("WHITELABEL_ISSUERS")) {
-		add(iss)
-	}
-	return out
-}
-
-// issuerAllowed reports whether iss is one of the trusted issuers. It is
-// fail-secure in BOTH directions: an empty trusted set matches NOTHING (deny), so
-// a misconfiguration that empties the issuer allowlist rejects every token instead
-// of silently disabling the check (I2); a non-empty set rejects any iss not in it.
-func issuerAllowed(iss string, trusted []string) bool {
-	return slices.Contains(trusted, iss)
 }

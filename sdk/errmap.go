@@ -35,6 +35,7 @@ import (
 	"strings"
 
 	"github.com/hanzoai/cloud/sdk/brand"
+	"github.com/hanzoai/cloud/sdk/fault"
 	"github.com/hanzoai/cloud/sdk/mcp"
 	"github.com/hanzoai/cloud/sdk/meter"
 	"github.com/hanzoai/cloud/sdk/supply"
@@ -262,9 +263,11 @@ func codeFor(code string, status int) string {
 
 // internalFault is what a 500 says when nobody decided anything.
 //
-// The rendered body is never err.Error() verbatim: an undecided error is text
-// written for an operator (storage, key references, upstream addresses), none of it
-// is the caller's to act on, and putting it on the wire would publish internals to
+// The rendered body used to be err.Error() verbatim, which is how a customer's
+// first fault told them about ZapDB migrations, CLOUD_KMS_MASTER_KEY_REF,
+// http://iam.hanzo.svc and features that are "not yet implemented". None of that
+// is theirs to act on and all of it is ours to know: an undecided error is text
+// written for an operator, and putting it on the wire published our internals to
 // whoever tripped it.
 //
 // The rule is provenance, not status. An *HTTPError or a *fiber.Error was
@@ -323,21 +326,27 @@ func ErrorHandler(c fiber.Ctx, err error) error {
 	// are built from this.
 	host := string(c.Request().Header.Host())
 	he := mapError(err, host)
+	route := c.Path()
+	if r := c.Route(); r != nil && r.Path != "" {
+		route = r.Path
+	}
+	// EVERY NON-2XX HAS A KEY. The fault is built here, from the status and code
+	// the response will carry and the error behind them, so a refusal, a 4xx a
+	// handler chose and a 5xx nobody did all read the same way: a code, a route
+	// pattern, a site and a sentence. Its fingerprint rides the body below.
+	f := fault.Request(c.Method(), route, he.Status, he.Code, err)
+	f.Request = c.Get("X-Request-Id")
 	if he.Status >= 500 {
 		faultLog.Error("request failed",
 			"status", he.Status,
 			"method", c.Method(),
 			"path", c.Path(),
-			"request_id", c.Get("X-Request-Id"),
+			"request_id", f.Request,
+			"fingerprint", f.Fingerprint(),
 			"err", err)
-		// A 500 is ours, so it is also filed with Sentinel (faults.go).
-		if he.Status == http.StatusInternalServerError {
-			route := c.Path()
-			if r := c.Route(); r != nil && r.Path != "" {
-				route = r.Path
-			}
-			reportFault(c.Method(), route, err)
-		}
+		// A 5xx is ours, so it is also stated on the event plane, where it is
+		// grouped by this fingerprint and counted (internal/host/faults.go).
+		ReportFault(f)
 	}
 	// A handler that CHOSE its sentence is not second-guessed about what it says —
 	// but a chosen sentence routinely quotes text this process did not write. The
@@ -356,10 +365,25 @@ func ErrorHandler(c fiber.Ctx, err error) error {
 	// holds, and rewriting that would corrupt every later rendering of it.
 	out := *he
 	out.Msg = scrubMessage(out.Status, out.Msg)
+	// A refusal always says why: a status with no sentence is read as the status's
+	// own phrase, never as an empty reason.
+	if strings.TrimSpace(out.Msg) == "" {
+		out.Msg = http.StatusText(out.Status)
+	}
+	// The key rides the body as an extension member (RFC 9457 §3.2), so a client
+	// that reports a failure, a person who writes to support and an issue the
+	// platform files name one thing. The member map is copied: the refusal may be
+	// a sentinel its owner still holds.
+	detail := make(map[string]any, len(out.Detail)+1)
+	for k, v := range out.Detail {
+		detail[k] = v
+	}
+	detail["fingerprint"] = f.Fingerprint()
+	out.Detail = detail
 	// A 401 names the scheme that would have been accepted (RFC 9110 §11.6.1),
 	// and where to learn how to get one: the resource metadata this host serves
 	// (RFC 9728 §5.1), which names the authorization server. Without it a client
-	// that met a 401 had to know the issuer already. The
+	// that met a 401 had to know hanzo.id already (#420). The
 	// origin is the request's own (brand.Origin of its Host header), as the MCP
 	// challenge's is (client/mcp.go), so a white-label host never points a client at
 	// a host it did not call, and a forwarded header names nothing here. A handler

@@ -52,6 +52,11 @@ func TestABrandsIssuersDuringAMove(t *testing.T) {
 	if got := Siblings("https://lux.id"); len(got) != 0 {
 		t.Errorf("a brand with one issuer has siblings: %v", got)
 	}
+	for iss, want := range map[string]bool{"https://hanzo.id": true, "https://hanzo.ai": true, "https://hanzo.ai/acme": false, "https://lux.id": false} {
+		if got := Trusts("https://hanzo.id", iss); got != want {
+			t.Errorf("Trusts(hanzo.id, %q) = %v, want %v", iss, got, want)
+		}
+	}
 	if got := IssuerFor("hanzo"); got != "https://hanzo.id" {
 		t.Errorf("a brand mints under %q: the move never changes what is minted here", got)
 	}

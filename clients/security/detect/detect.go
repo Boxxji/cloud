@@ -1,23 +1,3 @@
-// Package detect is the pure, dependency-free secret-detection engine behind
-// Hanzo's native code-security surface. It scans source for hardcoded secrets
-// with zero external tooling (no semgrep/gitleaks binary, no network) — the one
-// Semgrep-class capability that ships complete today. The logic ports the
-// concept behind hanzoai/guard (the LLM-boundary redactor) to code at rest, and
-// is the substrate a native AST/SAST engine (on hanzoai/ast) grows onto per the
-// plan of record in hanzoai/security POSTURE.md.
-//
-// It is deliberately a LEAF: only the standard library is imported, and the API
-// is pure functions over (path, content) → findings — no I/O, no store, no
-// HTTP, no cloud deps. That decomplection is the point: the HTTP subsystem
-// (clients/security) AND the `hanzo security scan` CLI both consume THIS engine,
-// so the detection logic exists once and neither surface drags the other in.
-//
-// THE ONE INVARIANT: a Finding NEVER carries the raw secret. It carries a masked
-// preview (first/last few chars, middle starred) plus a SHA-256 fingerprint of
-// the secret — enough to locate it, dedupe identical occurrences, and confirm a
-// rotation happened, and nothing more. Persisting the plaintext would make the
-// findings DB a secret store, exactly the thing we scan to prevent (global rule:
-// never store secrets in the clear).
 package detect
 
 import (
@@ -74,18 +54,20 @@ func RuleCount() int { return len(rules) }
 // fires when the captured value's Shannon entropy clears the threshold, which
 // is how generic `secret = "..."` lines avoid flagging every lowercase word.
 type Rule struct {
-	ID          string
-	Name        string
-	Severity    string
-	Description string
-	re          *regexp.Regexp
-	group       int     // capture group holding the secret (0 = whole match)
-	minEntropy  float64 // >0: only fire when the captured value's entropy >= this
+	ID              string
+	Name            string
+	Severity        string
+	Description     string
+	re              *regexp.Regexp
+	group           int      // capture group holding the secret (0 = whole match)
+	minEntropy      float64  // >0: only fire when the captured value's entropy >= this
+	excludePrefixes []string // optional prefixes handled by dedicated rules
 }
 
 // Finding is one detected secret. It is the redacted, storable record — it
-// pins WHERE (path, line) and WHAT rule fired, and carries a masked Preview
-// plus the SHA-256 Fingerprint of the raw secret, never the secret itself.
+// pins WHERE (path, line, and optional git commit) and WHAT rule fired, and
+// carries a masked Preview plus the SHA-256 Fingerprint of the raw secret,
+// never the secret itself.
 type Finding struct {
 	RuleID      string
 	RuleName    string
@@ -94,6 +76,8 @@ type Finding struct {
 	Line        int
 	Preview     string // masked: first/last chars kept, middle starred
 	Fingerprint string // hex SHA-256 of the raw secret — dedupe/rotation key
+	Commit      string `json:"commit,omitempty"`   // git commit SHA when scanned via --git / diff
+	Verified    *bool  `json:"verified,omitempty"` // live read-only credential probe verdict when --verify is enabled
 }
 
 // rules is the built-in catalog. Order is irrelevant (Scan sorts output); each
@@ -107,53 +91,107 @@ func buildRules() []Rule {
 		id, name, sev, desc, pat string
 		group                    int
 		entropy                  float64
+		exclude                  []string
 	}{
 		{"private-key", "Private key block", SeverityCritical,
 			"PEM private key material (RSA/EC/OPENSSH/DSA/PGP).",
-			`-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----`, 0, 0},
+			`-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----`, 0, 0, nil},
+		{"age-secret-key", "Age encryption secret key", SeverityCritical,
+			"An Age X25519 encryption secret key (AGE-SECRET-KEY-1...).",
+			`\bAGE-SECRET-KEY-1[A-Z0-9]{58}\b`, 0, 0, nil},
+		{"hanzo-api-key", "Hanzo API key", SeverityCritical,
+			"A Hanzo API, IAM, or KMS bearer key (hk-... / sk-hanzo-...).",
+			`\b(?:hk-[A-Za-z0-9_\-]{24,}|sk-hanzo-[A-Za-z0-9_\-]{24,})\b`, 0, 0, nil},
+		{"openai-api-key", "OpenAI API key", SeverityCritical,
+			"An OpenAI API or project/service-account secret key (sk-...).",
+			`\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_\-]{32,}\b`, 0, 0, []string{"sk-ant-", "sk-do-", "sk-hanzo-"}},
+		{"anthropic-api-key", "Anthropic API key", SeverityCritical,
+			"An Anthropic Claude API key (sk-ant-api03-...).",
+			`\bsk-ant-api03-[A-Za-z0-9_\-]{80,}\b`, 0, 0, nil},
+		{"digitalocean-token", "DigitalOcean token", SeverityCritical,
+			"A DigitalOcean PAT, OAuth token, or Gradient inference key (dop_v1_ / doo_v1_ / dor_v1_ / sk-do-).",
+			`\b(?:dop_v1_[a-f0-9]{64}|doo_v1_[a-f0-9]{64}|dor_v1_[a-f0-9]{64}|sk-do-[A-Za-z0-9_\-]{40,})\b`, 0, 0, nil},
 		{"aws-access-key-id", "AWS access key ID", SeverityCritical,
 			"An AWS access key ID (AKIA/ASIA...).",
-			`\b(?:AKIA|ASIA)[0-9A-Z]{16}\b`, 0, 0},
+			`\b(?:AKIA|ASIA)[0-9A-Z]{16}\b`, 0, 0, nil},
 		{"aws-secret-access-key", "AWS secret access key", SeverityCritical,
 			"A value assigned to an aws secret access key field.",
-			`(?i)aws_?secret_?access_?key["' ]*[:=]["' ]*([A-Za-z0-9/+=]{40})`, 1, 0},
-		{"gcp-api-key", "Google API key", SeverityHigh,
-			"A Google/GCP API key (AIza...).",
-			`\bAIza[0-9A-Za-z_\-]{35}\b`, 0, 0},
-		{"github-token", "GitHub token", SeverityHigh,
-			"A GitHub personal-access / OAuth / app token (ghp_/gho_/ghu_/ghs_/ghr_).",
-			`\bgh[pousr]_[A-Za-z0-9]{36,}\b`, 0, 0},
-		{"github-pat-fine", "GitHub fine-grained PAT", SeverityHigh,
-			"A GitHub fine-grained personal access token.",
-			`\bgithub_pat_[A-Za-z0-9_]{82}\b`, 0, 0},
-		{"slack-token", "Slack token", SeverityHigh,
-			"A Slack API token (xoxb/xoxa/xoxp/xoxr/xoxs).",
-			`\bxox[baprs]-[0-9A-Za-z\-]{10,}\b`, 0, 0},
+			`(?i)aws_?secret_?access_?key["' ]*[:=]["' ]*([A-Za-z0-9/+=]{40})`, 1, 0, nil},
+		{"crates-io-token", "crates.io publish token", SeverityCritical,
+			"A crates.io registry publish token (cio...).",
+			`\bcio[A-Za-z0-9]{32}\b`, 0, 0, nil},
+		{"pypi-token", "PyPI upload token", SeverityCritical,
+			"A PyPI macaroon upload token (pypi-AgEIcHlwaS5vcmc...).",
+			`\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9_\-]{50,}\b`, 0, 0, nil},
 		{"stripe-secret-key", "Stripe secret key", SeverityCritical,
 			"A live Stripe secret/restricted key.",
-			`\b(?:sk|rk)_live_[0-9A-Za-z]{24,}\b`, 0, 0},
+			`\b(?:sk|rk)_live_[0-9A-Za-z]{24,}\b`, 0, 0, nil},
+		{"square-secret", "Square secret", SeverityCritical,
+			"A Square OAuth secret or access token (sq0csp-... / sq0atp-...).",
+			`\bsq0(?:csp|atp)-[0-9A-Za-z\-_]{22,}\b`, 0, 0, nil},
+		{"gcp-api-key", "Google API key", SeverityHigh,
+			"A Google/GCP API key (AIza...).",
+			`\bAIza[0-9A-Za-z_\-]{35}\b`, 0, 0, nil},
+		{"github-token", "GitHub token", SeverityHigh,
+			"A GitHub personal-access / OAuth / app token (ghp_/gho_/ghu_/ghs_/ghr_).",
+			`\bgh[pousr]_[A-Za-z0-9]{36,}\b`, 0, 0, nil},
+		{"github-pat-fine", "GitHub fine-grained PAT", SeverityHigh,
+			"A GitHub fine-grained personal access token.",
+			`\bgithub_pat_[A-Za-z0-9_]{82}\b`, 0, 0, nil},
+		{"gitlab-pat", "GitLab personal access token", SeverityHigh,
+			"A GitLab personal access token (glpat-...).",
+			`\bglpat-[A-Za-z0-9_\-]{20,}\b`, 0, 0, nil},
+		{"huggingface-token", "Hugging Face access token", SeverityHigh,
+			"A Hugging Face user or fine-grained access token (hf_...).",
+			`\bhf_[A-Za-z0-9]{34,}\b`, 0, 0, nil},
+		{"slack-token", "Slack token", SeverityHigh,
+			"A Slack API token (xoxb/xoxa/xoxp/xoxr/xoxs).",
+			`\bxox[baprs]-[0-9A-Za-z\-]{10,}\b`, 0, 0, nil},
 		{"npm-token", "npm access token", SeverityHigh,
 			"An npm access token (npm_...).",
-			`\bnpm_[A-Za-z0-9]{36}\b`, 0, 0},
+			`\bnpm_[A-Za-z0-9]{36}\b`, 0, 0, nil},
+		{"sendgrid-api-key", "SendGrid API key", SeverityHigh,
+			"A SendGrid mail API key (SG....).",
+			`\bSG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}\b`, 0, 0, nil},
+		{"cloudflare-api-token", "Cloudflare API token", SeverityHigh,
+			"A 40-character Cloudflare API bearer token assigned in config or code.",
+			`(?i)cloudflare[_a-z0-9]*token["' ]*[:=]["' ]*([A-Za-z0-9_\-]{40})\b`, 1, 0, nil},
+		{"telegram-bot-token", "Telegram bot token", SeverityHigh,
+			"A Telegram Bot API token (<bot_id>:AA...).",
+			`\b[0-9]{8,10}:AA[A-Za-z0-9_\-]{33}\b`, 0, 0, nil},
+		{"basic-auth-url", "URL with embedded credentials", SeverityHigh,
+			"An HTTP(S) URL embedding a high-entropy password in userinfo.",
+			`https?://[A-Za-z0-9._%\-]+:([A-Za-z0-9._~%\-!$&'()*+,;=]{12,})@[A-Za-z0-9.\-]+`, 1, 3.3, nil},
 		{"slack-webhook", "Slack webhook URL", SeverityMedium,
 			"A Slack incoming-webhook URL (carries a send capability).",
-			`https://hooks\.slack\.com/services/[A-Za-z0-9_/]+`, 0, 0},
+			`https://hooks\.slack\.com/services/[A-Za-z0-9_/]+`, 0, 0, nil},
 		{"jwt", "JSON Web Token", SeverityMedium,
 			"A JWT (header.payload.signature) — often a bearer credential.",
-			`\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b`, 0, 0},
+			`\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b`, 0, 0, nil},
 		{"generic-secret", "Generic assigned secret", SeverityMedium,
 			"A high-entropy value assigned to a secret/password/token/apikey field.",
-			`(?i)\b(?:password|passwd|secret|api_?key|access_?token|auth_?token|client_?secret)\b["' ]*[:=]["' ]*["']?([A-Za-z0-9/+=_\-.]{16,})["']?`, 1, 3.5},
+			// The value class allows `=` ONLY as trailing base64 padding. Allowing it
+			// mid-value made the rule swallow a second `key=value` pair after the
+			// keyword — `--secret=id=GIT_AUTH_TOKEN` captured `id=GIT_AUTH_TOKEN`,
+			// which is the NAME of a credential, not one. Naming a secret instead of
+			// pasting it is the pattern we ask people for; flagging it taught them to
+			// ignore the scanner.
+			`(?i)\b(?:password|passwd|secret|api_?key|access_?token|auth_?token|client_?secret)\b["' ]*[:=]["' ]*["']?([A-Za-z0-9/+_\-.]{16,}={0,2})["']?`, 1, 3.5, nil},
 	}
 	out := make([]Rule, 0, len(def))
 	for _, d := range def {
 		out = append(out, Rule{
 			ID: d.id, Name: d.name, Severity: d.sev, Description: d.desc,
 			re: regexp.MustCompile(d.pat), group: d.group, minEntropy: d.entropy,
+			excludePrefixes: d.exclude,
 		})
 	}
 	return out
 }
+
+// InlineIgnoreMarker suppresses findings on a single line when placed in an
+// adjacent comment (e.g. `# hanzo-security:ignore` on a synthetic test fixture).
+const InlineIgnoreMarker = "hanzo-security:ignore"
 
 // ScanContent runs every rule over one file's content and returns the findings,
 // most severe first (then by line). It is pure and allocation-light: no I/O,
@@ -163,6 +201,13 @@ func buildRules() []Rule {
 // line yields one finding. (Named ScanContent, not Scan, so the engine entry
 // point never collides with the store's Scan record type.)
 func ScanContent(path, content string) []Finding {
+	return ScanMatches(path, content, nil)
+}
+
+// ScanMatches runs the detection catalog over content and optionally invokes
+// onMatch(finding, rawSecret) transiently in memory (for opt-in live --verify
+// probes) before discarding rawSecret. Finding never stores rawSecret.
+func ScanMatches(path, content string, onMatch func(f *Finding, rawSecret string)) []Finding {
 	if content == "" {
 		return nil
 	}
@@ -178,33 +223,68 @@ func ScanContent(path, content string) []Finding {
 				ss, se = m[2*r.group], m[2*r.group+1]
 			}
 			secret := content[ss:se]
+			if hasExcludedPrefix(secret, r.excludePrefixes) {
+				continue
+			}
 			if r.minEntropy > 0 && shannonEntropy(secret) < r.minEntropy {
 				continue // low-entropy assignment (e.g. secret = "changeme") — skip
 			}
-			fp := Fingerprint(secret)
 			line := lineOf(lineStarts, ss)
+			if strings.Contains(lineSlice(content, lineStarts, line), InlineIgnoreMarker) {
+				continue
+			}
+			fp := Fingerprint(secret)
 			key := r.ID + "\x00" + itoa(line) + "\x00" + fp
 			if _, dup := seen[key]; dup {
 				continue
 			}
 			seen[key] = struct{}{}
-			out = append(out, Finding{
+			f := Finding{
 				RuleID: r.ID, RuleName: r.Name, Severity: r.Severity,
 				Path: path, Line: line, Preview: mask(secret), Fingerprint: fp,
-			})
+			}
+			if onMatch != nil {
+				onMatch(&f, secret)
+			}
+			out = append(out, f)
 		}
 	}
 	sortFindings(out)
 	return out
 }
 
+func hasExcludedPrefix(s string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func lineSlice(content string, starts []int, line int) string {
+	idx := line - 1
+	if idx < 0 || idx >= len(starts) {
+		return ""
+	}
+	start := starts[idx]
+	end := len(content)
+	if idx+1 < len(starts) {
+		end = starts[idx+1] - 1
+	}
+	if end < start {
+		end = start
+	}
+	return content[start:end]
+}
+
 // RuleView is the catalog entry exposed at /v1/security/rules — the rule
 // identity without its internal regex.
 type RuleView struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Severity    string `json:"severity"`
-	Description string `json:"description"`
+	ID          string `json:"id"`          // the rule identifier a finding cites
+	Name        string `json:"name"`        // the rule's human name
+	Severity    string `json:"severity"`    // how serious a match is: critical, high, medium or low
+	Description string `json:"description"` // what kind of secret this rule recognises
 }
 
 // Rules returns the detection catalog (what the engine can find), most severe

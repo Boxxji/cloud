@@ -58,6 +58,7 @@ func serveFS(app *zip.App, fsys fs.FS) error {
 	app.Raw(zip.MethodAll, "/*", func(c *zip.Ctx) error {
 		p := c.Path()
 		if isAPIPath(p) {
+			c.SetHeader("Cache-Control", "no-store, max-age=0")
 			return c.JSON(http.StatusNotFound, map[string]any{
 				"error": map[string]string{
 					"code":    "not_found",
@@ -67,14 +68,34 @@ func serveFS(app *zip.App, fsys fs.FS) error {
 		}
 		// Clean folds any ".." away before the lookup; fs.ReadFile would refuse
 		// such a name anyway, so an escape attempt just lands on the shell.
-		if b, err := fs.ReadFile(fsys, strings.TrimPrefix(path.Clean(p), "/")); err == nil {
-			c.SetHeader("Content-Type", contentType(p))
+		clean := strings.TrimPrefix(path.Clean(p), "/")
+		if b, err := fs.ReadFile(fsys, clean); err == nil {
+			c.SetHeader("Content-Type", contentType(clean))
 			return c.Bytes(http.StatusOK, b)
+		}
+		// A missing asset under a bundler build-output subtree is a stale shell
+		// asking for a purged chunk and must 404 (uncached) rather than hand a
+		// <script> or <link> tag 200 text/html under strict MIME checking.
+		if isBuildAssetPath(clean) {
+			c.SetHeader("Cache-Control", "no-store, max-age=0")
+			c.SetHeader("Content-Type", "text/plain; charset=utf-8")
+			return c.Bytes(http.StatusNotFound, []byte("not found"))
 		}
 		c.SetHeader("Content-Type", "text/html; charset=utf-8")
 		return c.Bytes(http.StatusOK, index)
 	})
 	return nil
+}
+
+// isBuildAssetPath reports whether clean (a cleaned relative path without
+// leading slash) addresses a bundler build-output chunk subtree.
+func isBuildAssetPath(clean string) bool {
+	for _, seg := range []string{"assets/", "_next/static/", "_astro/", "_app/immutable/"} {
+		if strings.HasPrefix(clean, seg) || strings.Contains(clean, "/"+seg) {
+			return true
+		}
+	}
+	return false
 }
 
 // isAPIPath reports whether p addresses an API plane rather than the console.
@@ -87,10 +108,33 @@ func isAPIPath(p string) bool {
 	return false
 }
 
-// contentType answers from the extension. A browser drops a stylesheet or a
-// script served as the wrong type, so guessing is not optional here; an unknown
-// extension gets the neutral type, which browsers download rather than execute.
+// pinnedMIME pins standard web MIME types so minimal/distroless container images
+// (where /etc/mime.types may omit .mjs/.cjs/.map/.wasm or mis-type scripts) never
+// trigger strict MIME checking failures under X-Content-Type-Options: nosniff.
+func pinnedMIME(ext string) string {
+	switch strings.ToLower(ext) {
+	case ".js", ".mjs", ".cjs":
+		return "text/javascript; charset=utf-8"
+	case ".css":
+		return "text/css; charset=utf-8"
+	case ".wasm":
+		return "application/wasm"
+	case ".json", ".map":
+		return "application/json; charset=utf-8"
+	case ".svg":
+		return "image/svg+xml"
+	default:
+		return ""
+	}
+}
+
+// contentType answers from the extension, pinning standard web types before
+// consulting the host MIME table. An unknown extension gets the neutral type,
+// which browsers download rather than execute.
 func contentType(p string) string {
+	if t := pinnedMIME(path.Ext(p)); t != "" {
+		return t
+	}
 	if t := mime.TypeByExtension(path.Ext(p)); t != "" {
 		return t
 	}

@@ -17,12 +17,12 @@ type Info struct {
 	// IAMIssuer is the OIDC issuer (JWKS source) for this brand — the value the
 	// JWT `iss` claim must equal and whose /v1/iam/.well-known/jwks signs tokens.
 	IAMIssuer string
-	// AlsoIssuers are further issuers whose tokens are this brand's too, for the
-	// length of an issuer move: a verifier trusts every one of them, a minter mints
-	// only under the one it is configured with (IAMIssuer / IAM_ISSUER). Each is
-	// matched EXACTLY, and an organization's own issuer, which sits one path
-	// segment under a platform origin, is never one of them. Empty once the move is
-	// over.
+	// Discovery is the URL of this brand's OIDC discovery document. It is the one
+	// input that says who signs the brand's tokens: the issuer and the JWKS come from
+	// the document it names, never from a value kept here.
+	Discovery string
+	// AlsoIssuers are further issuers whose tokens are this brand's too while an issuer
+	// moves: verified exactly, never minted under, empty once the move is over.
 	AlsoIssuers []string
 	// Domain is the brand's primary marketing/site domain (for response scoping
 	// and base-URL derivation, e.g. api.<Domain>).
@@ -138,7 +138,7 @@ type Info struct {
 // every principal — SuperAdmin would 403 platform-wide (fail-secure, but
 // broken). lux/zoo/pars already correctly point at their own .id issuers.
 var brands = map[string]Info{
-	"hanzo": {ID: "hanzo", IAMIssuer: "https://hanzo.id", AlsoIssuers: []string{"https://hanzo.ai"}, Domain: "hanzo.ai", AltDomains: []string{"hanzo.cloud", "hanzo.app"}, Console: "platform.hanzo.ai",
+	"hanzo": {ID: "hanzo", IAMIssuer: "https://hanzo.id", Discovery: "https://hanzo.ai/.well-known/openid-configuration", AlsoIssuers: []string{"https://hanzo.ai"}, Domain: "hanzo.ai", AltDomains: []string{"hanzo.cloud", "hanzo.app"}, Console: "platform.hanzo.ai",
 		SignIn:    []string{"hanzo.ai"},
 		Published: []string{"hanzo.app"},
 		Sites: []string{"hanzo.id", "hanzo.bot", "hanzo.chat", "hanzo.team", "hanzo.build", "hanzo.market",
@@ -177,21 +177,21 @@ var brands = map[string]Info{
 		Agent:  "https://hanzoskills.com/hanzo.md", Wallet: true, Guide: "https://hanzo.ai/agents",
 		Docs: "https://docs.hanzo.ai", Reference: "https://docs.hanzo.ai/docs/openapi", Status: "https://status.hanzo.ai",
 		Login: "hanzo auth login", Pay: "https://hanzo.ai/pay"},
-	"lux": {ID: "lux", IAMIssuer: "https://lux.id", Domain: "lux.network", AltDomains: []string{"lux.cloud"}, Console: "console.lux.cloud",
+	"lux": {ID: "lux", IAMIssuer: "https://lux.id", Discovery: "https://lux.id/.well-known/openid-configuration", Domain: "lux.network", AltDomains: []string{"lux.cloud"}, Console: "console.lux.cloud",
 		// osage.id is the Osage L1's identity host, run by the Lux estate.
 		Sites: []string{"lux.id", "lux.exchange", "lux.market", "lux.chat", "lux.vote", "lux.fund", "lux.credit",
 			"lux.tel", "lux.financial", "luxbitco.in", "lux-test.network", "osage.id"},
 		Framers: []string{"https://console.lux.cloud"},
 		Returns: []string{"https://console.lux.cloud/connectors"},
 		Agent:   "https://lux.network/llms.txt"},
-	"zoo": {ID: "zoo", IAMIssuer: "https://zoolabs.id", Domain: "zoo.ngo", AltDomains: []string{"zoo.network", "zoo.cloud"}, Console: "console.zoo.cloud",
+	"zoo": {ID: "zoo", IAMIssuer: "https://zoolabs.id", Discovery: "https://zoolabs.id/.well-known/openid-configuration", Domain: "zoo.ngo", AltDomains: []string{"zoo.network", "zoo.cloud"}, Console: "console.zoo.cloud",
 		Sites:   []string{"zoolabs.id", "zoolabs.io", "zoo.fund", "zoo.exchange", "zoo-test.network"},
 		Framers: []string{"https://console.zoo.cloud"},
 		Returns: []string{"https://console.zoo.cloud/connectors"},
 		Agent:   "https://zoo.ngo/llms.txt"},
-	"pars": {ID: "pars", IAMIssuer: "https://pars.id", Domain: "pars.network", AltDomains: []string{"pars.ai"},
+	"pars": {ID: "pars", IAMIssuer: "https://pars.id", Discovery: "https://pars.id/.well-known/openid-configuration", Domain: "pars.network", AltDomains: []string{"pars.ai"},
 		Sites: []string{"pars.id", "pars.vote"}},
-	"bootnode": {ID: "bootnode", IAMIssuer: "https://id.bootno.de", Domain: "bootno.de"},
+	"bootnode": {ID: "bootnode", IAMIssuer: "https://id.bootno.de", Discovery: "https://id.bootno.de/.well-known/openid-configuration", Domain: "bootno.de"},
 }
 
 // Default is the fallback brand when CLOUD_BRAND is unknown.
@@ -244,8 +244,7 @@ func ForIssuer(iss string) (string, bool) {
 	return "", false
 }
 
-// issuers is every issuer whose tokens are this brand's: its own and the ones an
-// issuer move adds beside it.
+// issuers is every issuer whose tokens are this brand's.
 func (b Info) issuers() []string {
 	if b.IAMIssuer == "" {
 		return nil
@@ -253,9 +252,8 @@ func (b Info) issuers() []string {
 	return append([]string{b.IAMIssuer}, b.AlsoIssuers...)
 }
 
-// Siblings are the other issuers of the brand that issuer belongs to, for a
-// verifier that holds one provider per issuer (the object store's STS). Empty for
-// an issuer no brand claims.
+// Siblings are the other issuers of the brand issuer belongs to, for a verifier that holds
+// one provider per issuer (the object store's STS).
 func Siblings(issuer string) []string {
 	issuer = strings.TrimSuffix(strings.TrimSpace(issuer), "/")
 	for _, b := range brands {
@@ -263,15 +261,14 @@ func Siblings(issuer string) []string {
 		if !slices.ContainsFunc(all, func(i string) bool { return strings.TrimSuffix(i, "/") == issuer }) {
 			continue
 		}
-		var out []string
-		for _, i := range all {
-			if strings.TrimSuffix(i, "/") != issuer {
-				out = append(out, i)
-			}
-		}
-		return out
+		return slices.DeleteFunc(slices.Clone(all), func(i string) bool { return strings.TrimSuffix(i, "/") == issuer })
 	}
 	return nil
+}
+
+// Trusts reports whether iss is issuer or one of its brand's other issuers.
+func Trusts(issuer, iss string) bool {
+	return iss == issuer || slices.Contains(Siblings(issuer), iss)
 }
 
 // Issuer is the ONE resolution of "which IAM signs my token": a pinned value if
@@ -379,7 +376,7 @@ func Agent(host string) (Info, bool) {
 // on them is answered as the brand's API. It decides only where the agent
 // discovery documents answer — OAuth metadata and the MCP card (openapi/agent.go,
 // apps/sites agentDocs) — so a scanner reading any of a brand's hosts learns how
-// to reach its API. Everything else keeps Agent.
+// to reach its API (#420, #421). Everything else keeps Agent.
 func Claimed(host string) (Info, bool) {
 	if b, ok := Agent(host); ok {
 		return b, true
@@ -565,8 +562,15 @@ func Sibling(host, label string) string {
 // It is here, beside the apex it derives from, because two packages need the
 // SAME answer and neither can hold it for the other: package cloud resolves
 // Config.Domain from it, and apps/sites (a leaf that must never import the root
-// package) resolves the self-domain floor from it.
+// package) resolves the self-domain floor from it. Each used to spell the
+// literal "api.hanzo.ai" for itself, so the deployment's own host was stated
+// twice, brand-blind in both places, and nothing made the two agree.
 func APIHost(id string) string { return "api." + For(id).Domain }
+
+// ZapHost is where brand `id` serves ZAP to browsers: zap.<that brand's apex>. It
+// is a name of its own because a WebTransport session cannot cross the proxy the
+// API host sits behind.
+func ZapHost(id string) string { return "zap." + For(id).Domain }
 
 // GitHost is the code-hosting host of brand `id`: git.<that brand's apex> —
 // git.hanzo.ai, git.lux.network, git.zoo.ngo. Same derivation as APIHost and
@@ -643,3 +647,25 @@ func Origin(host string) string {
 	}
 	return "https://" + host
 }
+
+// Discoveries are the discovery URLs of every brand this binary fronts, in brand
+// order, one per brand that states one.
+func Discoveries() []string {
+	var out []string
+	for _, id := range slices.Sorted(maps.Keys(brands)) {
+		b := brands[id]
+		if b.Discovery != "" {
+			out = append(out, b.Discovery)
+		}
+		// Every issuer the brand's tokens may carry is trusted by its own document.
+		for _, iss := range b.issuers() {
+			if d := strings.TrimSuffix(iss, "/") + "/.well-known/openid-configuration"; iss != "" && !slices.Contains(out, d) {
+				out = append(out, d)
+			}
+		}
+	}
+	return out
+}
+
+// DiscoveryFor is the discovery URL of a brand id, and empty when it states none.
+func DiscoveryFor(id string) string { return For(id).Discovery }

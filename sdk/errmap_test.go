@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hanzoai/cloud/sdk/fault"
 	"github.com/hanzoai/cloud/sdk/meter"
 	"github.com/hanzoai/cloud/sdk/supply"
 	"github.com/zap-proto/zip"
@@ -43,6 +44,8 @@ func getThing(t *testing.T, err error) (int, string) {
 	return resp.StatusCode, string(body)
 }
 
+// TestPropagatedRefusalsKeepTheirStatusAndCode is the whole defect: each of these
+// errors already NAMES a status, and every one of them used to render 500.
 func TestPropagatedRefusalsKeepTheirStatusAndCode(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -85,7 +88,10 @@ func TestPropagatedRefusalsKeepTheirStatusAndCode(t *testing.T) {
 	}
 }
 
-// It is why Serve installs ErrorHandler, and it fails the moment anyone stops.
+// TestWithoutTheClientAnUnfundedRequestIs500 is the bug, kept executable: zip's
+// DEFAULT handler reads only a *zip.HTTPError, so the sentinel that means 402
+// renders as an internal fault with no code on it — the dead card. It is why
+// Serve installs ErrorHandler, and it fails the moment anyone stops.
 func TestWithoutTheClientAnUnfundedRequestIs500(t *testing.T) {
 	app := zip.New(zip.Config{}) // no ErrorHandler: zip's own
 	app.Raw(http.MethodGet, "/v1/thing", func(c *zip.Ctx) error { return meter.ErrInsufficientBalance })
@@ -198,8 +204,8 @@ func TestDenialKeepsAnUpstreamStatus(t *testing.T) {
 
 // TestUnauthorizedNamesTheScheme: a 401 carries WWW-Authenticate (RFC 9110
 // §11.6.1), so a client can tell which credential would have been accepted, and
-// names the resource metadata on the host it called (RFC 9728 §5.1,). A handler
-// that issued its own challenge keeps it.
+// names the resource metadata on the host it called (RFC 9728 §5.1,
+// #420). A handler that issued its own challenge keeps it.
 func TestUnauthorizedNamesTheScheme(t *testing.T) {
 	resp, err := newErrApp(zip.ErrUnauthorized("no key")).Test(httptest.NewRequest(http.MethodGet, "/v1/thing", nil), zip.TestConfig{Timeout: 30 * time.Second, FailOnTimeout: true})
 	if err != nil {
@@ -366,5 +372,51 @@ func TestTheChallengeReadsTheRequestsOwnHost(t *testing.T) {
 		if strings.Contains(string(b), "red-probe") {
 			t.Errorf("401 on %s names the forwarded host in its body: %s", host, b)
 		}
+	}
+}
+
+// EVERY NON-2XX HAS A KEY AND A REASON. Whatever the error — a refusal a handler
+// chose, a 4xx, a fault nobody chose, an error with no sentence — the body carries
+// `fingerprint` and a non-empty `detail`, and the key is the one the fault states.
+//
+// MUTATION: drop the Detail write in ErrorHandler and every case here loses its key.
+func TestEveryErrorBodyCarriesItsFingerprintAndReason(t *testing.T) {
+	for name, err := range map[string]error{
+		"a refusal":       zip.ErrForbidden("no"),
+		"a bare 404":      &zip.HTTPError{Status: http.StatusNotFound},
+		"an undecided":    errors.New("boom"),
+		"a typed 500":     zip.ErrInternal("store unavailable"),
+		"an outage":       &zip.HTTPError{Status: http.StatusBadGateway, Msg: "peer away"},
+		"no words at all": &zip.HTTPError{Status: http.StatusConflict},
+	} {
+		t.Run(name, func(t *testing.T) {
+			status, body := getThing(t, err)
+			var got struct {
+				Detail      string `json:"detail"`
+				Fingerprint string `json:"fingerprint"`
+			}
+			if jerr := json.Unmarshal([]byte(body), &got); jerr != nil {
+				t.Fatalf("%d %s: %v", status, body, jerr)
+			}
+			if len(got.Fingerprint) != 16 || strings.TrimSpace(got.Detail) == "" {
+				t.Fatalf("%d: no key or no reason: %s", status, body)
+			}
+			want := fault.Request(http.MethodGet, "/v1/thing", status, "", err).Fingerprint()
+			if he, ok := errors.AsType[*zip.HTTPError](err); ok {
+				want = fault.Request(http.MethodGet, "/v1/thing", status, he.Code, err).Fingerprint()
+			}
+			if got.Fingerprint != want {
+				t.Fatalf("the body's key %s is not the fault's %s", got.Fingerprint, want)
+			}
+		})
+	}
+}
+
+// The sentinel a handler holds is never written to by rendering it.
+func TestRenderingAnErrorLeavesItsSentinelAlone(t *testing.T) {
+	sentinel := zip.ErrForbidden("no")
+	getThing(t, sentinel)
+	if len(sentinel.Detail) != 0 {
+		t.Fatalf("rendering wrote %v into the sentinel's members", sentinel.Detail)
 	}
 }

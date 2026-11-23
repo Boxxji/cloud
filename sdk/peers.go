@@ -33,7 +33,11 @@ type Peers struct {
 	// another org does (other).
 	ProjectOwnership func(ctx context.Context, org, idOrSlug string) (mine, other bool, err error)
 	// TierOf asks commerce which tier subject is on, "" for none. ctx already states the org.
+	// A tier is a class of plans (free, starter, pro, enterprise); the plan is PlanOf's.
 	TierOf func(ctx context.Context, subject string) (string, error)
+	// PlanOf asks commerce which catalog plan subject is served as ("unlimited", "pro-3x",
+	// "go", ...), "" for none. ctx already states the org.
+	PlanOf func(ctx context.Context, subject string) (string, error)
 	// OwnerOf asks IAM whether person ("<home org>/<name>") holds an owner membership in
 	// org.
 	OwnerOf func(ctx context.Context, person, org string) (bool, error)

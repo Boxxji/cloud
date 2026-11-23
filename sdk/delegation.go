@@ -23,6 +23,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,6 +47,20 @@ type Delegation struct {
 	Until time.Time
 	// Run names the work in IAM's audit row. It is never signed into the token.
 	Run string
+	// Scopes lists optional bounded sub-scopes alongside ai:inference (e.g. "research",
+	// "workflow:gpu") for autonomous science runs. Empty requests ai:inference only.
+	Scopes []string
+}
+
+func delegationScope(extra []string) string {
+	out := []string{inferenceScope}
+	for _, s := range extra {
+		s = strings.TrimSpace(s)
+		if (s == researchScope || s == workflowGPUScope) && !slices.Contains(out, s) {
+			out = append(out, s)
+		}
+	}
+	return strings.Join(out, " ")
 }
 
 // Delegated is a delegated token and how long IAM granted it for, from when it was asked.
@@ -99,7 +114,7 @@ func Delegate(ctx context.Context, actor oauth2.TokenSource, d Delegation) (Dele
 		"actor_token_type":  {"urn:ietf:params:oauth:token-type:access_token"},
 		"requested_subject": {d.Subject},
 		"org":               {d.Org},
-		"scope":             {inferenceScope},
+		"scope":             {delegationScope(d.Scopes)},
 		"resource":          {delegatedAudience()},
 		"lifetime":          {strconv.Itoa(life)},
 		"run":               {d.Run},
@@ -347,7 +362,15 @@ func (l *liveness) check(ctx context.Context, token string, exp *jwt.NumericDate
 			return errLivenessUnsure
 		}
 		e = liveAt{alive: out.Active, at: time.Now()}
-		l.remember(k, e)
+		// Cache positive liveness for livenessTTL to avoid per-request IAM calls,
+		// but never negative-cache inactive answers: a revoked token still fails
+		// closed on every request, while a transient IAM DB blip or read-after-write
+		// lag right after minting will not poison the cache for 30s.
+		if e.alive {
+			l.remember(k, e)
+		} else {
+			l.forget(k)
+		}
 	}
 	if !e.alive {
 		// IAM answers an expired token inactive too, and with no clock leeway; the
@@ -381,4 +404,12 @@ func (l *liveness) remember(k [32]byte, e liveAt) {
 		}
 	}
 	l.seen[k] = e
+}
+
+// forget drops any cached liveness entry for k so a newly-revoked token is never
+// served from a prior positive entry.
+func (l *liveness) forget(k [32]byte) {
+	l.mu.Lock()
+	delete(l.seen, k)
+	l.mu.Unlock()
 }

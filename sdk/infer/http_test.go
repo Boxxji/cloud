@@ -170,6 +170,28 @@ func TestAIHTTP_ConsecutiveUserTurnsMerged(t *testing.T) {
 	}
 }
 
+// Regression test for #937: a leading system prompt must remain
+// role="system" and never be merged into consecutive user turns from a Slack thread.
+func TestAIHTTP_SystemPromptNotMergedWithUserTurns(t *testing.T) {
+	req := &ChatRequest{
+		Messages: []ChatMessage{
+			{Role: RoleSystem, Content: "You are Hanzo, an AI assistant made by Hanzo AI."},
+			{Role: RoleUser, Content: "Denis: docs page broken"},
+			{Role: RoleUser, Content: "@Hanzo fix it"},
+		},
+	}
+	msgs := openaiMessages(req)
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 messages (system + merged user), got %d: %+v", len(msgs), msgs)
+	}
+	if msgs[0].Role != RoleSystem || msgs[0].Content != "You are Hanzo, an AI assistant made by Hanzo AI." {
+		t.Fatalf("system message must stay separate, got %+v", msgs[0])
+	}
+	if msgs[1].Role != RoleUser || msgs[1].Content != "Denis: docs page broken\n\n@Hanzo fix it" {
+		t.Fatalf("consecutive user turns must merge without absorbing system prompt, got %+v", msgs[1])
+	}
+}
+
 // TestAIHTTP_ServerErrorMapped asserts a 5xx upstream also maps to an error.
 func TestAIHTTP_ServerErrorMapped(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -709,6 +731,8 @@ func TestAIHTTP_ReasoningDoesNotEatTheVisibleBudget(t *testing.T) {
 		answer.WriteString("</|channel>\n")
 		answer.WriteString("The visible answer completes its sentence here.")
 		content := answer.String()
+		// The upstream truncates at its received cap, exactly as the bug
+		// reproduces: reasoning eats the budget and the visible answer is cut.
 		if len(content) > sawMax {
 			content = content[:sawMax]
 		}

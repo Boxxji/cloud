@@ -25,6 +25,8 @@ package cloud
 // matching the gateway's admin-guard. An org admin gets NO admin authority.
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"net/url"
 	"strings"
 	"unicode"
@@ -465,4 +467,33 @@ func CallerBearer(c *zip.Ctx) string {
 		return ""
 	}
 	return tok
+}
+
+// CallerIssuer is the `iss` claim of the caller's validated JWT bearer
+// (CallerBearer): which of the trusted identity providers minted the token
+// this request was admitted on. Empty when the request carries no JWT bearer.
+func CallerIssuer(c *zip.Ctx) string {
+	tok := CallerBearer(c)
+	if tok == "" {
+		return ""
+	}
+	return claimedIssuer(tok)
+}
+
+func claimedIssuer(raw string) string {
+	parts := strings.Split(raw, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	b, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var p struct {
+		Iss string `json:"iss"`
+	}
+	if json.Unmarshal(b, &p) != nil {
+		return ""
+	}
+	return strings.TrimSpace(p.Iss)
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"slices"
 	"strconv"
@@ -66,8 +67,9 @@ type Config struct {
 	// Domain is the deployment's primary public domain.
 	Domain string
 
-	// IAMIssuer is the JWKS issuer for JWT validation, and it MUST equal the
-	// `iss` IAM actually stamps: hanzo.id for hanzo, and each brand's own .id
+	// IAMIssuer is the public identity host of this deployment, which the IAM base URL
+	// and sign-in links derive from. It does NOT decide whose tokens are trusted: that
+	// is Discovery. It should equal the `iss` IAM actually stamps: hanzo.id for hanzo, and each brand's own .id
 	// otherwise (sdk/brand/brand.go is the registry and the reasoning).
 	//
 	// Not iam.hanzo.ai. That host answers discovery and reports
@@ -77,10 +79,18 @@ type Config struct {
 	// the path to prefer.
 	IAMIssuer string
 
-	// JWKSURL is the JSON Web Key Set endpoint the identity sanitizer fetches IAM
-	// signing keys from. Defaults to {IAMIssuer}/v1/iam/.well-known/jwks
-	// (HIP-0111); override with CLOUD_JWKS_URL.
-	JWKSURL string
+	// Discovery is the OIDC discovery URL of the provider that signs this
+	// deployment's tokens, https://<host>/.well-known/openid-configuration. It is
+	// the ONE input for who is trusted: the issuer a token must name and the JWKS it
+	// is checked against both come from the document it names (discovery.go).
+	// Defaults to the brand's own (brand.Info.Discovery); override with
+	// CLOUD_OIDC_DISCOVERY for a deployment whose provider is not a registered brand.
+	Discovery string
+
+	// DiscoveryClient is the HTTP client discovery documents are fetched with, for
+	// a deployment that reaches its provider through an egress proxy. Nil is a
+	// default client with a 10 s timeout.
+	DiscoveryClient *http.Client
 
 	// KMSMasterKeyRef is the base64-encoded 32-byte KMS master key (KEK) the
 	// embedded luxfi/kms store seals every secret's DEK under, and the ONE
@@ -108,7 +118,7 @@ type Config struct {
 	Role role.Role
 
 	// WriterURL is the base URL of the single writer (CLOUD_WRITER_URL, e.g.
-	// http://cloud-writer.internal:8000). A Reader forwards EVERY request here —
+	// http://cloud-writer.hanzo.svc:8000). A Reader forwards EVERY request here —
 	// it opens no stores and is a transparent, always-ready edge that absorbs the
 	// writer's rollout gap (see reader_proxy.go). Required when Role==Reader;
 	// ignored by a Writer.
@@ -328,7 +338,7 @@ func LoadConfig() *Config {
 		// A cluster has a NetworkPolicy and a mesh in front and now SAYS so —
 		// universe sets CLOUD_ZAP_LISTEN=:9653 on the cloud deployments, which is
 		// why this default can move without cutting the transport superbase dials
-		// (zap://cloud.internal:9653, a real Service port). A
+		// (zap://cloud.hanzo.svc.cluster.local:9653, a real Service port). A
 		// developer has neither guard and sets nothing, so the unattended case is
 		// the one the default has to be safe for.
 		//
@@ -348,10 +358,14 @@ func LoadConfig() *Config {
 		Replicas:   getenvInt("CLOUD_REPLICAS", 0),
 		OpenStores: env.Or("CLOUD_OPEN_STORES", ""),
 		IAMStore:   env.Or(IAMStoreEnv, ""),
-		Domain:     env.Or("CLOUD_DOMAIN", ""),
+		// Domain left empty here; derived from Brand below unless pinned — the
+		// literal "api.hanzo.ai" default used to live here, which meant a lux
+		// deployment that pinned nothing answered with Hanzo's host in every URL
+		// it built about itself.
+		Domain: env.Or("CLOUD_DOMAIN", ""),
 		// IAMIssuer left empty here; resolved from Brand below unless pinned.
 		IAMIssuer:         env.Or("CLOUD_IAM_ISSUER", ""),
-		JWKSURL:           env.Or("CLOUD_JWKS_URL", ""),
+		Discovery:         env.Or("CLOUD_OIDC_DISCOVERY", ""),
 		KMSMasterKeyRef:   rootKeyRef(),
 		KMSMPCAddr:        env.Or("CLOUD_KMS_MPC_ADDR", ""),
 		KMSMPCVaultID:     env.Or("CLOUD_KMS_MPC_VAULT_ID", ""),
@@ -376,8 +390,12 @@ func LoadConfig() *Config {
 	// THE BINARY KNOWS WHICH APP IT IS; a deployment does not restate it.
 	//
 	// cfg.Enable is set by Listen from the app the plugin was built as — one
-	// process per app, and plugin/<app>/main.go names it. Neither is representable
-	// now. Empty still means all, which is what production has always run.
+	// process per app, and plugin/<app>/main.go names it. CLOUD_ENABLE/--enable
+	// used to state the same set a SECOND time, from the values file, and the
+	// only thing a second source of truth can add is disagreement: the list named
+	// an app that does not exist and omitted one every child needs. Neither is
+	// representable now. Empty still means all, which is what production has
+	// always run.
 	flagsOnce.Do(func() {
 		flag.StringVar(&cfg.Brand, "brand", cfg.Brand, "white-label brand")
 		flag.StringVar(&cfg.Domain, "domain", cfg.Domain, "primary domain")
@@ -398,7 +416,10 @@ func LoadConfig() *Config {
 	// etc. — never silently defaulting every brand to iam.hanzo.ai.
 	//
 	// issuerFor is THE resolution, shared with the package-level IAMIssuer()
-	// (iamurl.go). The two cannot differ now because there is one function.
+	// (iamurl.go). That function used to read CLOUD_IAM_ISSUER raw and stop, so on
+	// any deployment that let the brand supply the issuer — the documented happy
+	// path — this field held "https://lux.id" while IAMIssuer() held "". The two
+	// cannot differ now because there is one function.
 	cfg.IAMIssuer = iam.IssuerFor(cfg.IAMIssuer, cfg.Brand)
 
 	// The deployment's own public API host, by the same rule and for the same
@@ -408,13 +429,10 @@ func LoadConfig() *Config {
 	// or zoo deployment presented api.hanzo.ai as its own host.
 	cfg.Domain = domainFor(cfg.Domain, cfg.Brand)
 
-	// JWKS endpoint for the in-binary identity sanitizer. Default follows the
-	// HIP-0111 convention {IAMIssuer}/v1/iam/.well-known/jwks so a brand
-	// deployment validates against its own IAM; override with CLOUD_JWKS_URL.
-	// JWKSURLFor is the ONE derivation, shared with NewTokenValidator so a
-	// subsystem that verifies a token resolves the same keys this boundary does.
-	if cfg.JWKSURL == "" {
-		cfg.JWKSURL = JWKSURLFor(cfg.IAMIssuer)
+	// The provider that signs this deployment's tokens, by its discovery document:
+	// the brand's own unless the operator names another.
+	if cfg.Discovery == "" {
+		cfg.Discovery = brand.DiscoveryFor(cfg.Brand)
 	}
 
 	// Browser ZAP-over-WS Origin allowlist. Default to the console SPA hosts so

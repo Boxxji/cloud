@@ -107,8 +107,11 @@ type Deps struct {
 	// IAMIssuer is the canonical OIDC issuer (JWKS source) for this brand,
 	// resolved from Brand via the white-label registry unless pinned by the
 	// operator. Subsystems validate JWT `iss` + signatures against
-	// {IAMIssuer}/v1/iam/.well-known/jwks (HIP-0111). One issuer per deployment.
+	// the provider's discovery document (Discovery).
 	IAMIssuer string
+	// Discovery is the OIDC discovery URL of the provider whose tokens this deployment
+	// trusts (Config.Discovery).
+	Discovery string
 
 	// MasterKey is the 32-byte at-rest KEK (decoded CLOUD_KMS_MASTER_KEY_REF), for
 	// subsystems that encrypt their own stores and would otherwise each need a key
@@ -151,7 +154,8 @@ type Deps struct {
 	// and the eight subsystems that read them did the identical thing — copy the
 	// string onto their own state, never branching on it — which is a constant
 	// wearing a struct field's clothes. They are aimodel.DefaultModel and
-	// aimodel.FallbackModel in model.go now, one literal each.
+	// aimodel.FallbackModel in model.go now, one literal each. See model.go for the
+	// two incidents the env knob caused.
 
 	// Subsystem clients — populated by BuildDeps based on enabled subsystems.
 	// Each is an interface with both in-process and ZAP-RPC implementations.

@@ -34,7 +34,7 @@ import (
 // Unlike the loopback socket (ungated, ai-ingest only), every request here must
 // carry a valid IAM auth_token — the same trust anchor as HTTP SanitizeIdentity —
 // org-scoped to the token owner. 9999 mirrors the port the retired tasksd exposed, so
-// a consumer repoint changes only the host (the old service host → this one).
+// a consumer repoint changes only the host (tasks.hanzo.svc → cloud.hanzo.svc).
 const durableGatedZAPPort = 9999
 
 // gatedAddr is the cluster-reachable tasks listener. It defaults to the port
@@ -141,7 +141,7 @@ func InstallDurableIngest(ctx context.Context, deps Deps, app string) {
 	// Expose the SAME engine on a cluster-reachable, IDENTITY-GATED ZAP listener so the
 	// standalone tasksd's consumers (auto, hanzo-playground, platform) run their durable
 	// work here. RequireIdentity: every request must carry an IAM auth_token, validated
-	// against {IAMIssuer}/v1/iam/.well-known/jwks (HIP-0111) and org-scoped to its owner —
+	// against the issuer and JWKS the provider's discovery document names and org-scoped to its owner —
 	// the SAME trust anchor as the HTTP SanitizeIdentity boundary. The loopback dialer above
 	// stays ungated (in-process ai-ingest shares cloud's trust boundary). Fail-soft: a
 	// missing issuer or a bind failure logs and leaves the gated surface down without
@@ -153,19 +153,29 @@ func InstallDurableIngest(ctx context.Context, deps Deps, app string) {
 	if app != "tasks" && app != "cloud" {
 		return
 	}
-	if deps.IAMIssuer == "" {
-		luxlog.Default().Warn("durable tasks: no IAM issuer; gated cluster ZAP listener NOT exposed", "addr", gatedAddr())
+	if deps.Discovery == "" {
+		luxlog.Default().Warn("durable tasks: no OIDC discovery URL; gated cluster ZAP listener NOT exposed", "addr", gatedAddr())
+		return
+	}
+	disc, err := DiscoveryFor(deps.Discovery, nil)
+	if err != nil {
+		luxlog.Default().Error("durable tasks: bad OIDC discovery URL; gated cluster ZAP listener NOT exposed", "err", err)
+		return
+	}
+	doc, err := disc.Document()
+	if err != nil {
+		luxlog.Default().Error("durable tasks: no discovery document; gated cluster ZAP listener NOT exposed", "err", err, "addr", gatedAddr())
 		return
 	}
 	validator := tasksauth.NewValidator(tasksauth.JWTConfig{
-		Issuer:  deps.IAMIssuer,
-		JWKSURL: JWKSURLFor(deps.IAMIssuer),
+		Issuer:  doc.Issuer,
+		JWKSURL: doc.JWKSURI,
 	})
 	if err := emb.ServeGated(ctx, gatedAddr(), validator); err != nil {
 		luxlog.Default().Error("durable tasks: gated cluster ZAP listener failed to start", "err", err, "addr", gatedAddr())
 		return
 	}
-	luxlog.Default().Info("durable tasks: gated cluster ZAP listener up", "addr", gatedAddr(), "issuer", deps.IAMIssuer)
+	luxlog.Default().Info("durable tasks: gated cluster ZAP listener up", "addr", gatedAddr(), "issuer", doc.Issuer)
 }
 
 // durableConfig is how every embedded engine is configured: the one place.

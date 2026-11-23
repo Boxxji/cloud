@@ -17,12 +17,12 @@ require (
 	github.com/hanzoai/go-openai v1.41.0
 	github.com/hanzoai/goa v1.0.0
 	github.com/hanzoai/ha v0.2.0
-	github.com/hanzoai/iam v1.34.192
+	github.com/hanzoai/iam v1.34.198
 	github.com/hanzoai/money v0.2.5
 	github.com/hanzoai/namespace v1.2.0
 	github.com/hanzoai/orm v0.6.45
 	github.com/hanzoai/sqlite v0.5.10
-	github.com/hanzoai/tasks v1.53.11
+	github.com/hanzoai/tasks v1.53.12
 	github.com/hanzoai/vfs v0.6.6
 	github.com/hanzokv/go/v9 v9.22.0
 	github.com/hanzos3/go v1.0.3

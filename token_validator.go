@@ -34,6 +34,8 @@ type VerifiedIdentity struct {
 	Username string
 	// Email is the validated `email` claim, when present.
 	Email string
+	// Issuer is the validated `iss` claim: which identity provider minted the token.
+	Issuer string
 	// IsAdmin is IAM's `isAdmin` bit: admin OF ONE'S OWN ORG. It is NOT the
 	// SuperAdmin predicate — that is Owner == the reserved admin org, and
 	// conflating the two is a privilege escalation. Reported so a caller can tell
@@ -84,6 +86,7 @@ func (t *TokenValidator) Validate(raw string) (VerifiedIdentity, error) {
 		User:     claims.userID(),
 		Username: claims.username(),
 		Email:    claims.Email,
+		Issuer:   strings.TrimSpace(claims.Issuer),
 		IsAdmin:  claims.IsAdmin,
 		Orgs:     claims.Orgs,
 	}

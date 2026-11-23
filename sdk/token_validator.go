@@ -16,13 +16,14 @@ package cloud
 
 import (
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
+	"github.com/hanzoai/cloud/sdk/env"
 	"github.com/hanzoai/cloud/sdk/principal"
 
 	"github.com/hanzoai/authz"
-	"github.com/hanzoai/cloud/sdk/env"
 	model "github.com/hanzoai/iam/pkg/model"
 )
 
@@ -59,6 +60,17 @@ type VerifiedIdentity struct {
 	// whatever org they act in (Home). Empty when the token names no home or no
 	// username.
 	Account string
+	// BillingAccount is the validated `billing_account` claim exactly as the
+	// identity boundary stamps it into X-Billing-Account-Id: the account IAM says
+	// pays for this person's work. A caller with no request to carry that header
+	// (a WebTransport session) states it on the plane caller, so the wallet a lease
+	// or a model call is charged to is the one the same token names over HTTP.
+	// Empty when the token names none.
+	BillingAccount string
+	// Issuer is the validated `iss` claim: which identity provider minted the token
+	// (one of the brand's issuers, hanzo.id or hanzo.ai for hanzo). A downstream that
+	// checks the same token itself against one issuer is told this one.
+	Issuer string
 	// Email is the validated `email` claim, when present.
 	Email string
 	// IsAdmin is IAM's `isAdmin` bit: admin OF ONE'S OWN ORG. It is NOT the
@@ -97,13 +109,15 @@ type VerifiedIdentity struct {
 // Safe for concurrent use; the underlying JWKS cache is shared and stale-on-error.
 type TokenValidator struct{ v *Boundary }
 
-// NewTokenValidator builds a validator bound to issuer, with the SAME JWKS endpoint
-// SanitizeIdentity uses — JWKSURLFor is the single source for both, so a token this
-// accepts is a token the boundary accepts, and the two can never drift apart into a
-// mint-then-refuse loop.
-func NewTokenValidator(issuer string) *TokenValidator {
-	issuer = strings.TrimRight(strings.TrimSpace(issuer), "/")
-	return &TokenValidator{v: newIdentityValidator(issuer, JWKSURLFor(issuer), 0)}
+// NewTokenValidator builds a validator bound to the provider at discovery (empty is
+// this process's own, DiscoveryURL), by the SAME discovery documents SanitizeIdentity
+// uses, so a token this accepts is a token the boundary accepts and the two can never
+// drift apart into a mint-then-refuse loop. A nil client is the default one.
+func NewTokenValidator(discovery string, client *http.Client) *TokenValidator {
+	if discovery == "" {
+		discovery = DiscoveryURL()
+	}
+	return &TokenValidator{v: BoundaryOf(&Config{Discovery: discovery, DiscoveryClient: client, Brand: env.Or("CLOUD_BRAND", "")})}
 }
 
 // Validate verifies raw and returns what it proved. The error is the real reason
@@ -134,6 +148,10 @@ func (t *TokenValidator) Validate(raw string) (VerifiedIdentity, error) {
 		Email:     claims.Email,
 		IsAdmin:   claims.IsAdmin,
 		TokenType: strings.TrimSpace(claims.TokenType),
+		// The same rendering the boundary writes the header from, so the two paths
+		// cannot name different payers for one token.
+		BillingAccount: claims.renderBillingAccount(),
+		Issuer:         strings.TrimSpace(claims.Issuer),
 		// The published shape stays []model.OrgRef: clients/team copies it verbatim into
 		// a session, so this is cloud's outward contract, not a second reading of the
 		// claim. ONE conversion, at the surface that publishes it.
@@ -181,25 +199,6 @@ func (v VerifiedIdentity) Home() string {
 		return ""
 	}
 	return strings.TrimSpace(v.Orgs[0].Org)
-}
-
-// JWKSURLFor resolves the JWKS endpoint for an issuer: the CLOUD_JWKS_URL
-// override when set, else the HIP-0111 convention
-// {issuer}/v1/iam/.well-known/jwks. ONE derivation — the whole binary reads it,
-// so a deployment that pins a custom JWKS pins it everywhere.
-//
-// It claimed to be that already while being unexported, so the two subsystems
-// that could not reach it rebuilt the URL inline instead — durable.go's gated
-// ZAP listener and apps/base's per-app pool. Both concatenated the suffix
-// themselves and therefore ignored CLOUD_JWKS_URL outright: an operator who
-// pinned a JWKS pinned it for the edge validator and NOT for the two planes
-// that verify the same tokens, which is a fleet validating one set of signing
-// keys at the edge and a different set behind it.
-func JWKSURLFor(issuer string) string {
-	if override := env.Or("CLOUD_JWKS_URL", ""); override != "" {
-		return override
-	}
-	return strings.TrimRight(issuer, "/") + "/v1/iam/.well-known/jwks"
 }
 
 // orgRefs renders a signed membership set in the shape VerifiedIdentity publishes.

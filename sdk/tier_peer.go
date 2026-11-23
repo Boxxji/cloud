@@ -29,23 +29,48 @@ const tierCallTimeout = 5 * time.Second
 // deployment that runs no commerce. Every other failure is returned, and each
 // reader decides which way it fails.
 func Tier(ctx context.Context, subject, org string) (string, error) {
+	return asked(ctx, "tier", subject, org, askTier)
+}
+
+// Plan is the catalog plan commerce serves subject as inside org ("unlimited",
+// "pro-3x", ...), asked and kept as Tier is. "" with a nil error means none.
+func Plan(ctx context.Context, subject, org string) (string, error) {
+	return asked(ctx, "plan", subject, org, askPlan)
+}
+
+// tierOrg extracts the commerce organization namespace from org. Callers such as
+// hanzoai/ai's RateLimiter pass a composite payer subject ("hanzo/<user>") as
+// both subject and org for users in the signup org; commerce routes by org
+// slug, so forwarding the composite string makes every lookup miss and fall
+// back to the free tier.
+func tierOrg(org string) string {
+	org = strings.TrimSpace(org)
+	if base, _, ok := strings.Cut(org, "/"); ok && base != "" {
+		return base
+	}
+	return org
+}
+
+// asked is the cache Tier and Plan share.
+func asked(ctx context.Context, kind, subject, org string, ask func(ctx context.Context, subject, org string) (string, error)) (string, error) {
 	if strings.TrimSpace(subject) == "" {
 		return "", nil
 	}
-	k := org + "\x00" + subject
+	org = tierOrg(org)
+	k := kind + "\x00" + org + "\x00" + subject
 	tiers.mu.Lock()
 	t, ok := tiers.m[k]
 	stale := ok && time.Since(t.at) > tierTTL
 	if stale && !t.asking {
 		t.asking = true
 		tiers.m[k] = t
-		go refreshTier(k, subject, org)
+		go refreshTier(k, subject, org, ask)
 	}
 	tiers.mu.Unlock()
 	if ok {
 		return t.name, nil
 	}
-	name, err := askTier(ctx, subject, org)
+	name, err := ask(ctx, subject, org)
 	if err == nil {
 		keepTier(k, name)
 	}
@@ -78,8 +103,8 @@ func keepTier(k, name string) {
 	tiers.mu.Unlock()
 }
 
-func refreshTier(k, subject, org string) {
-	name, err := askTier(context.Background(), subject, org)
+func refreshTier(k, subject, org string, ask func(ctx context.Context, subject, org string) (string, error)) {
+	name, err := ask(context.Background(), subject, org)
 	if err == nil {
 		keepTier(k, name)
 		return
@@ -105,6 +130,23 @@ func askTier(ctx context.Context, subject, org string) (string, error) {
 		return "", nil
 	case err != nil:
 		return "", fmt.Errorf("tier: %w", err)
+	}
+	return strings.TrimSpace(name), nil
+}
+
+func askPlan(ctx context.Context, subject, org string) (string, error) {
+	ask := peersOf().PlanOf
+	if ask == nil {
+		return "", nil
+	}
+	ctx, cancel := context.WithTimeout(For(ctx, org), tierCallTimeout)
+	defer cancel()
+	name, err := ask(ctx, subject)
+	switch {
+	case errors.Is(err, ErrNoPeer):
+		return "", nil
+	case err != nil:
+		return "", fmt.Errorf("plan: %w", err)
 	}
 	return strings.TrimSpace(name), nil
 }

@@ -6,9 +6,10 @@ package cloud
 // / X-User-Id request headers verbatim. In production the gateway
 // (hanzoai/gateway) is the sole author of those headers: it strips any
 // client-supplied copy and re-injects them from a validated IAM JWT (HIP-0026).
-// cloud TRUSTS that contract. A deployment that is also reachable WITHOUT the
-// gateway in front (directly in-cluster, or on a second public host) has paths on
-// which a caller can simply send `X-User-IsAdmin: true` and every cloud admin gate
+// cloud TRUSTS that contract. But cloud-api is also reachable WITHOUT the gateway
+// in front — directly in-cluster (cloud-api.hanzo.svc:8000, used by console's
+// BFF) and historically on the public host cloud-api.hanzo.ai. On those paths a
+// caller can simply send `X-User-IsAdmin: true` and every cloud admin gate
 // (principal.Super) believes it. That is the forgeable-admin trust boundary.
 //
 // THE FIX. This middleware runs FIRST — before BillingGate and every subsystem —
@@ -100,7 +101,9 @@ const (
 // from the validated `billing_account` claim. The raw client copy is never a
 // source for any of them.
 //
-// Both categories are REMOVED the same way, by the one list below.
+// Both categories are REMOVED the same way, by the one list below. They used to be
+// two lists that also spelled what to remove, which is two places for one fact to
+// go stale in.
 
 // stripped is every identity name ingress DELETES: ingress.Stripped, the one list
 // (see it for what is in it and why X-Request-Id is not).
@@ -414,9 +417,34 @@ func IdentityMiddleware(cfg *Config) zip.Handler {
 	return SanitizeIdentity(BoundaryOf(cfg))
 }
 
-// BoundaryOf is the validator the boundary for cfg checks credentials with.
+// BoundaryOf is the validator the boundary for cfg checks credentials with. It
+// trusts the provider cfg.Discovery names and every other brand's (each only for the
+// issuer its own document names), and panics on a configuration that names none: a
+// binary with no one to trust must not start as one that trusts anyone.
 func BoundaryOf(cfg *Config) *Boundary {
-	return newIdentityValidator(cfg.IAMIssuer, cfg.JWKSURL, 0)
+	b, err := newBoundary(discoveryURLs(cfg), cfg.DiscoveryClient, 0)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+// discoveryURLs are the providers cfg trusts: the one it names, and each registered
+// brand's, so one binary fronts every white-label brand. A brand whose own URL cfg
+// replaces is not also trusted at the default.
+func discoveryURLs(cfg *Config) []string {
+	own := cfg.Discovery
+	if own == "" {
+		own = brand.DiscoveryFor(cfg.Brand)
+	}
+	urls := []string{own}
+	def := brand.DiscoveryFor(cfg.Brand)
+	for _, u := range brand.Discoveries() {
+		if u != def || own == def {
+			urls = append(urls, u)
+		}
+	}
+	return urls
 }
 
 // sanitizeSubScopes re-injects the org SUB-SCOPES (X-Project-Id, X-App-Id) for a
@@ -454,11 +482,12 @@ func sanitizeSubScopes(c *zip.Ctx, org, project, app, billingAccount string) {
 	}
 	// X-Billing-Account-Id names WHO PAYS, so it is written from the validated
 	// `billing_account` claim (claims.renderBillingAccount) and never from a client
-	// value — the raw copy is deleted on ingress and not restored here. It is not
-	// one anymore: ai/object.Payer now resolves the paying Account from this claim,
-	// so a restored client copy would be a caller naming its own payer — the whole
-	// thing the claim exists to prevent. Absent when IAM minted no account (a
-	// pre-claim token); Payer then falls back.
+	// value — the raw copy is deleted on ingress and not restored here. It used to
+	// be forwarded as-is, which was defensible only while it was a mere attribution
+	// hint that no debit read. It is not one anymore: ai/object.Payer now resolves
+	// the paying Account from this claim, so a restored client copy would be a caller
+	// naming its own payer — the whole thing the claim exists to prevent. Absent when
+	// IAM minted no account (a pre-claim token); Payer then falls back.
 	if billingAccount != "" {
 		req.Header.Set(authz.HeaderBillingAccount, billingAccount)
 	}
@@ -488,7 +517,7 @@ func sanitizeSubScopes(c *zip.Ctx, org, project, app, billingAccount string) {
 // decided below the boundary from its signed membership set; a key carries none,
 // so the key's own resolution asks IAM whether its holder acts there
 // (iamKeys.resolveIn) — the selection never silently falls back to the key's org,
-// which would bill the wrong tenant.
+// which billed the wrong tenant (#429).
 func validatedPrincipal(c *zip.Ctx, v *Boundary, selected string) (claims *idClaims, refusal error, strike bool) {
 	if v == nil {
 		return nil, nil, false
@@ -718,8 +747,8 @@ func (c *idClaims) admits(z *zip.Ctx) error {
 	// included (confined.go). A refusal is logged with who acted: it is code in a
 	// sandbox reaching past its run, which is worth seeing before it succeeds.
 	if c.confined {
-		err := inferenceOnly(path, z.Method())
-		if err == nil {
+		err := confinedAllowed(c.Scope, path, z.Method())
+		if err == nil && inferenceOnly(path, z.Method()) == nil {
 			err = noRetrieval(z)
 		}
 		if err != nil {
@@ -870,4 +899,18 @@ func CallerBearer(c *zip.Ctx) string {
 		return ""
 	}
 	return tok
+}
+
+// CallerIssuer is the `iss` of the caller's validated JWT bearer (CallerBearer): which
+// of the trusted identity providers minted the token this request was admitted on. A
+// downstream that checks the person's own token itself against ONE issuer (a cell's
+// Dev server) is told this one. The claim is read from the token SanitizeIdentity
+// already verified, so it is the issuer that verification accepted. Empty when the
+// request carries no JWT bearer.
+func CallerIssuer(c *zip.Ctx) string {
+	tok := CallerBearer(c)
+	if tok == "" {
+		return ""
+	}
+	return claimedIssuer(tok)
 }

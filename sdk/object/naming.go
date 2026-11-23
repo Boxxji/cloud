@@ -6,6 +6,8 @@ import (
 	"path"
 	"regexp"
 	"strings"
+
+	"github.com/hanzoai/cloud/sdk/env"
 )
 
 // How a tenant's resource becomes a physical name on a shared backend.
@@ -30,25 +32,43 @@ func Ident(name string) string { return strings.ReplaceAll(name, "-", "_") }
 // PhysicalName namespaces a resource as "o"<OrgHash>_<Ident>. The leading 'o'
 // keeps it alpha-initial, which every backend accepts as an identifier. With a
 // name of 40 characters or fewer the result is at most 58, inside both a 63
-// character bucket limit and Postgres's 63-character identifier limit.
+// character bucket limit and Postgres's 63-character identifier limit. A store
+// that wraps the bucket (AffixEnv) leaves less room, and Bucket shortens a longer name.
 func PhysicalName(org, name string) string {
 	return "o" + OrgHash(org) + "_" + Ident(name)
 }
 
 // BucketName is the physical bucket a tenant's named resource lives in.
-func BucketName(org, name string) string { return bucket(PhysicalName(org, name)) }
+func BucketName(org, name string) string { return BucketOf(PhysicalName(org, name)) }
 
 // BucketPrefix is the string every one of a tenant's buckets begins with, which
 // is what makes a listing filterable back to one org.
-func BucketPrefix(org string) string { return bucket("o"+OrgHash(org)) + "-" }
+func BucketPrefix(org string) string { return BucketOf("o"+OrgHash(org)) + "-" }
 
-// bucket renders a physical name in the alphabet buckets accept.
-func bucket(physical string) string {
+// AffixEnv names how many characters the store puts around a bucket name before it
+// reaches AWS: the AWS gateway's bucket.prefix and bucket.suffix, 22 of them. A
+// store that adds none leaves it unset.
+const AffixEnv = "S3_BUCKET_AFFIX"
+
+// tagLen is the hex digits of the hash that keeps a shortened name distinct.
+const tagLen = 10
+
+// BucketOf renders a physical name in the alphabet buckets accept and within the length
+// the store can hold: 63 characters less the store's own affix. A name that fits is
+// returned as it was; one that does not keeps its leading characters, which carry the
+// org's prefix, and ends in a hash of the whole name, so it is deterministic, still
+// ordered under its org, and distinct from every other name. A name this function
+// returned fits, and so BucketOf its friendly part returns it again: a listing's
+// names can be addressed.
+func BucketOf(physical string) string {
 	b := strings.Trim(strings.ToLower(strings.ReplaceAll(physical, "_", "-")), "-")
-	if len(b) > 63 { // unreachable for a bounded name; defensive.
-		b = strings.Trim(b[:63], "-")
+	room := 63 - env.Int(AffixEnv, 0)
+	if len(b) <= room {
+		return b
 	}
-	return b
+	sum := sha256.Sum256([]byte(physical))
+	tag := hex.EncodeToString(sum[:])[:tagLen]
+	return strings.Trim(b[:room-1-tagLen], "-") + "-" + tag
 }
 
 // friendlyRE is the FRIENDLY bucket name a tenant supplies: a DNS-safe slug of at

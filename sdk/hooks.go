@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hanzoai/cloud/sdk/fault"
 	"github.com/hanzoai/cloud/sdk/meter"
 	"github.com/zap-proto/zip"
 )
@@ -45,8 +46,9 @@ type Hooks struct {
 	// PeerHas reports whether a CLOUD_PEERS value names the pod id.
 	PeerHas func(spec, id string) bool
 
-	// ReportFault files a 500 this process answered.
-	ReportFault func(method, path string, err error)
+	// ReportFault states one fault on the event plane: a 5xx this process
+	// answered, a run that ended in error, a job that failed.
+	ReportFault func(f fault.Fault)
 	// Ceiling is the op-invoke half of the rate ceiling.
 	Ceiling func() zip.Authorizer
 	// Toll is the op-invoke authorizer that charges.
@@ -104,9 +106,13 @@ func peerHas(spec, id string) bool {
 	return false
 }
 
-func reportFault(method, path string, err error) {
-	if f := hooks().ReportFault; f != nil {
-		f(method, path, err)
+// ReportFault states one fault on the event plane, detached and bounded, so any
+// process can say a failure the same way the request handler does: a run that
+// ended in error (fault.Ended), a scheduled job that failed (fault.Failed). A
+// process with no host says nothing.
+func ReportFault(f fault.Fault) {
+	if h := hooks().ReportFault; h != nil {
+		h(f)
 	}
 }
 

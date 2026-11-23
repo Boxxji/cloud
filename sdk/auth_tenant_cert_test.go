@@ -15,19 +15,9 @@ import (
 	"github.com/hanzoai/cloud/sdk/brand"
 )
 
-// A token signed by an ORGANIZATION'S OWN cert is refused at the boundary.
-//
-// An org's applications sign with a cert of the org's, under the org's own issuer
-// and published only in the org's own JWKS. The platform's boundary trusts the
-// platform's issuers and the platform's JWKS, and nothing an org publishes: a
-// person who signed in to an org's app holds a credential for that org's app, not
-// a credential for this API. Held here through the real middleware, because it is
-// the one in front of production.
-//
-// Three ways a tenant token could present, each refused on its own: under the
-// tenant's issuer, under the platform's issuer with a kid the platform never
-// published, and under a kid the platform DID publish but signed by the tenant's
-// key (a collision between a tenant cert's name and a platform cert's).
+// A token signed by an organization's own cert is refused at the boundary, which trusts the
+// platform's issuers and JWKS and nothing an organization publishes. Four pairings of issuer, kid
+// and key, through the real middleware.
 func TestATokenSignedByATenantCertIsRefusedAtTheBoundary(t *testing.T) {
 	platform, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -94,10 +84,8 @@ func TestATokenSignedByATenantCertIsRefusedAtTheBoundary(t *testing.T) {
 	}
 }
 
-// During the platform's issuer move the boundary trusts both platform issuers, each
-// exactly, and still nothing an organization publishes: a platform-signed token under
-// https://hanzo.ai authenticates as the hanzo brand; a token under an organization's own
-// issuer, https://hanzo.ai/<org>, signed by the platform key or by the tenant's, does not.
+// While the platform issuer moves the boundary trusts both platform issuers, each exactly, and
+// still no organization's: https://hanzo.ai/<org> is refused whoever signed it.
 func TestBothPlatformIssuersAuthenticateAndATenantIssuerDoesNot(t *testing.T) {
 	platform, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -115,7 +103,7 @@ func TestBothPlatformIssuersAuthenticateAndATenantIssuerDoesNot(t *testing.T) {
 	}}})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(body) }))
 	defer srv.Close()
-	v := newIdentityValidator("https://hanzo.id", srv.URL, 0)
+	v := newIdentityValidator("https://hanzo.ai", srv.URL, 0)
 	app, got := newIdentityApp(t, v)
 
 	sign := func(key *rsa.PrivateKey, kid, issuer string) string {
@@ -130,15 +118,20 @@ func TestBothPlatformIssuersAuthenticateAndATenantIssuerDoesNot(t *testing.T) {
 		}
 		return raw
 	}
-	for _, iss := range []string{"https://hanzo.id", "https://hanzo.ai"} {
-		*got = captured{}
-		probe(t, app, bearer(sign(platform, "cert-hanzo", iss)))
-		if got.org != "acme" {
-			t.Errorf("a platform-signed token under %s did not authenticate: %+v", iss, *got)
-		}
-		if id, ok := brand.ForIssuer(iss); !ok || id != "hanzo" {
-			t.Errorf("%s does not name the hanzo brand", iss)
-		}
+	// The platform's issuer is the one its discovery document names: a token under it
+	// authenticates, and one under the issuer it replaced does not.
+	*got = captured{}
+	probe(t, app, bearer(sign(platform, "cert-hanzo", "https://hanzo.ai")))
+	if got.org != "acme" {
+		t.Errorf("a platform-signed token under the discovered issuer did not authenticate: %+v", *got)
+	}
+	if id, ok := brand.ForIssuer("https://hanzo.ai"); !ok || id != "hanzo" {
+		t.Errorf("https://hanzo.ai does not name the hanzo brand")
+	}
+	*got = captured{}
+	probe(t, app, bearer(sign(platform, "cert-hanzo", "https://hanzo.id")))
+	if got.org != "" {
+		t.Errorf("a token under an issuer no discovery document names authenticated: %+v", *got)
 	}
 	for name, tok := range map[string]string{
 		"an organization's issuer, signed by the platform key": sign(platform, "cert-hanzo", "https://hanzo.ai/acme"),

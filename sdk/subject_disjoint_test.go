@@ -66,7 +66,8 @@ func TestAKeyNamedAfterAColleaguesSubIsNotThem(t *testing.T) {
 	}
 	// The attacker's home key: IAM resolves it to hanzo/<victim's sub>.
 	v := keyValidator(t, "hanzo", victim)
-	v.verifier = newIdentityValidator(testIssuer, jwksServer(t, &key.PublicKey).URL, 0).verifier
+	nv := newIdentityValidator(testIssuer, jwksServer(t, &key.PublicKey).URL, 0)
+	v.sources, v.issuers, v.held = nv.sources, nv.issuers, nv.held
 
 	tc := tokenClaims("hanzo-console", "hanzo", "victim@example.test", false, time.Now().Add(time.Hour))
 	tc.Subject = victim
@@ -94,7 +95,8 @@ func TestAnApplicationNamedAfterAMemberIsNotThem(t *testing.T) {
 	}
 	// bob's key in acme, and the application acme's admin named "bob".
 	v := keyValidator(t, "acme", "bob")
-	v.verifier = newIdentityValidator(testIssuer, jwksServer(t, &key.PublicKey).URL, 0).verifier
+	nv := newIdentityValidator(testIssuer, jwksServer(t, &key.PublicKey).URL, 0)
+	v.sources, v.issuers, v.held = nv.sources, nv.issuers, nv.held
 
 	appUser, appP := minted(t, v, appToken(t, key, "bob", "acme"))
 	keyUser, keyP := minted(t, v, "sk-bob-key")
