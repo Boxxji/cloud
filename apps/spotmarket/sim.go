@@ -53,6 +53,7 @@ type RegimeMetrics struct {
 	ProvidersTotal      int   `json:"providersTotal"`
 	OrdersSubmitted     int   `json:"ordersSubmitted"`
 	OrdersCleared       int   `json:"ordersCleared"`
+	OrdersCompleted     int   `json:"ordersCompleted"`
 	OrdersRejected      int   `json:"ordersRejected"`
 	LeasesAwarded       int   `json:"leasesAwarded"`
 	FailoversTriggered  int   `json:"failoversTriggered"`
@@ -81,6 +82,7 @@ type RegimeMetrics struct {
 	LatencyP95Ms          float64 `json:"latencyP95Ms"`
 	LatencyP99Ms          float64 `json:"latencyP99Ms"`
 	MeanThroughputTokSec  float64 `json:"meanThroughputTokPerSec"`
+	ClearRatePct          float64 `json:"clearRatePct"`
 	CompletionRatePct     float64 `json:"completionRatePct"`
 	TokenFulfillRatePct   float64 `json:"tokenFulfillRatePct"`
 	AdmissionRejectPct    float64 `json:"admissionRejectPct"`
@@ -519,6 +521,17 @@ func buildDemandWorkload(cfg SimConfig, demandScale float64) []simOrderSpec {
 	return orders
 }
 
+// computeGenerationLatencyMs returns total simulated execution latency in
+// milliseconds: TTFT (ms) plus generation duration across an 8-way parallel
+// batch converted from seconds to milliseconds (* 1000.0).
+func computeGenerationLatencyMs(ttftMs float64, tokens int64, tokPerSec float64) float64 {
+	if tokPerSec <= 0 || tokens <= 0 {
+		return ttftMs
+	}
+	genSeconds := float64(tokens) / (tokPerSec * 8.0)
+	return ttftMs + genSeconds*1000.0
+}
+
 func simulateFixedPriceBaseline(cfg SimConfig, orders []simOrderSpec) RegimeMetrics {
 	rng := rand.New(rand.NewSource(cfg.Seed + 303))
 	ttfts := make([]float64, 0, len(orders))
@@ -552,7 +565,7 @@ func simulateFixedPriceBaseline(cfg SimConfig, orders []simOrderSpec) RegimeMetr
 		if o.model == "llama-3.1-8b" {
 			tokSec += 35.0
 		}
-		lat := ttft + (float64(o.requestedTokens)/1000.0)*(1000.0/(tokSec*8.0))
+		lat := computeGenerationLatencyMs(ttft, o.requestedTokens, tokSec)
 		ttfts = append(ttfts, ttft)
 		lats = append(lats, lat)
 		sumTokSec += tokSec
@@ -574,6 +587,7 @@ func simulateFixedPriceBaseline(cfg SimConfig, orders []simOrderSpec) RegimeMetr
 		ProvidersTotal:              1,
 		OrdersSubmitted:             len(orders),
 		OrdersCleared:               completed,
+		OrdersCompleted:             completed,
 		OrdersRejected:              len(orders) - completed,
 		LeasesAwarded:               completed,
 		RequestedTokens:             totalReqTokens,
@@ -590,6 +604,7 @@ func simulateFixedPriceBaseline(cfg SimConfig, orders []simOrderSpec) RegimeMetr
 		LatencyP95Ms:                round2(percentile(lats, 0.95)),
 		LatencyP99Ms:                round2(percentile(lats, 0.99)),
 		MeanThroughputTokSec:        round2(meanTokSec),
+		ClearRatePct:                round2(pct(completed, len(orders))),
 		CompletionRatePct:           round2(pct(completed, len(orders))),
 		TokenFulfillRatePct:         round2(pctInt64(totalUsefulTokens, totalReqTokens)),
 		AdmissionRejectPct:          round2(pct(len(orders)-completed, len(orders))),
@@ -611,6 +626,10 @@ func simulateSpotRegime(cfg SimConfig, orders []simOrderSpec, opts regimeOpts, b
 	if err != nil {
 		return RegimeMetrics{}, SovereigntyMetrics{}, err
 	}
+	return simulateSpotRegimeWithProviders(cfg, providers, orders, opts, baselineCostPer1M)
+}
+
+func simulateSpotRegimeWithProviders(cfg SimConfig, providers []*simProvider, orders []simOrderSpec, opts regimeOpts, baselineCostPer1M float64) (RegimeMetrics, SovereigntyMetrics, error) {
 	rng := rand.New(rand.NewSource(cfg.Seed + 404))
 
 	mcfg := DefaultConfig()
@@ -626,7 +645,7 @@ func simulateSpotRegime(cfg SimConfig, orders []simOrderSpec, opts regimeOpts, b
 		return RegimeMetrics{}, SovereigntyMetrics{}, err
 	}
 	for _, p := range providers {
-		if err := market.DepositProvider(p.id, 5_000_000_000); err != nil {
+		if err := market.DepositProviderWithKey(p.id, p.kp.PubKeyHex, 5_000_000_000); err != nil {
 			return RegimeMetrics{}, SovereigntyMetrics{}, err
 		}
 		// Register permissionless peer in gossip overlay (skip Hanzo peers when kill-switch active)
@@ -685,7 +704,13 @@ func simulateSpotRegime(cfg SimConfig, orders []simOrderSpec, opts regimeOpts, b
 		lats               []float64
 		sumTokSec          float64
 		providerWins       = make(map[string]int64)
+		orderRequested     = make(map[string]int64, len(orders))
+		orderDelivered     = make(map[string]int64, len(orders))
+		provByID           = make(map[string]*simProvider, len(providers))
 	)
+	for _, p := range providers {
+		provByID[p.id] = p
+	}
 
 	// Keep one previously used signed bid per provider to craft authentic replay-nonce attacks
 	lastValidBid := make(map[string]SignedBid)
@@ -750,8 +775,8 @@ func simulateSpotRegime(cfg SimConfig, orders []simOrderSpec, opts regimeOpts, b
 						MinBillableTokens:   1000,
 					},
 					SLO: ServiceCommitment{
-						TargetTTFTMs:           int64(p.baseTTFTMs),
-						MinThroughputTokPerSec: p.baseTokPerSec,
+						TargetTTFTMs:           int64(math.Ceil(p.baseTTFTMs*1.35)) + 25,
+						MinThroughputTokPerSec: math.Floor(p.baseTokPerSec * 0.85),
 						UptimeBPS:              9920,
 						CollateralMicroUSD:     500_000,
 						SlashBPSOnBreach:       5000,
@@ -841,6 +866,7 @@ func simulateSpotRegime(cfg SimConfig, orders []simOrderSpec, opts regimeOpts, b
 			for _, spec := range wave {
 				totalReqTokens += spec.requestedTokens
 				orderID := fmt.Sprintf("ord-e%02d-%03d", spec.epoch, spec.indexInEpoch)
+				orderRequested[orderID] = spec.requestedTokens
 				order := Order{
 					OrderID:                orderID,
 					BuyerID:                buyerID,
@@ -1124,10 +1150,6 @@ func simulateSpotRegime(cfg SimConfig, orders []simOrderSpec, opts regimeOpts, b
 					partialFillOrders++
 				}
 
-				provByID := make(map[string]*simProvider, len(providers))
-				for _, p := range providers {
-					provByID[p.id] = p
-				}
 				for _, l := range leases {
 					activeWave = append(activeWave, activeExec{
 						spec:     spec,
@@ -1137,15 +1159,11 @@ func simulateSpotRegime(cfg SimConfig, orders []simOrderSpec, opts regimeOpts, b
 				}
 			}
 
-			// Execute & settle all leases in the wave
-			settleNow := waveNow + 4
-			for _, ex := range activeWave {
-				p := ex.provider
-				l := ex.lease
-
-				// Adversarial winner attempts bait-and-switch or fraudulent non-delivery at settlement.
-				// In verified mode, only bait_and_switch reaches clearing (others are blocked pre-clear);
-				// in unverified negative-control mode, forged/malleated/Sybil/overclaim bids also win and fail delivery.
+			// Unified lease execution model shared identically by both primary
+			// and failover replacement executions so replacement providers are
+			// subject to the exact same adversarial roles, crash probabilities,
+			// SLA enforcement, and millisecond latency calculations.
+			executeLease := func(l Lease, spec simOrderSpec, p *simProvider, settleTS int64, isFailover bool) (succeeded bool, isAdversarial bool, err error) {
 				if p.adversarial {
 					if p.advRole == "bait_and_switch" {
 						atkInjected["bait_and_switch_non_delivery"]++
@@ -1161,128 +1179,72 @@ func simulateSpotRegime(cfg SimConfig, orders []simOrderSpec, opts regimeOpts, b
 						ReportedMicroUSDPer1MTokens: l.AgreedMicroUSDPer1MTokens * 3,
 						BaitAndSwitchPriceAttempted: true,
 					}
-					rcpt, err := market.SettleLease(l.LeaseID, rep, settleNow)
-					if err != nil {
-						return RegimeMetrics{}, SovereigntyMetrics{}, err
+					rcpt, settleErr := market.SettleLease(l.LeaseID, rep, settleTS)
+					if settleErr != nil {
+						return false, true, settleErr
 					}
 					totalComputeMicro += rcpt.ProviderPayoutMicroUSD
 					totalSlashComp += rcpt.SlashedBondMicroUSD
 					totalSettleOverhd += rcpt.VerificationOverheadMicroUSD
-
 					if p.advRole == "bait_and_switch" && rcpt.Status == LeaseSlashedBaitSwitch && rcpt.ProviderPayoutMicroUSD == 0 && rcpt.SlashedBondMicroUSD > 0 {
 						atkDetected["bait_and_switch_non_delivery"]++
 					}
-
-					// Automatic failover to honest provider when slashing/recovery is active
-					if opts.enforceSlashing {
-						failoversTriggered++
-						foLease, err := market.FailoverLease(l.LeaseID, settleNow)
-						if err == nil && foLease != nil {
-							foProv := findProvider(providers, foLease.ProviderID)
-							foTTFT := foProv.baseTTFTMs + 45.0 + rng.Float64()*20.0
-							foTokSec := foProv.baseTokPerSec
-							foLat := foTTFT + (float64(foLease.AllocatedTokens)/1000.0)*(1000.0/(foTokSec*8.0))
-							foRcpt, err := market.SettleLease(foLease.LeaseID, DeliveryReport{
-								LeaseID:           foLease.LeaseID,
-								DeliveredTokens:   foLease.AllocatedTokens,
-								ObservedTTFTMs:    foTTFT,
-								ObservedLatencyMs: foLat,
-								ObservedTokPerSec: foTokSec,
-								Completed:         true,
-							}, settleNow+1)
-							if err == nil {
-								failoversRecovered++
-								leasesAwarded++
-								totalUsefulTokens += foRcpt.DeliveredTokens
-								totalComputeMicro += foRcpt.ProviderPayoutMicroUSD
-								totalSettleOverhd += foRcpt.VerificationOverheadMicroUSD
-								clearingPriceSum += float64(foLease.AgreedMicroUSDPer1MTokens) / 1_000_000.0
-								clearingPriceCount++
-								ttfts = append(ttfts, foTTFT)
-								lats = append(lats, foLat)
-								sumTokSec += foTokSec
-								providerWins[foLease.ProviderID]++
-							}
-						}
-					}
-					continue
+					return false, true, nil
 				}
 
-				// Mid-lease provider crash/timeout (elevated during capacity shock epochs)
 				crashRate := p.crashProb
-				if ex.spec.shockEpoch {
+				if spec.shockEpoch {
 					crashRate *= 1.8
 				}
 				if rng.Float64() < crashRate {
 					partialDeliv := (l.AllocatedTokens * int64(15+rng.Intn(35))) / 100
+					crashTTFT := p.baseTTFTMs * 1.4
+					crashTokSec := p.baseTokPerSec * 0.4
 					rep := DeliveryReport{
 						LeaseID:           l.LeaseID,
 						DeliveredTokens:   partialDeliv,
-						ObservedTTFTMs:    p.baseTTFTMs * 1.4,
-						ObservedLatencyMs: 950.0,
-						ObservedTokPerSec: p.baseTokPerSec * 0.4,
+						ObservedTTFTMs:    crashTTFT,
+						ObservedLatencyMs: computeGenerationLatencyMs(crashTTFT, partialDeliv, crashTokSec),
+						ObservedTokPerSec: crashTokSec,
 						Completed:         false,
 						FailureReason:     "mid_lease_gpu_crash",
 					}
-					rcpt, err := market.SettleLease(l.LeaseID, rep, settleNow)
-					if err != nil {
-						return RegimeMetrics{}, SovereigntyMetrics{}, err
+					rcpt, settleErr := market.SettleLease(l.LeaseID, rep, settleTS)
+					if settleErr != nil {
+						return false, false, settleErr
 					}
 					totalUsefulTokens += rcpt.DeliveredTokens
+					orderDelivered[l.OrderID] += rcpt.DeliveredTokens
 					totalComputeMicro += rcpt.ProviderPayoutMicroUSD
 					totalSlashComp += rcpt.SlashedBondMicroUSD
 					totalSettleOverhd += rcpt.VerificationOverheadMicroUSD
-
-					// Failover remaining undelivered tokens
-					failoversTriggered++
-					foLease, err := market.FailoverLease(l.LeaseID, settleNow)
-					if err == nil && foLease != nil {
-						foProv := findProvider(providers, foLease.ProviderID)
-						foTTFT := foProv.baseTTFTMs + 38.0 + rng.Float64()*22.0
-						foTokSec := foProv.baseTokPerSec
-						foLat := foTTFT + (float64(foLease.AllocatedTokens)/1000.0)*(1000.0/(foTokSec*8.0))
-						foRcpt, err := market.SettleLease(foLease.LeaseID, DeliveryReport{
-							LeaseID:           foLease.LeaseID,
-							DeliveredTokens:   foLease.AllocatedTokens,
-							ObservedTTFTMs:    foTTFT,
-							ObservedLatencyMs: foLat,
-							ObservedTokPerSec: foTokSec,
-							Completed:         true,
-						}, settleNow+1)
-						if err == nil {
-							failoversRecovered++
-							leasesAwarded++
-							totalUsefulTokens += foRcpt.DeliveredTokens
-							totalComputeMicro += foRcpt.ProviderPayoutMicroUSD
-							totalSettleOverhd += foRcpt.VerificationOverheadMicroUSD
-							clearingPriceSum += float64(foLease.AgreedMicroUSDPer1MTokens) / 1_000_000.0
-							clearingPriceCount++
-							ttfts = append(ttfts, foTTFT)
-							lats = append(lats, foLat)
-							sumTokSec += foTokSec
-							providerWins[foLease.ProviderID]++
-						}
-					}
-					continue
+					return false, false, nil
 				}
 
-				// Normal honest execution
-				ttft := p.baseTTFTMs*(0.92+rng.Float64()*0.18) + (ex.spec.burstMultiplier-1.0)*18.0
+				// Normal honest execution (primary or failover replacement)
+				var ttft float64
+				if isFailover {
+					ttft = p.baseTTFTMs + 15.0 + rng.Float64()*15.0
+				} else {
+					ttft = p.baseTTFTMs*(0.92+rng.Float64()*0.18) + (spec.burstMultiplier-1.0)*18.0
+				}
 				tokSec := p.baseTokPerSec * (0.94 + rng.Float64()*0.12)
-				lat := ttft + (float64(l.AllocatedTokens)/1000.0)*(1000.0/(tokSec*8.0))
-				rcpt, err := market.SettleLease(l.LeaseID, DeliveryReport{
+				lat := computeGenerationLatencyMs(ttft, l.AllocatedTokens, tokSec)
+				rcpt, settleErr := market.SettleLease(l.LeaseID, DeliveryReport{
 					LeaseID:           l.LeaseID,
 					DeliveredTokens:   l.AllocatedTokens,
 					ObservedTTFTMs:    ttft,
 					ObservedLatencyMs: lat,
 					ObservedTokPerSec: tokSec,
 					Completed:         true,
-				}, settleNow)
-				if err != nil {
-					return RegimeMetrics{}, SovereigntyMetrics{}, err
+				}, settleTS)
+				if settleErr != nil {
+					return false, false, settleErr
 				}
 				totalUsefulTokens += rcpt.DeliveredTokens
+				orderDelivered[l.OrderID] += rcpt.DeliveredTokens
 				totalComputeMicro += rcpt.ProviderPayoutMicroUSD
+				totalSlashComp += rcpt.SlashedBondMicroUSD
 				totalSettleOverhd += rcpt.VerificationOverheadMicroUSD
 				clearingPriceSum += float64(l.AgreedMicroUSDPer1MTokens) / 1_000_000.0
 				clearingPriceCount++
@@ -1290,6 +1252,41 @@ func simulateSpotRegime(cfg SimConfig, orders []simOrderSpec, opts regimeOpts, b
 				lats = append(lats, lat)
 				sumTokSec += tokSec
 				providerWins[l.ProviderID]++
+				return rcpt.DeliveredTokens >= l.AllocatedTokens, false, nil
+			}
+
+			// Execute & settle all leases in the wave
+			settleNow := waveNow + 4
+			for _, ex := range activeWave {
+				ok, wasAdv, execErr := executeLease(ex.lease, ex.spec, ex.provider, settleNow, false)
+				if execErr != nil {
+					return RegimeMetrics{}, SovereigntyMetrics{}, execErr
+				}
+				if ok {
+					continue
+				}
+				// Automatic failover on crashes, and on adversarial non-delivery
+				// when slashing/recovery is active.
+				if wasAdv && !opts.enforceSlashing {
+					continue
+				}
+				failoversTriggered++
+				foLease, foErr := market.FailoverLease(ex.lease.LeaseID, settleNow)
+				if foErr != nil || foLease == nil {
+					continue
+				}
+				leasesAwarded++
+				foProv := provByID[foLease.ProviderID]
+				if foProv == nil {
+					foProv = findProvider(providers, foLease.ProviderID)
+				}
+				foOK, _, foExecErr := executeLease(*foLease, ex.spec, foProv, settleNow+1, true)
+				if foExecErr != nil {
+					return RegimeMetrics{}, SovereigntyMetrics{}, foExecErr
+				}
+				if foOK {
+					failoversRecovered++
+				}
 			}
 		}
 
@@ -1364,6 +1361,15 @@ func simulateSpotRegime(cfg SimConfig, orders []simOrderSpec, opts regimeOpts, b
 		}
 	}
 
+	// Calculate order completion strictly from actual delivered tokens per order,
+	// separate from auction clearing.
+	ordersCompleted := 0
+	for orderID, req := range orderRequested {
+		if req > 0 && orderDelivered[orderID] >= req {
+			ordersCompleted++
+		}
+	}
+
 	meanTokSec := 0.0
 	if len(ttfts) > 0 {
 		meanTokSec = sumTokSec / float64(len(ttfts))
@@ -1373,7 +1379,7 @@ func simulateSpotRegime(cfg SimConfig, orders []simOrderSpec, opts regimeOpts, b
 		avgClearing = clearingPriceSum / float64(clearingPriceCount)
 	}
 	compWithoutHanzo := 0.0
-	if market.HanzoCalls() == 0 && ordersCleared > 0 {
+	if market.HanzoCalls() == 0 && ordersCompleted > 0 {
 		compWithoutHanzo = 100.0
 	}
 
@@ -1384,6 +1390,7 @@ func simulateSpotRegime(cfg SimConfig, orders []simOrderSpec, opts regimeOpts, b
 		ProvidersTotal:              len(providers),
 		OrdersSubmitted:             len(orders),
 		OrdersCleared:               ordersCleared,
+		OrdersCompleted:             ordersCompleted,
 		OrdersRejected:              ordersRejected,
 		LeasesAwarded:               leasesAwarded,
 		FailoversTriggered:          failoversTriggered,
@@ -1408,7 +1415,8 @@ func simulateSpotRegime(cfg SimConfig, orders []simOrderSpec, opts regimeOpts, b
 		LatencyP95Ms:                round2(percentile(lats, 0.95)),
 		LatencyP99Ms:                round2(percentile(lats, 0.99)),
 		MeanThroughputTokSec:        round2(meanTokSec),
-		CompletionRatePct:           round2(pct(ordersCleared, len(orders))),
+		ClearRatePct:                round2(pct(ordersCleared, len(orders))),
+		CompletionRatePct:           round2(pct(ordersCompleted, len(orders))),
 		TokenFulfillRatePct:         round2(pctInt64(totalUsefulTokens, totalReqTokens)),
 		AdmissionRejectPct:          round2(pct(ordersRejected, len(orders))),
 		FailoverRecoveryPct:         round2(pct(failoversRecovered, failoversTriggered)),
@@ -1506,14 +1514,14 @@ func runSovereigntyMigrationCheck(market *Market, providers []*simProvider, cfg 
 			})
 			if err := forked.SubmitBid(sb, migNow); err == nil {
 				if leases, _, err := forked.ClearOrder(ord.OrderID, migNow); err == nil && len(leases) == 1 {
-					if _, err := forked.SettleLease(leases[0].LeaseID, DeliveryReport{
+					if rcpt, err := forked.SettleLease(leases[0].LeaseID, DeliveryReport{
 						LeaseID:           leases[0].LeaseID,
 						DeliveredTokens:   250_000,
-						ObservedTTFTMs:    88.0,
-						ObservedLatencyMs: 420.0,
-						ObservedTokPerSec: 115.0,
+						ObservedTTFTMs:    healthyProv.baseTTFTMs,
+						ObservedLatencyMs: computeGenerationLatencyMs(healthyProv.baseTTFTMs, 250_000, healthyProv.baseTokPerSec),
+						ObservedTokPerSec: healthyProv.baseTokPerSec,
 						Completed:         true,
-					}, migNow+5); err == nil {
+					}, migNow+5); err == nil && rcpt.Status == LeaseCompleted {
 						postForkOK = forked.CheckConservation() == nil
 					}
 				}

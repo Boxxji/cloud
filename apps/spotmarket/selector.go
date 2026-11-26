@@ -5,6 +5,7 @@ package spotmarket
 import (
 	"math"
 	"sort"
+	"strings"
 )
 
 // Candidate bundles a provider's signed bid, its backing signed offer, and
@@ -14,6 +15,11 @@ type Candidate struct {
 	SignedOffer SignedOffer
 	Telemetry   ProviderTelemetry
 	FreeSlots   int
+
+	// HardwareAttestationVerified is populated strictly from a trusted
+	// AttestationVerifier result (never from Offer.AttestationClass alone).
+	// Orders with RequireHardwareAttested fail closed when this is false.
+	HardwareAttestationVerified bool
 }
 
 // RankedCandidate is an eligible candidate annotated with its normalized
@@ -128,11 +134,14 @@ func RankCandidates(order Order, candidates []Candidate, nowUnix int64, verifySi
 			})
 			continue
 		}
-		if order.RequireHardwareAttested && offer.AttestationClass != VerificationHardwareAttestation {
+		if order.RequireHardwareAttested &&
+			(!cand.HardwareAttestationVerified ||
+				offer.AttestationClass != VerificationHardwareAttestation ||
+				strings.TrimSpace(offer.AttestationQuoteHash) == "") {
 			rejections = append(rejections, Rejection{
 				EntityID:          bid.BidID,
 				ProviderID:        bid.ProviderID,
-				Reason:            "hardware_attestation_required",
+				Reason:            "hardware_attestation_unverified",
 				VerificationClass: VerificationHardwareAttestation,
 			})
 			continue

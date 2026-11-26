@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/luxfi/crypto/secp256k1"
 )
@@ -74,7 +76,11 @@ func gossipStateRoot(s GossipSnapshot) [32]byte {
 		writeLenPrefixed(&buf, p.PeerID)
 		writeLenPrefixed(&buf, p.Endpoint)
 		writeLenPrefixed(&buf, p.PubKeyHex)
+		regions := append([]string(nil), p.Regions...)
+		sort.Strings(regions)
+		writeStringSlice(&buf, regions)
 		writeInt64(&buf, p.LastSeenUnix)
+		writeLenPrefixed(&buf, p.OperatorClass)
 	}
 
 	writeUint64(&buf, uint64(len(s.ActiveOffers)))
@@ -82,6 +88,7 @@ func gossipStateRoot(s GossipSnapshot) [32]byte {
 		writeLenPrefixed(&buf, so.Offer.OfferID)
 		writeLenPrefixed(&buf, so.CommitmentHex)
 		writeLenPrefixed(&buf, so.SignatureHex)
+		writeLenPrefixed(&buf, string(so.VerificationClass))
 	}
 
 	telKeys := make([]string, 0, len(s.Telemetry))
@@ -94,21 +101,25 @@ func gossipStateRoot(s GossipSnapshot) [32]byte {
 		t := s.Telemetry[k]
 		writeLenPrefixed(&buf, t.ProviderID)
 		writeUint64(&buf, math.Float64bits(t.MeasuredTTFTMs))
+		writeUint64(&buf, math.Float64bits(t.MeasuredLatencyMs))
+		writeUint64(&buf, math.Float64bits(t.MeasuredTokPerSec))
 		writeInt64(&buf, t.CompletedJobs)
 		writeInt64(&buf, t.FailedJobs)
 		writeInt64(&buf, t.SlashedJobs)
 		writeInt64(&buf, int64(t.ReliabilityBPS))
+		writeInt64(&buf, t.ObservedSampleCount)
 	}
 
 	return sha256.Sum256(buf.Bytes())
 }
 
 // BundleCommitment computes the deterministic SHA-256 digest of a
-// MarketExportBundle covering gossip state, exact ledger balances, leases,
-// and settlement receipts.
+// MarketExportBundle covering gossip state, exact ledger balances, provider key
+// bindings, verified hardware attestations, orders, cleared status, pending
+// bids, complete lease terms, and settlement receipts.
 func BundleCommitment(b MarketExportBundle) [32]byte {
 	var buf bytes.Buffer
-	writeLenPrefixed(&buf, "HIP1350:EXPORT_BUNDLE:V1")
+	writeLenPrefixed(&buf, "HIP1350:EXPORT_BUNDLE:V2")
 	writeLenPrefixed(&buf, b.ProtocolVersion)
 	writeInt64(&buf, b.ExportedAtUnix)
 	writeLenPrefixed(&buf, b.ExporterPubKeyHex)
@@ -122,17 +133,87 @@ func BundleCommitment(b MarketExportBundle) [32]byte {
 	writeSortedInt64Map(&buf, b.Ledger.ProviderBalances)
 	writeSortedInt64Map(&buf, b.Ledger.ProviderLockedBonds)
 
-	// Leases
+	// Provider identity-to-key bindings
+	writeSortedStringMap(&buf, b.ProviderKeys)
+
+	// Verified hardware attestation offer IDs
+	verifiedIDs := append([]string(nil), b.VerifiedAttestationOfferIDs...)
+	sort.Strings(verifiedIDs)
+	writeStringSlice(&buf, verifiedIDs)
+
+	// Orders (all fields)
+	writeUint64(&buf, uint64(len(b.Orders)))
+	for _, o := range b.Orders {
+		writeLenPrefixed(&buf, o.OrderID)
+		writeLenPrefixed(&buf, o.BuyerID)
+		writeLenPrefixed(&buf, o.Model)
+		writeInt64(&buf, o.RequestedTokens)
+		writeInt64(&buf, int64(o.MinVRAMGB))
+		writeInt64(&buf, o.MaxMicroUSDPer1MTokens)
+		writeStringSlice(&buf, o.AllowedRegions)
+		writeStringSlice(&buf, o.AllowedJurisdictions)
+		writeStringSlice(&buf, o.BlockedJurisdictions)
+		writeInt64(&buf, o.MaxTTFTMs)
+		writeInt64(&buf, int64(o.MinReliabilityBPS))
+		writeBool(&buf, o.AllowPartialFill)
+		writeInt64(&buf, o.EscrowMicroUSD)
+		writeInt64(&buf, o.CreatedAtUnix)
+		writeInt64(&buf, o.ExpiresAtUnix)
+		writeUint64(&buf, math.Float64bits(o.RankingWeights.PriceWeight))
+		writeUint64(&buf, math.Float64bits(o.RankingWeights.LatencyWeight))
+		writeUint64(&buf, math.Float64bits(o.RankingWeights.ReliabilityWeight))
+		writeBool(&buf, o.RequireHardwareAttested)
+	}
+
+	// Cleared order IDs
+	clearedIDs := append([]string(nil), b.ClearedOrderIDs...)
+	sort.Strings(clearedIDs)
+	writeStringSlice(&buf, clearedIDs)
+
+	// Pending bids (complete Bid + signature envelope)
+	writeUint64(&buf, uint64(len(b.PendingBids)))
+	for _, sb := range b.PendingBids {
+		bid := sb.Bid
+		writeLenPrefixed(&buf, bid.ProtocolVersion)
+		writeLenPrefixed(&buf, bid.BidID)
+		writeLenPrefixed(&buf, bid.OrderID)
+		writeLenPrefixed(&buf, bid.OfferID)
+		writeLenPrefixed(&buf, bid.ProviderID)
+		writeLenPrefixed(&buf, bid.ProviderPubKeyHex)
+		writeInt64(&buf, bid.BidMicroUSDPer1MTokens)
+		writeInt64(&buf, bid.OfferedTokens)
+		writeInt64(&buf, int64(bid.CommittedVRAMGB))
+		writeInt64(&buf, bid.BondMicroUSD)
+		writeInt64(&buf, bid.IssuedAtUnix)
+		writeInt64(&buf, bid.ExpiresAtUnix)
+		writeUint64(&buf, bid.Nonce)
+		writeLenPrefixed(&buf, sb.CommitmentHex)
+		writeLenPrefixed(&buf, sb.SignatureHex)
+		writeLenPrefixed(&buf, string(sb.VerificationClass))
+	}
+
+	// Leases (EVERY field consumed after import)
 	writeUint64(&buf, uint64(len(b.Leases)))
 	for _, l := range b.Leases {
 		writeLenPrefixed(&buf, l.LeaseID)
 		writeLenPrefixed(&buf, l.OrderID)
+		writeLenPrefixed(&buf, l.BidID)
+		writeLenPrefixed(&buf, l.OfferID)
+		writeLenPrefixed(&buf, l.BuyerID)
 		writeLenPrefixed(&buf, l.ProviderID)
 		writeLenPrefixed(&buf, string(l.Status))
 		writeInt64(&buf, l.AllocatedTokens)
 		writeInt64(&buf, l.DeliveredTokens)
+		writeInt64(&buf, l.AgreedMicroUSDPer1MTokens)
 		writeInt64(&buf, l.EscrowLockedMicroUSD)
 		writeInt64(&buf, l.ProviderBondMicroUSD)
+		writeInt64(&buf, int64(l.SlashBPSOnBreach))
+		writeInt64(&buf, l.TargetTTFTMs)
+		writeUint64(&buf, math.Float64bits(l.MinThroughputTokPerSec))
+		writeInt64(&buf, l.StartedAtUnix)
+		writeInt64(&buf, l.SettledAtUnix)
+		writeLenPrefixed(&buf, l.FailoverFromLeaseID)
+		writeLenPrefixed(&buf, l.FailoverToLeaseID)
 	}
 
 	// Receipts
@@ -143,6 +224,34 @@ func BundleCommitment(b MarketExportBundle) [32]byte {
 	}
 
 	return sha256.Sum256(buf.Bytes())
+}
+
+func writeBool(buf *bytes.Buffer, v bool) {
+	if v {
+		buf.WriteByte(1)
+	} else {
+		buf.WriteByte(0)
+	}
+}
+
+func writeStringSlice(buf *bytes.Buffer, list []string) {
+	writeUint64(buf, uint64(len(list)))
+	for _, item := range list {
+		writeLenPrefixed(buf, item)
+	}
+}
+
+func writeSortedStringMap(buf *bytes.Buffer, m map[string]string) {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	writeUint64(buf, uint64(len(keys)))
+	for _, k := range keys {
+		writeLenPrefixed(buf, k)
+		writeLenPrefixed(buf, m[k])
+	}
 }
 
 func writeSortedInt64Map(buf *bytes.Buffer, m map[string]int64) {
@@ -160,7 +269,8 @@ func writeSortedInt64Map(buf *bytes.Buffer, m map[string]int64) {
 
 // ExportBundle produces a cryptographically signed, self-contained state dump
 // so any user or operator can verify, migrate, or fork the entire market
-// without upstream Hanzo coordination.
+// (including pending auctions, provider key bindings, verified attestations,
+// active/settled leases, and receipts) without upstream Hanzo coordination.
 func (m *Market) ExportBundle(signer *secp256k1.PrivateKey, nowUnix int64) (MarketExportBundle, error) {
 	if signer == nil {
 		return MarketExportBundle{}, ErrInvalidSignature
@@ -168,6 +278,51 @@ func (m *Market) ExportBundle(signer *secp256k1.PrivateKey, nowUnix int64) (Mark
 	m.mu.RLock()
 	gossip := m.gossipSnapshotLocked(nowUnix)
 	ledger := m.ledgerSnapshotLocked()
+
+	providerKeys := make(map[string]string, len(m.providerKeys))
+	for k, v := range m.providerKeys {
+		providerKeys[k] = v
+	}
+
+	verifiedIDs := make([]string, 0, len(m.verifiedAttestations))
+	for _, so := range gossip.ActiveOffers {
+		if m.verifiedAttestations[so.Offer.OfferID] {
+			verifiedIDs = append(verifiedIDs, so.Offer.OfferID)
+		}
+	}
+	sort.Strings(verifiedIDs)
+
+	orders := make([]Order, 0, len(m.orders))
+	clearedIDs := make([]string, 0, len(m.orderCleared))
+	pendingBids := make([]SignedBid, 0)
+	for id, ord := range m.orders {
+		cp := ord
+		if len(ord.AllowedRegions) > 0 {
+			cp.AllowedRegions = append([]string(nil), ord.AllowedRegions...)
+		}
+		if len(ord.AllowedJurisdictions) > 0 {
+			cp.AllowedJurisdictions = append([]string(nil), ord.AllowedJurisdictions...)
+		}
+		if len(ord.BlockedJurisdictions) > 0 {
+			cp.BlockedJurisdictions = append([]string(nil), ord.BlockedJurisdictions...)
+		}
+		orders = append(orders, cp)
+		if m.orderCleared[id] {
+			clearedIDs = append(clearedIDs, id)
+		} else {
+			pendingBids = append(pendingBids, m.bidsByOrder[id]...)
+		}
+	}
+	sort.Slice(orders, func(i, j int) bool {
+		return orders[i].OrderID < orders[j].OrderID
+	})
+	sort.Strings(clearedIDs)
+	sort.Slice(pendingBids, func(i, j int) bool {
+		if pendingBids[i].Bid.OrderID != pendingBids[j].Bid.OrderID {
+			return pendingBids[i].Bid.OrderID < pendingBids[j].Bid.OrderID
+		}
+		return pendingBids[i].Bid.BidID < pendingBids[j].Bid.BidID
+	})
 
 	leases := make([]Lease, 0, len(m.leaseOrder))
 	for _, id := range m.leaseOrder {
@@ -186,14 +341,19 @@ func (m *Market) ExportBundle(signer *secp256k1.PrivateKey, nowUnix int64) (Mark
 	}
 
 	bundle := MarketExportBundle{
-		ProtocolVersion:   ProtocolVersion,
-		ExportedAtUnix:    nowUnix,
-		ExporterPubKeyHex: hex.EncodeToString(signer.PublicKey().Bytes()),
-		Gossip:            gossip,
-		Ledger:            ledger,
-		Leases:            leases,
-		Receipts:          receipts,
-		VerificationClass: VerificationCryptoSignature,
+		ProtocolVersion:             ProtocolVersion,
+		ExportedAtUnix:              nowUnix,
+		ExporterPubKeyHex:           hex.EncodeToString(signer.PublicKey().Bytes()),
+		Gossip:                      gossip,
+		Ledger:                      ledger,
+		ProviderKeys:                providerKeys,
+		VerifiedAttestationOfferIDs: verifiedIDs,
+		Orders:                      orders,
+		ClearedOrderIDs:             clearedIDs,
+		PendingBids:                 pendingBids,
+		Leases:                      leases,
+		Receipts:                    receipts,
+		VerificationClass:           VerificationCryptoSignature,
 	}
 	digest := BundleCommitment(bundle)
 	sig, err := SignDigestLowS(signer, digest)
@@ -206,8 +366,10 @@ func (m *Market) ExportBundle(signer *secp256k1.PrivateKey, nowUnix int64) (Mark
 }
 
 // VerifyExportBundle verifies the exporter's EIP-2 low-S secp256k1 signature,
-// gossip state root, every included SignedOffer signature, every receipt hash,
-// and exact integer ledger conservation (drift == 0).
+// gossip state root, every included SignedOffer and PendingBid signature, every
+// receipt hash, provider key bindings, verified attestation claims, complete
+// auction/lease escrow-and-bond consistency, and exact integer ledger
+// conservation (drift == 0).
 func VerifyExportBundle(bundle MarketExportBundle) error {
 	if bundle.ProtocolVersion != ProtocolVersion {
 		return fmt.Errorf("%w: unsupported protocol version %q", ErrInvalidExportBundle, bundle.ProtocolVersion)
@@ -217,29 +379,157 @@ func VerifyExportBundle(bundle MarketExportBundle) error {
 		return fmt.Errorf("%w: gossip state root mismatch", ErrInvalidExportBundle)
 	}
 
-	// Verify exact ledger conservation independently
+	// Verify non-negative balances and exact ledger conservation independently
+	// using checked int64 addition.
 	var sum int64
-	for _, v := range bundle.Ledger.BuyerBalances {
-		sum += v
+	addBalances := func(label string, m map[string]int64) error {
+		for k, v := range m {
+			if v < 0 {
+				return fmt.Errorf("%w: negative %s balance for %s", ErrLedgerDrift, label, k)
+			}
+			var err error
+			sum, err = addInt64Checked(sum, v)
+			if err != nil {
+				return fmt.Errorf("%w: %v", ErrLedgerDrift, err)
+			}
+		}
+		return nil
 	}
-	for _, v := range bundle.Ledger.BuyerEscrow {
-		sum += v
+	if err := addBalances("buyerBalances", bundle.Ledger.BuyerBalances); err != nil {
+		return err
 	}
-	for _, v := range bundle.Ledger.ProviderBalances {
-		sum += v
+	if err := addBalances("buyerEscrow", bundle.Ledger.BuyerEscrow); err != nil {
+		return err
 	}
-	for _, v := range bundle.Ledger.ProviderLockedBonds {
-		sum += v
+	if err := addBalances("providerBalances", bundle.Ledger.ProviderBalances); err != nil {
+		return err
+	}
+	if err := addBalances("providerLockedBonds", bundle.Ledger.ProviderLockedBonds); err != nil {
+		return err
 	}
 	if sum != bundle.Ledger.TotalDepositedMicroUSD || bundle.Ledger.ConservationDrift != 0 {
 		return fmt.Errorf("%w: ledger drift detected (sum=%d deposited=%d)", ErrLedgerDrift, sum, bundle.Ledger.TotalDepositedMicroUSD)
 	}
 
-	// Verify every active offer's signature
+	// Verify provider key bindings
+	for provID, pubHex := range bundle.ProviderKeys {
+		if strings.TrimSpace(provID) == "" {
+			return fmt.Errorf("%w: empty provider ID in providerKeys", ErrInvalidExportBundle)
+		}
+		if _, err := canonicalCompressedPubKeyHex(pubHex); err != nil {
+			return fmt.Errorf("%w: invalid provider key for %s: %v", ErrInvalidExportBundle, provID, err)
+		}
+	}
+
+	// Verify every active offer's signature and index offers for attestation checks
+	activeOffers := make(map[string]SignedOffer, len(bundle.Gossip.ActiveOffers))
 	for _, so := range bundle.Gossip.ActiveOffers {
 		if err := VerifySignedOffer(so); err != nil {
 			return fmt.Errorf("%w: offer %s: %v", ErrInvalidExportBundle, so.Offer.OfferID, err)
 		}
+		activeOffers[so.Offer.OfferID] = so
+	}
+
+	for _, id := range bundle.VerifiedAttestationOfferIDs {
+		so, ok := activeOffers[id]
+		if !ok {
+			return fmt.Errorf("%w: verified attestation references missing offer %s", ErrInvalidExportBundle, id)
+		}
+		if so.Offer.AttestationClass != VerificationHardwareAttestation || strings.TrimSpace(so.Offer.AttestationQuoteHash) == "" {
+			return fmt.Errorf("%w: verified attestation offer %s lacks hardware quote", ErrInvalidExportBundle, id)
+		}
+	}
+
+	// Index orders and cleared status; verify pending bids and lease references
+	orderMap := make(map[string]Order, len(bundle.Orders))
+	for _, ord := range bundle.Orders {
+		if ord.OrderID == "" || ord.BuyerID == "" || ord.EscrowMicroUSD < 0 {
+			return fmt.Errorf("%w: invalid order %q", ErrInvalidExportBundle, ord.OrderID)
+		}
+		if _, dup := orderMap[ord.OrderID]; dup {
+			return fmt.Errorf("%w: duplicate order %s", ErrInvalidExportBundle, ord.OrderID)
+		}
+		orderMap[ord.OrderID] = ord
+	}
+
+	clearedSet := make(map[string]bool, len(bundle.ClearedOrderIDs))
+	for _, id := range bundle.ClearedOrderIDs {
+		if _, ok := orderMap[id]; !ok {
+			return fmt.Errorf("%w: cleared order %s missing from orders", ErrInvalidExportBundle, id)
+		}
+		clearedSet[id] = true
+	}
+
+	expectedBuyerEscrow := make(map[string]int64)
+	expectedProvBonds := make(map[string]int64)
+
+	for _, ord := range bundle.Orders {
+		if !clearedSet[ord.OrderID] && ord.EscrowMicroUSD > 0 {
+			next, err := addInt64Checked(expectedBuyerEscrow[ord.BuyerID], ord.EscrowMicroUSD)
+			if err != nil {
+				return fmt.Errorf("%w: escrow overflow", ErrInvalidExportBundle)
+			}
+			expectedBuyerEscrow[ord.BuyerID] = next
+		}
+	}
+
+	seenPendingBids := make(map[string]bool, len(bundle.PendingBids))
+	for _, sb := range bundle.PendingBids {
+		if err := VerifySignedBid(sb); err != nil {
+			return fmt.Errorf("%w: pending bid %s: %v", ErrInvalidExportBundle, sb.Bid.BidID, err)
+		}
+		if sb.Bid.BondMicroUSD < 0 {
+			return fmt.Errorf("%w: negative bond on pending bid %s", ErrInvalidExportBundle, sb.Bid.BidID)
+		}
+		if seenPendingBids[sb.Bid.BidID] {
+			return fmt.Errorf("%w: duplicate pending bid %s", ErrInvalidExportBundle, sb.Bid.BidID)
+		}
+		seenPendingBids[sb.Bid.BidID] = true
+		if _, ok := orderMap[sb.Bid.OrderID]; !ok {
+			return fmt.Errorf("%w: pending bid %s references missing order %s", ErrInvalidExportBundle, sb.Bid.BidID, sb.Bid.OrderID)
+		}
+		if clearedSet[sb.Bid.OrderID] {
+			return fmt.Errorf("%w: pending bid %s references already-cleared order %s", ErrInvalidExportBundle, sb.Bid.BidID, sb.Bid.OrderID)
+		}
+		if sb.Bid.BondMicroUSD > 0 {
+			next, err := addInt64Checked(expectedProvBonds[sb.Bid.ProviderID], sb.Bid.BondMicroUSD)
+			if err != nil {
+				return fmt.Errorf("%w: bond overflow", ErrInvalidExportBundle)
+			}
+			expectedProvBonds[sb.Bid.ProviderID] = next
+		}
+	}
+
+	for _, l := range bundle.Leases {
+		if l.LeaseID == "" || l.BuyerID == "" || l.ProviderID == "" || l.EscrowLockedMicroUSD < 0 || l.ProviderBondMicroUSD < 0 {
+			return fmt.Errorf("%w: invalid lease %q", ErrInvalidExportBundle, l.LeaseID)
+		}
+		if _, ok := orderMap[l.OrderID]; !ok {
+			return fmt.Errorf("%w: lease %s references missing order %s", ErrInvalidExportBundle, l.LeaseID, l.OrderID)
+		}
+		if l.Status == LeaseActive {
+			if l.EscrowLockedMicroUSD > 0 {
+				next, err := addInt64Checked(expectedBuyerEscrow[l.BuyerID], l.EscrowLockedMicroUSD)
+				if err != nil {
+					return fmt.Errorf("%w: lease escrow overflow", ErrInvalidExportBundle)
+				}
+				expectedBuyerEscrow[l.BuyerID] = next
+			}
+			if l.ProviderBondMicroUSD > 0 {
+				next, err := addInt64Checked(expectedProvBonds[l.ProviderID], l.ProviderBondMicroUSD)
+				if err != nil {
+					return fmt.Errorf("%w: lease bond overflow", ErrInvalidExportBundle)
+				}
+				expectedProvBonds[l.ProviderID] = next
+			}
+		}
+	}
+
+	if err := verifyAccountingMapMatches("buyerEscrow", bundle.Ledger.BuyerEscrow, expectedBuyerEscrow); err != nil {
+		return err
+	}
+	if err := verifyAccountingMapMatches("providerLockedBonds", bundle.Ledger.ProviderLockedBonds, expectedProvBonds); err != nil {
+		return err
 	}
 
 	// Verify every settlement receipt hash
@@ -269,8 +559,35 @@ func VerifyExportBundle(bundle MarketExportBundle) error {
 	return nil
 }
 
+func verifyAccountingMapMatches(label string, actual, expected map[string]int64) error {
+	for k, v := range actual {
+		if expected[k] != v {
+			return fmt.Errorf("%w: %s mismatch for %s (ledger=%d state=%d)", ErrInvalidExportBundle, label, k, v, expected[k])
+		}
+	}
+	for k, v := range expected {
+		if actual[k] != v {
+			return fmt.Errorf("%w: %s mismatch for %s (ledger=%d state=%d)", ErrInvalidExportBundle, label, k, actual[k], v)
+		}
+	}
+	return nil
+}
+
+func maxSeqFromID(id, prefix string, cur int64) int64 {
+	if !strings.HasPrefix(id, prefix) {
+		return cur
+	}
+	n, err := strconv.ParseInt(strings.TrimPrefix(id, prefix), 10, 64)
+	if err == nil && n > cur {
+		return n
+	}
+	return cur
+}
+
 // ImportBundle verifies a signed MarketExportBundle and boots a completely
-// independent forked Market instance with zero Hanzo connectivity.
+// independent forked Market instance with zero Hanzo connectivity, preserving
+// pending auctions, provider key bindings, verified attestations, active
+// leases, and receipts.
 func ImportBundle(bundle MarketExportBundle, cfg Config, nowUnix int64) (*Market, error) {
 	if err := VerifyExportBundle(bundle); err != nil {
 		return nil, err
@@ -280,17 +597,43 @@ func ImportBundle(bundle MarketExportBundle, cfg Config, nowUnix int64) (*Market
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	for provID, pubHex := range bundle.ProviderKeys {
+		canon, err := canonicalCompressedPubKeyHex(pubHex)
+		if err != nil {
+			return nil, err
+		}
+		m.providerKeys[provID] = canon
+	}
+
 	for _, p := range bundle.Gossip.Peers {
-		m.peers[p.PeerID] = p
+		cp := p
+		if len(p.Regions) > 0 {
+			cp.Regions = append([]string(nil), p.Regions...)
+		}
+		m.peers[p.PeerID] = cp
 	}
 	for _, so := range bundle.Gossip.ActiveOffers {
 		if so.Offer.ExpiresAtUnix > nowUnix {
-			m.offers[so.Offer.OfferID] = so
+			cp := so
+			cp.Offer.SupportedModels = append([]string(nil), so.Offer.SupportedModels...)
+			m.offers[so.Offer.OfferID] = cp
 			if _, ok := m.usedOfferNonces[so.Offer.ProviderPubKeyHex]; !ok {
 				m.usedOfferNonces[so.Offer.ProviderPubKeyHex] = make(map[uint64]struct{})
 			}
 			m.usedOfferNonces[so.Offer.ProviderPubKeyHex][so.Offer.Nonce] = struct{}{}
 		}
+	}
+	for _, offerID := range bundle.VerifiedAttestationOfferIDs {
+		so, ok := m.offers[offerID]
+		if !ok {
+			continue
+		}
+		if cfg.AttestationVerifier != nil {
+			if err := cfg.AttestationVerifier(so.Offer); err != nil {
+				continue
+			}
+		}
+		m.verifiedAttestations[offerID] = true
 	}
 	for k, t := range bundle.Gossip.Telemetry {
 		m.telemetry[k] = t
@@ -302,21 +645,50 @@ func ImportBundle(bundle MarketExportBundle, cfg Config, nowUnix int64) (*Market
 	m.providerLockedBonds = copyInt64Map(bundle.Ledger.ProviderLockedBonds)
 	m.totalDepositedMicroUSD = bundle.Ledger.TotalDepositedMicroUSD
 
+	for _, ord := range bundle.Orders {
+		cp := ord
+		if len(ord.AllowedRegions) > 0 {
+			cp.AllowedRegions = append([]string(nil), ord.AllowedRegions...)
+		}
+		if len(ord.AllowedJurisdictions) > 0 {
+			cp.AllowedJurisdictions = append([]string(nil), ord.AllowedJurisdictions...)
+		}
+		if len(ord.BlockedJurisdictions) > 0 {
+			cp.BlockedJurisdictions = append([]string(nil), ord.BlockedJurisdictions...)
+		}
+		m.orders[ord.OrderID] = cp
+		m.orderProvBids[ord.OrderID] = make(map[string]int)
+	}
+	for _, id := range bundle.ClearedOrderIDs {
+		m.orderCleared[id] = true
+	}
+	for _, sb := range bundle.PendingBids {
+		m.bidsByOrder[sb.Bid.OrderID] = append(m.bidsByOrder[sb.Bid.OrderID], sb)
+		m.bidByID[sb.Bid.BidID] = sb
+		m.orderProvBids[sb.Bid.OrderID][sb.Bid.ProviderID]++
+		if _, ok := m.usedBidNonces[sb.Bid.ProviderPubKeyHex]; !ok {
+			m.usedBidNonces[sb.Bid.ProviderPubKeyHex] = make(map[uint64]struct{})
+		}
+		m.usedBidNonces[sb.Bid.ProviderPubKeyHex][sb.Bid.Nonce] = struct{}{}
+	}
+
+	m.leaseSeq = int64(len(bundle.Leases))
 	for _, l := range bundle.Leases {
 		cp := l
 		m.leases[l.LeaseID] = &cp
 		m.leaseOrder = append(m.leaseOrder, l.LeaseID)
+		m.leaseSeq = maxSeqFromID(l.LeaseID, "lease-", m.leaseSeq)
 		if l.Status == LeaseActive {
 			m.activeSlotsUsed[l.ProviderID]++
 		}
 	}
-	m.leaseSeq = int64(len(bundle.Leases))
 
+	m.receiptSeq = int64(len(bundle.Receipts))
 	for _, r := range bundle.Receipts {
 		m.receipts[r.ReceiptID] = r
 		m.receiptOrder = append(m.receiptOrder, r.ReceiptID)
+		m.receiptSeq = maxSeqFromID(r.ReceiptID, "rcpt-", m.receiptSeq)
 	}
-	m.receiptSeq = int64(len(bundle.Receipts))
 
 	return m, nil
 }

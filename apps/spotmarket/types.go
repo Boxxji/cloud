@@ -37,26 +37,36 @@ const (
 
 // Sentinel errors returned on fail-closed validation and settlement paths.
 var (
-	ErrInvalidSignature        = errors.New("spotmarket: invalid secp256k1 signature")
-	ErrHighSMalleableSignature = errors.New("spotmarket: high-S malleable signature rejected (EIP-2)")
-	ErrCommitmentMismatch      = errors.New("spotmarket: canonical commitment digest mismatch")
-	ErrExpiredOffer            = errors.New("spotmarket: offer expired")
-	ErrExpiredBid              = errors.New("spotmarket: bid expired")
-	ErrExpiredOrder            = errors.New("spotmarket: order expired")
-	ErrReplayNonce             = errors.New("spotmarket: replayed nonce rejected")
-	ErrSybilBidLimit           = errors.New("spotmarket: provider exceeded per-order bid limit")
-	ErrCapacityOverclaim       = errors.New("spotmarket: capacity claim exceeds available provider slots")
-	ErrInsufficientBond        = errors.New("spotmarket: provider bond below minimum required collateral")
-	ErrInsufficientBalance     = errors.New("spotmarket: insufficient account balance")
-	ErrInvalidOffer            = errors.New("spotmarket: invalid offer")
-	ErrInvalidOrder            = errors.New("spotmarket: invalid order")
-	ErrInvalidBid              = errors.New("spotmarket: invalid bid")
-	ErrNotFound                = errors.New("spotmarket: record not found")
-	ErrLedgerDrift             = errors.New("spotmarket: ledger conservation invariant violated")
-	ErrInvalidExportBundle     = errors.New("spotmarket: invalid or tampered export bundle")
-	ErrNoEligibleBids          = errors.New("spotmarket: no eligible bids satisfy order policy")
-	ErrLeaseAlreadySettled     = errors.New("spotmarket: lease already settled")
+	ErrInvalidSignature              = errors.New("spotmarket: invalid secp256k1 signature")
+	ErrHighSMalleableSignature       = errors.New("spotmarket: high-S malleable signature rejected (EIP-2)")
+	ErrCommitmentMismatch            = errors.New("spotmarket: canonical commitment digest mismatch")
+	ErrExpiredOffer                  = errors.New("spotmarket: offer expired")
+	ErrExpiredBid                    = errors.New("spotmarket: bid expired")
+	ErrExpiredOrder                  = errors.New("spotmarket: order expired")
+	ErrReplayNonce                   = errors.New("spotmarket: replayed nonce rejected")
+	ErrSybilBidLimit                 = errors.New("spotmarket: provider exceeded per-order bid limit")
+	ErrCapacityOverclaim             = errors.New("spotmarket: capacity claim exceeds available provider slots")
+	ErrInsufficientBond              = errors.New("spotmarket: provider bond below minimum required collateral")
+	ErrInsufficientBalance           = errors.New("spotmarket: insufficient account balance")
+	ErrInvalidOffer                  = errors.New("spotmarket: invalid offer")
+	ErrInvalidOrder                  = errors.New("spotmarket: invalid order")
+	ErrInvalidBid                    = errors.New("spotmarket: invalid bid")
+	ErrNotFound                      = errors.New("spotmarket: record not found")
+	ErrLedgerDrift                   = errors.New("spotmarket: ledger conservation invariant violated")
+	ErrInvalidExportBundle           = errors.New("spotmarket: invalid or tampered export bundle")
+	ErrNoEligibleBids                = errors.New("spotmarket: no eligible bids satisfy order policy")
+	ErrLeaseAlreadySettled           = errors.New("spotmarket: lease already settled")
+	ErrArithmeticOverflow            = errors.New("spotmarket: integer arithmetic overflow")
+	ErrUnauthorizedProviderKey       = errors.New("spotmarket: provider signing key not bound to provider identity")
+	ErrLeaseNotEligibleForFailover   = errors.New("spotmarket: lease is not eligible for failover")
+	ErrUnverifiedHardwareAttestation = errors.New("spotmarket: hardware attestation quote not verified")
 )
+
+// AttestationVerifier validates a provider's hardware TEE / confidential-compute
+// attestation claim (e.g. NVIDIA CC, Intel TDX, AMD SEV-SNP quote). Returning
+// nil certifies that the offer's AttestationQuoteHash was externally verified.
+// When nil (unconfigured), hardware attestation verification fails closed.
+type AttestationVerifier func(offer Offer) error
 
 // GPUHardwareSpec describes a provider's offered GPU hardware capabilities.
 type GPUHardwareSpec struct {
@@ -196,6 +206,7 @@ const (
 	LeasePartialCompleted   LeaseStatus = "partial_completed"
 	LeaseSlashedNonDelivery LeaseStatus = "slashed_non_delivery"
 	LeaseSlashedBaitSwitch  LeaseStatus = "slashed_bait_and_switch"
+	LeaseSlashedSLABreach   LeaseStatus = "slashed_sla_breach"
 	LeaseFailedOver         LeaseStatus = "failed_over"
 	LeaseExpired            LeaseStatus = "expired"
 )
@@ -215,9 +226,12 @@ type Lease struct {
 	EscrowLockedMicroUSD      int64       `json:"escrowLockedMicroUsd"`
 	ProviderBondMicroUSD      int64       `json:"providerBondMicroUsd"`
 	SlashBPSOnBreach          int         `json:"slashBpsOnBreach"`
+	TargetTTFTMs              int64       `json:"targetTtftMs,omitempty"`
+	MinThroughputTokPerSec    float64     `json:"minThroughputTokPerSec,omitempty"`
 	StartedAtUnix             int64       `json:"startedAtUnix"`
 	SettledAtUnix             int64       `json:"settledAtUnix,omitempty"`
 	FailoverFromLeaseID       string      `json:"failoverFromLeaseId,omitempty"`
+	FailoverToLeaseID         string      `json:"failoverToLeaseId,omitempty"`
 }
 
 // DeliveryReport records measured execution telemetry and token delivery for a
@@ -318,14 +332,19 @@ type LedgerSnapshot struct {
 // allowing any user or operator to verify, migrate, or fork the entire market
 // with zero dependency on Hanzo infrastructure.
 type MarketExportBundle struct {
-	ProtocolVersion   string              `json:"protocolVersion"`
-	ExportedAtUnix    int64               `json:"exportedAtUnix"`
-	ExporterPubKeyHex string              `json:"exporterPubKeyHex"`
-	Gossip            GossipSnapshot      `json:"gossip"`
-	Ledger            LedgerSnapshot      `json:"ledger"`
-	Leases            []Lease             `json:"leases"`
-	Receipts          []SettlementReceipt `json:"receipts"`
-	CommitmentHex     string              `json:"commitmentHex"`
-	SignatureHex      string              `json:"signatureHex"`
-	VerificationClass VerificationClass   `json:"verificationClass"`
+	ProtocolVersion             string              `json:"protocolVersion"`
+	ExportedAtUnix              int64               `json:"exportedAtUnix"`
+	ExporterPubKeyHex           string              `json:"exporterPubKeyHex"`
+	Gossip                      GossipSnapshot      `json:"gossip"`
+	Ledger                      LedgerSnapshot      `json:"ledger"`
+	ProviderKeys                map[string]string   `json:"providerKeys,omitempty"`
+	VerifiedAttestationOfferIDs []string            `json:"verifiedAttestationOfferIds,omitempty"`
+	Orders                      []Order             `json:"orders,omitempty"`
+	ClearedOrderIDs             []string            `json:"clearedOrderIds,omitempty"`
+	PendingBids                 []SignedBid         `json:"pendingBids,omitempty"`
+	Leases                      []Lease             `json:"leases"`
+	Receipts                    []SettlementReceipt `json:"receipts"`
+	CommitmentHex               string              `json:"commitmentHex"`
+	SignatureHex                string              `json:"signatureHex"`
+	VerificationClass           VerificationClass   `json:"verificationClass"`
 }

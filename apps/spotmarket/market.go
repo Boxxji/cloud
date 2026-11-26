@@ -5,9 +5,14 @@ package spotmarket
 import (
 	"encoding/hex"
 	"fmt"
+	"math"
+	"math/bits"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/luxfi/crypto/secp256k1"
 )
 
 // Config controls verification, collateral slashing, anti-Sybil limits, and
@@ -42,6 +47,12 @@ type Config struct {
 	// Hanzo-operated infrastructure unreachable. The protocol never calls Hanzo
 	// infrastructure in either mode (HanzoCalls == 0).
 	HanzoControlPlaneDisabled bool
+
+	// AttestationVerifier optionally verifies hardware TEE / confidential-compute
+	// quotes attached to Offers claiming VerificationHardwareAttestation.
+	// When nil, hardware attestation claims fail closed and never satisfy
+	// Order.RequireHardwareAttested.
+	AttestationVerifier AttestationVerifier
 }
 
 // DefaultConfig returns production-safe fail-closed defaults for the open spot market.
@@ -57,16 +68,111 @@ func DefaultConfig() Config {
 	}
 }
 
+// mulDivCeilChecked computes ceil(a * b / denom) for non-negative int64 inputs
+// using exact 128-bit unsigned arithmetic and fails with ErrArithmeticOverflow
+// whenever the result exceeds math.MaxInt64.
+func mulDivCeilChecked(a, b, denom int64) (int64, error) {
+	if denom <= 0 {
+		return 0, ErrArithmeticOverflow
+	}
+	if a < 0 || b < 0 {
+		return 0, ErrArithmeticOverflow
+	}
+	if a == 0 || b == 0 {
+		return 0, nil
+	}
+	hi, lo := bits.Mul64(uint64(a), uint64(b))
+	lo, carry := bits.Add64(lo, uint64(denom-1), 0)
+	hi += carry
+	if hi >= uint64(denom) {
+		return 0, ErrArithmeticOverflow
+	}
+	q, _ := bits.Div64(hi, lo, uint64(denom))
+	if q > uint64(math.MaxInt64) {
+		return 0, ErrArithmeticOverflow
+	}
+	return int64(q), nil
+}
+
+// mulDivFloorChecked computes floor(a * b / denom) for non-negative int64 inputs
+// using exact 128-bit unsigned arithmetic and fails with ErrArithmeticOverflow
+// whenever the result exceeds math.MaxInt64.
+func mulDivFloorChecked(a, b, denom int64) (int64, error) {
+	if denom <= 0 {
+		return 0, ErrArithmeticOverflow
+	}
+	if a < 0 || b < 0 {
+		return 0, ErrArithmeticOverflow
+	}
+	if a == 0 || b == 0 {
+		return 0, nil
+	}
+	hi, lo := bits.Mul64(uint64(a), uint64(b))
+	if hi >= uint64(denom) {
+		return 0, ErrArithmeticOverflow
+	}
+	q, _ := bits.Div64(hi, lo, uint64(denom))
+	if q > uint64(math.MaxInt64) {
+		return 0, ErrArithmeticOverflow
+	}
+	return int64(q), nil
+}
+
+func addInt64Checked(a, b int64) (int64, error) {
+	if b > 0 && a > math.MaxInt64-b {
+		return 0, ErrArithmeticOverflow
+	}
+	if b < 0 && a < math.MinInt64-b {
+		return 0, ErrArithmeticOverflow
+	}
+	return a + b, nil
+}
+
+// ComputeTokenCostMicroUSDChecked calculates the exact integer microdollar cost
+// for `tokens` billed at `microUSDPer1M` microdollars per 1,000,000 tokens using
+// exact 128-bit arithmetic, returning ErrArithmeticOverflow if the result cannot
+// be represented as a non-negative int64.
+func ComputeTokenCostMicroUSDChecked(tokens int64, microUSDPer1M int64) (int64, error) {
+	if tokens < 0 || microUSDPer1M < 0 {
+		return 0, ErrInvalidOrder
+	}
+	if tokens == 0 || microUSDPer1M == 0 {
+		return 0, nil
+	}
+	return mulDivCeilChecked(tokens, microUSDPer1M, 1_000_000)
+}
+
 // ComputeTokenCostMicroUSD calculates the exact integer microdollar cost for
-// `tokens` billed at `microUSDPer1M` microdollars per 1,000,000 tokens without
-// risking int64 overflow or floating-point rounding drift.
+// `tokens` billed at `microUSDPer1M` microdollars per 1,000,000 tokens. On
+// overflow it saturates to math.MaxInt64 (never wrapping negative). Financial
+// mutations MUST call ComputeTokenCostMicroUSDChecked and reject overflows.
 func ComputeTokenCostMicroUSD(tokens int64, microUSDPer1M int64) int64 {
 	if tokens <= 0 || microUSDPer1M <= 0 {
 		return 0
 	}
-	q := tokens / 1_000_000
-	r := tokens % 1_000_000
-	return q*microUSDPer1M + (r*microUSDPer1M+999_999)/1_000_000
+	cost, err := ComputeTokenCostMicroUSDChecked(tokens, microUSDPer1M)
+	if err != nil {
+		return math.MaxInt64
+	}
+	return cost
+}
+
+// ProviderIDFromPubKey derives a canonical self-certifying provider identity
+// directly from a compressed secp256k1 public key hex string.
+func ProviderIDFromPubKey(pubKeyHex string) string {
+	return "pk:" + strings.ToLower(strings.TrimSpace(pubKeyHex))
+}
+
+func canonicalCompressedPubKeyHex(pubKeyHex string) (string, error) {
+	clean := strings.ToLower(strings.TrimSpace(pubKeyHex))
+	raw, err := hex.DecodeString(clean)
+	if err != nil || len(raw) != 33 {
+		return "", fmt.Errorf("%w: compressed secp256k1 pubkey must be 33 bytes", ErrInvalidSignature)
+	}
+	if _, err := secp256k1.ToPublicKey(raw); err != nil {
+		return "", fmt.Errorf("%w: invalid secp256k1 pubkey: %v", ErrInvalidSignature, err)
+	}
+	return clean, nil
 }
 
 // Market is a self-contained, thread-safe reverse-auction GPU spot market,
@@ -76,18 +182,20 @@ type Market struct {
 	cfg Config
 
 	// Offers, orders, bids, leases, and receipts
-	offers          map[string]SignedOffer
-	orders          map[string]Order
-	orderCleared    map[string]bool
-	bidsByOrder     map[string][]SignedBid
-	bidByID         map[string]SignedBid
-	leases          map[string]*Lease
-	receipts        map[string]SettlementReceipt
-	receiptOrder    []string
-	leaseOrder      []string
-	telemetry       map[string]ProviderTelemetry
-	peers           map[string]PeerNode
-	activeSlotsUsed map[string]int
+	offers               map[string]SignedOffer
+	orders               map[string]Order
+	orderCleared         map[string]bool
+	bidsByOrder          map[string][]SignedBid
+	bidByID              map[string]SignedBid
+	leases               map[string]*Lease
+	receipts             map[string]SettlementReceipt
+	receiptOrder         []string
+	leaseOrder           []string
+	telemetry            map[string]ProviderTelemetry
+	peers                map[string]PeerNode
+	activeSlotsUsed      map[string]int
+	providerKeys         map[string]string
+	verifiedAttestations map[string]bool
 
 	// Anti-replay & anti-Sybil tracking
 	usedOfferNonces map[string]map[uint64]struct{}
@@ -118,24 +226,26 @@ func NewMarket(cfg Config) *Market {
 		cfg.MinBondBPS = 0
 	}
 	return &Market{
-		cfg:                 cfg,
-		offers:              make(map[string]SignedOffer),
-		orders:              make(map[string]Order),
-		orderCleared:        make(map[string]bool),
-		bidsByOrder:         make(map[string][]SignedBid),
-		bidByID:             make(map[string]SignedBid),
-		leases:              make(map[string]*Lease),
-		receipts:            make(map[string]SettlementReceipt),
-		telemetry:           make(map[string]ProviderTelemetry),
-		peers:               make(map[string]PeerNode),
-		activeSlotsUsed:     make(map[string]int),
-		usedOfferNonces:     make(map[string]map[uint64]struct{}),
-		usedBidNonces:       make(map[string]map[uint64]struct{}),
-		orderProvBids:       make(map[string]map[string]int),
-		buyerBalances:       make(map[string]int64),
-		buyerEscrow:         make(map[string]int64),
-		providerBalances:    make(map[string]int64),
-		providerLockedBonds: make(map[string]int64),
+		cfg:                  cfg,
+		offers:               make(map[string]SignedOffer),
+		orders:               make(map[string]Order),
+		orderCleared:         make(map[string]bool),
+		bidsByOrder:          make(map[string][]SignedBid),
+		bidByID:              make(map[string]SignedBid),
+		leases:               make(map[string]*Lease),
+		receipts:             make(map[string]SettlementReceipt),
+		telemetry:            make(map[string]ProviderTelemetry),
+		peers:                make(map[string]PeerNode),
+		activeSlotsUsed:      make(map[string]int),
+		providerKeys:         make(map[string]string),
+		verifiedAttestations: make(map[string]bool),
+		usedOfferNonces:      make(map[string]map[uint64]struct{}),
+		usedBidNonces:        make(map[string]map[uint64]struct{}),
+		orderProvBids:        make(map[string]map[string]int),
+		buyerBalances:        make(map[string]int64),
+		buyerEscrow:          make(map[string]int64),
+		providerBalances:     make(map[string]int64),
+		providerLockedBonds:  make(map[string]int64),
 	}
 }
 
@@ -164,6 +274,62 @@ func (m *Market) TotalVerificationCostMicroUSD() int64 {
 	return m.sigVerifications.Load() * m.cfg.VerificationCostPerSigMicroUSD
 }
 
+// BindProviderKey binds a provider ledger identity to its authorized 33-byte
+// compressed secp256k1 public key. Once bound, offers and bids naming providerID
+// MUST be signed by this key (fail closed). Calling BindProviderKey again with
+// the same key is idempotent; attempting to rebind to a different key fails
+// with ErrUnauthorizedProviderKey.
+func (m *Market) BindProviderKey(providerID, pubKeyHex string) error {
+	if strings.TrimSpace(providerID) == "" {
+		return ErrInvalidOffer
+	}
+	canon, err := canonicalCompressedPubKeyHex(pubKeyHex)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, ok := m.providerKeys[providerID]; ok {
+		if existing != canon {
+			return fmt.Errorf("%w: provider %s already bound to a different key", ErrUnauthorizedProviderKey, providerID)
+		}
+		return nil
+	}
+	m.providerKeys[providerID] = canon
+	return nil
+}
+
+// ProviderPubKey returns the authorized compressed secp256k1 public key hex
+// bound to providerID, if any.
+func (m *Market) ProviderPubKey(providerID string) (string, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	k, ok := m.providerKeys[providerID]
+	return k, ok
+}
+
+// verifyProviderKeyLocked checks that pubKeyHex is authorized to act for
+// providerID. Self-certifying key-derived provider IDs (equal to pubKeyHex or
+// ProviderIDFromPubKey(pubKeyHex)) are automatically bound on first verified
+// use; any other providerID MUST already be explicitly bound via BindProviderKey.
+func (m *Market) verifyProviderKeyLocked(providerID, pubKeyHex string) error {
+	canon, err := canonicalCompressedPubKeyHex(pubKeyHex)
+	if err != nil {
+		return err
+	}
+	if bound, ok := m.providerKeys[providerID]; ok {
+		if bound != canon {
+			return fmt.Errorf("%w: key does not match bound provider %s", ErrUnauthorizedProviderKey, providerID)
+		}
+		return nil
+	}
+	if strings.EqualFold(providerID, canon) || providerID == ProviderIDFromPubKey(canon) {
+		m.providerKeys[providerID] = canon
+		return nil
+	}
+	return fmt.Errorf("%w: provider %s has no bound signing key", ErrUnauthorizedProviderKey, providerID)
+}
+
 // DepositBuyer credits a buyer's integer microdollar ledger balance.
 func (m *Market) DepositBuyer(buyerID string, microUSD int64) error {
 	if buyerID == "" || microUSD <= 0 {
@@ -171,8 +337,16 @@ func (m *Market) DepositBuyer(buyerID string, microUSD int64) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.buyerBalances[buyerID] += microUSD
-	m.totalDepositedMicroUSD += microUSD
+	nextBal, err := addInt64Checked(m.buyerBalances[buyerID], microUSD)
+	if err != nil {
+		return err
+	}
+	nextTotal, err := addInt64Checked(m.totalDepositedMicroUSD, microUSD)
+	if err != nil {
+		return err
+	}
+	m.buyerBalances[buyerID] = nextBal
+	m.totalDepositedMicroUSD = nextTotal
 	return nil
 }
 
@@ -183,8 +357,45 @@ func (m *Market) DepositProvider(providerID string, microUSD int64) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.providerBalances[providerID] += microUSD
-	m.totalDepositedMicroUSD += microUSD
+	nextBal, err := addInt64Checked(m.providerBalances[providerID], microUSD)
+	if err != nil {
+		return err
+	}
+	nextTotal, err := addInt64Checked(m.totalDepositedMicroUSD, microUSD)
+	if err != nil {
+		return err
+	}
+	m.providerBalances[providerID] = nextBal
+	m.totalDepositedMicroUSD = nextTotal
+	return nil
+}
+
+// DepositProviderWithKey atomically binds providerID to pubKeyHex and credits
+// microUSD to the provider's collateral balance.
+func (m *Market) DepositProviderWithKey(providerID, pubKeyHex string, microUSD int64) error {
+	if strings.TrimSpace(providerID) == "" || microUSD <= 0 {
+		return ErrInsufficientBalance
+	}
+	canon, err := canonicalCompressedPubKeyHex(pubKeyHex)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, ok := m.providerKeys[providerID]; ok && existing != canon {
+		return fmt.Errorf("%w: provider %s already bound to a different key", ErrUnauthorizedProviderKey, providerID)
+	}
+	nextBal, err := addInt64Checked(m.providerBalances[providerID], microUSD)
+	if err != nil {
+		return err
+	}
+	nextTotal, err := addInt64Checked(m.totalDepositedMicroUSD, microUSD)
+	if err != nil {
+		return err
+	}
+	m.providerKeys[providerID] = canon
+	m.providerBalances[providerID] = nextBal
+	m.totalDepositedMicroUSD = nextTotal
 	return nil
 }
 
@@ -281,10 +492,28 @@ func (m *Market) RegisterOffer(so SignedOffer, nowUnix int64) error {
 		}
 	}
 
+	// Evaluate hardware attestation strictly through a configured trusted
+	// AttestationVerifier; never trust a provider's self-signed claim alone.
+	attestVerified := false
+	if o.AttestationClass == VerificationHardwareAttestation &&
+		strings.TrimSpace(o.AttestationQuoteHash) != "" &&
+		m.cfg.AttestationVerifier != nil {
+		if err := m.cfg.AttestationVerifier(o); err == nil {
+			attestVerified = true
+		}
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if _, dup := m.offers[o.OfferID]; dup {
+		return fmt.Errorf("%w: duplicate offer %s", ErrInvalidOffer, o.OfferID)
+	}
+
 	if m.cfg.VerifySignatures {
+		if err := m.verifyProviderKeyLocked(o.ProviderID, o.ProviderPubKeyHex); err != nil {
+			return err
+		}
 		if seen, ok := m.usedOfferNonces[o.ProviderPubKeyHex]; ok {
 			if _, dup := seen[o.Nonce]; dup {
 				return ErrReplayNonce
@@ -300,6 +529,11 @@ func (m *Market) RegisterOffer(so SignedOffer, nowUnix int64) error {
 	sort.Strings(models)
 	so.Offer.SupportedModels = models
 	m.offers[o.OfferID] = so
+	if attestVerified {
+		m.verifiedAttestations[o.OfferID] = true
+	} else {
+		delete(m.verifiedAttestations, o.OfferID)
+	}
 
 	if _, exists := m.telemetry[o.ProviderID]; !exists {
 		ttft := float64(o.SLO.TargetTTFTMs)
@@ -338,15 +572,32 @@ func (m *Market) SubmitOrder(order Order, nowUnix int64) error {
 	if order.OrderID == "" || order.BuyerID == "" || order.Model == "" || order.RequestedTokens <= 0 || order.MaxMicroUSDPer1MTokens <= 0 {
 		return ErrInvalidOrder
 	}
+	if order.EscrowMicroUSD < 0 {
+		return ErrInvalidOrder
+	}
 	if order.ExpiresAtUnix <= nowUnix {
 		return ErrExpiredOrder
 	}
-	minEscrow := ComputeTokenCostMicroUSD(order.RequestedTokens, order.MaxMicroUSDPer1MTokens)
+	minEscrow, err := ComputeTokenCostMicroUSDChecked(order.RequestedTokens, order.MaxMicroUSDPer1MTokens)
+	if err != nil {
+		return err
+	}
 	if order.EscrowMicroUSD == 0 {
 		order.EscrowMicroUSD = minEscrow
 	}
 	if order.EscrowMicroUSD < minEscrow {
 		return fmt.Errorf("%w: escrow %d < required ceiling %d", ErrInsufficientBalance, order.EscrowMicroUSD, minEscrow)
+	}
+
+	// Copy slices for immutability.
+	if len(order.AllowedRegions) > 0 {
+		order.AllowedRegions = append([]string(nil), order.AllowedRegions...)
+	}
+	if len(order.AllowedJurisdictions) > 0 {
+		order.AllowedJurisdictions = append([]string(nil), order.AllowedJurisdictions...)
+	}
+	if len(order.BlockedJurisdictions) > 0 {
+		order.BlockedJurisdictions = append([]string(nil), order.BlockedJurisdictions...)
 	}
 
 	m.mu.Lock()
@@ -357,19 +608,24 @@ func (m *Market) SubmitOrder(order Order, nowUnix int64) error {
 	if m.buyerBalances[order.BuyerID] < order.EscrowMicroUSD {
 		return fmt.Errorf("%w: buyer %s balance %d < escrow %d", ErrInsufficientBalance, order.BuyerID, m.buyerBalances[order.BuyerID], order.EscrowMicroUSD)
 	}
+	nextEscrow, err := addInt64Checked(m.buyerEscrow[order.BuyerID], order.EscrowMicroUSD)
+	if err != nil {
+		return err
+	}
 	m.buyerBalances[order.BuyerID] -= order.EscrowMicroUSD
-	m.buyerEscrow[order.BuyerID] += order.EscrowMicroUSD
+	m.buyerEscrow[order.BuyerID] = nextEscrow
 	m.orders[order.OrderID] = order
 	m.orderProvBids[order.OrderID] = make(map[string]int)
 	return nil
 }
 
 // SubmitBid verifies and accepts a provider's reverse-auction SignedBid against
-// an open Order, enforcing signature validity, expiry, replay protection,
-// anti-Sybil bid limits, real capacity bounds, and provider collateral bonding.
+// an open Order, enforcing signature validity, authorized key binding, expiry,
+// replay protection, anti-Sybil bid limits, real capacity bounds, and provider
+// collateral bonding.
 func (m *Market) SubmitBid(sb SignedBid, nowUnix int64) error {
 	b := sb.Bid
-	if b.BidID == "" || b.OrderID == "" || b.OfferID == "" || b.ProviderID == "" || b.OfferedTokens <= 0 || b.BidMicroUSDPer1MTokens <= 0 {
+	if b.BidID == "" || b.OrderID == "" || b.OfferID == "" || b.ProviderID == "" || b.OfferedTokens <= 0 || b.BidMicroUSDPer1MTokens <= 0 || b.BondMicroUSD < 0 {
 		return ErrInvalidBid
 	}
 	if b.ExpiresAtUnix <= nowUnix {
@@ -410,8 +666,13 @@ func (m *Market) SubmitBid(sb SignedBid, nowUnix int64) error {
 	if offer.Offer.ProviderID != b.ProviderID {
 		return fmt.Errorf("%w: bid provider does not match offer provider", ErrInvalidBid)
 	}
-	if m.cfg.VerifySignatures && offer.Offer.ProviderPubKeyHex != b.ProviderPubKeyHex {
-		return fmt.Errorf("%w: bid pubkey does not match offer pubkey", ErrInvalidSignature)
+	if m.cfg.VerifySignatures {
+		if err := m.verifyProviderKeyLocked(b.ProviderID, b.ProviderPubKeyHex); err != nil {
+			return err
+		}
+		if !strings.EqualFold(offer.Offer.ProviderPubKeyHex, b.ProviderPubKeyHex) {
+			return fmt.Errorf("%w: bid pubkey does not match offer pubkey", ErrInvalidSignature)
+		}
 	}
 
 	// Anti-replay nonce check
@@ -440,14 +701,20 @@ func (m *Market) SubmitBid(sb SignedBid, nowUnix int64) error {
 		}
 	}
 
-	// Collateral bond lock
+	// Collateral bond lock (with checked arithmetic to prevent overflow)
 	if m.cfg.EnforceSlashing && m.cfg.MinBondBPS > 0 {
 		allocCap := b.OfferedTokens
 		if allocCap > order.RequestedTokens {
 			allocCap = order.RequestedTokens
 		}
-		bidVal := ComputeTokenCostMicroUSD(allocCap, b.BidMicroUSDPer1MTokens)
-		minBond := (bidVal*int64(m.cfg.MinBondBPS) + 9999) / 10000
+		bidVal, err := ComputeTokenCostMicroUSDChecked(allocCap, b.BidMicroUSDPer1MTokens)
+		if err != nil {
+			return err
+		}
+		minBond, err := mulDivCeilChecked(bidVal, int64(m.cfg.MinBondBPS), 10000)
+		if err != nil {
+			return err
+		}
 		if minBond < 1 {
 			minBond = 1
 		}
@@ -459,8 +726,12 @@ func (m *Market) SubmitBid(sb SignedBid, nowUnix int64) error {
 		if m.providerBalances[b.ProviderID] < b.BondMicroUSD {
 			return fmt.Errorf("%w: provider %s balance %d < bond %d", ErrInsufficientBalance, b.ProviderID, m.providerBalances[b.ProviderID], b.BondMicroUSD)
 		}
+		nextLocked, err := addInt64Checked(m.providerLockedBonds[b.ProviderID], b.BondMicroUSD)
+		if err != nil {
+			return err
+		}
 		m.providerBalances[b.ProviderID] -= b.BondMicroUSD
-		m.providerLockedBonds[b.ProviderID] += b.BondMicroUSD
+		m.providerLockedBonds[b.ProviderID] = nextLocked
 	}
 
 	if m.cfg.VerifySignatures {
@@ -495,12 +766,18 @@ func (m *Market) ClearOrder(orderID string, nowUnix int64) ([]Lease, []Rejection
 		if !exists {
 			continue
 		}
+		if m.cfg.VerifySignatures {
+			if err := m.verifyProviderKeyLocked(sb.Bid.ProviderID, sb.Bid.ProviderPubKeyHex); err != nil {
+				continue
+			}
+		}
 		freeSlots := offer.Offer.AvailableSlots - m.activeSlotsUsed[sb.Bid.ProviderID]
 		candidates = append(candidates, Candidate{
-			SignedBid:   sb,
-			SignedOffer: offer,
-			Telemetry:   m.telemetry[sb.Bid.ProviderID],
-			FreeSlots:   freeSlots,
+			SignedBid:                   sb,
+			SignedOffer:                 offer,
+			Telemetry:                   m.telemetry[sb.Bid.ProviderID],
+			FreeSlots:                   freeSlots,
+			HardwareAttestationVerified: m.verifiedAttestations[offer.Offer.OfferID],
 		})
 	}
 
@@ -539,8 +816,8 @@ func (m *Market) ClearOrder(orderID string, nowUnix int64) ([]Lease, []Rejection
 			continue
 		}
 
-		leaseCost := ComputeTokenCostMicroUSD(alloc, bid.BidMicroUSDPer1MTokens)
-		if leaseCost > remainingEscrow {
+		leaseCost, err := ComputeTokenCostMicroUSDChecked(alloc, bid.BidMicroUSDPer1MTokens)
+		if err != nil || leaseCost > remainingEscrow {
 			continue
 		}
 
@@ -550,6 +827,7 @@ func (m *Market) ClearOrder(orderID string, nowUnix int64) ([]Lease, []Rejection
 		if slashBPS <= 0 {
 			slashBPS = 5000
 		}
+		targetTTFT := effectiveLeaseTargetTTFT(offer.SLO.TargetTTFTMs, order.MaxTTFTMs)
 
 		lease := &Lease{
 			LeaseID:                   leaseID,
@@ -564,6 +842,8 @@ func (m *Market) ClearOrder(orderID string, nowUnix int64) ([]Lease, []Rejection
 			EscrowLockedMicroUSD:      leaseCost,
 			ProviderBondMicroUSD:      bid.BondMicroUSD,
 			SlashBPSOnBreach:          slashBPS,
+			TargetTTFTMs:              targetTTFT,
+			MinThroughputTokPerSec:    offer.SLO.MinThroughputTokPerSec,
 			StartedAtUnix:             nowUnix,
 		}
 		m.leases[leaseID] = lease
@@ -603,9 +883,35 @@ func (m *Market) ClearOrder(orderID string, nowUnix int64) ([]Lease, []Rejection
 	return awarded, rejections, nil
 }
 
+func effectiveLeaseTargetTTFT(offerTargetTTFTMs, orderMaxTTFTMs int64) int64 {
+	target := offerTargetTTFTMs
+	if orderMaxTTFTMs > 0 && (target <= 0 || orderMaxTTFTMs < target) {
+		target = orderMaxTTFTMs
+	}
+	return target
+}
+
+func computeSlashMicroUSD(bondMicroUSD int64, slashBPS int) int64 {
+	if bondMicroUSD <= 0 {
+		return 0
+	}
+	if slashBPS <= 0 {
+		slashBPS = 5000
+	}
+	if slashBPS > 10000 {
+		slashBPS = 10000
+	}
+	slashed, err := mulDivFloorChecked(bondMicroUSD, int64(slashBPS), 10000)
+	if err != nil || slashed > bondMicroUSD {
+		return bondMicroUSD
+	}
+	return slashed
+}
+
 // SettleLease settles an active Lease according to its DeliveryReport, enforces
-// agreed pricing and collateral slashing, updates measured Enso telemetry, and
-// emits a deterministic SettlementReceipt with exact zero microdollar drift.
+// agreed pricing, promised latency/throughput SLA commitments, and collateral
+// slashing, updates measured Enso telemetry, and emits a deterministic
+// SettlementReceipt with exact zero microdollar drift.
 func (m *Market) SettleLease(leaseID string, report DeliveryReport, nowUnix int64) (SettlementReceipt, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -642,6 +948,14 @@ func (m *Market) SettleLease(leaseID string, report DeliveryReport, nowUnix int6
 		verClass       VerificationClass
 	)
 
+	cappedTokenPayout := func(toks, rate int64) int64 {
+		cost, err := ComputeTokenCostMicroUSDChecked(toks, rate)
+		if err != nil || cost > lease.EscrowLockedMicroUSD {
+			return lease.EscrowLockedMicroUSD
+		}
+		return cost
+	}
+
 	if m.cfg.EnforceSlashing {
 		verClass = VerificationEconomicStake
 		if baitAndSwitch {
@@ -661,29 +975,29 @@ func (m *Market) SettleLease(leaseID string, report DeliveryReport, nowUnix int6
 			} else {
 				status = LeaseSlashedNonDelivery
 			}
-			providerPayout = ComputeTokenCostMicroUSD(delivered, lease.AgreedMicroUSDPer1MTokens)
-			if providerPayout > lease.EscrowLockedMicroUSD {
-				providerPayout = lease.EscrowLockedMicroUSD
-			}
+			providerPayout = cappedTokenPayout(delivered, lease.AgreedMicroUSDPer1MTokens)
 			buyerRefund = lease.EscrowLockedMicroUSD - providerPayout
-			slashBPS := lease.SlashBPSOnBreach
-			if slashBPS <= 0 {
-				slashBPS = 5000
-			}
-			if slashBPS > 10000 {
-				slashBPS = 10000
-			}
-			slashedBond = (lease.ProviderBondMicroUSD * int64(slashBPS)) / 10000
+			slashedBond = computeSlashMicroUSD(lease.ProviderBondMicroUSD, lease.SlashBPSOnBreach)
 			bondReturned = lease.ProviderBondMicroUSD - slashedBond
 		} else {
-			status = LeaseCompleted
-			providerPayout = ComputeTokenCostMicroUSD(delivered, lease.AgreedMicroUSDPer1MTokens)
-			if providerPayout > lease.EscrowLockedMicroUSD {
-				providerPayout = lease.EscrowLockedMicroUSD
-			}
+			// Evaluate snapshotted latency & throughput SLA commitments even when
+			// all allocated tokens were delivered with Completed=true.
+			ttftBreach := lease.TargetTTFTMs > 0 &&
+				(report.ObservedTTFTMs <= 0 || report.ObservedTTFTMs > float64(lease.TargetTTFTMs))
+			throughputBreach := lease.MinThroughputTokPerSec > 0 &&
+				report.ObservedTokPerSec < lease.MinThroughputTokPerSec
+
+			providerPayout = cappedTokenPayout(delivered, lease.AgreedMicroUSDPer1MTokens)
 			buyerRefund = lease.EscrowLockedMicroUSD - providerPayout
-			slashedBond = 0
-			bondReturned = lease.ProviderBondMicroUSD
+			if ttftBreach || throughputBreach {
+				status = LeaseSlashedSLABreach
+				slashedBond = computeSlashMicroUSD(lease.ProviderBondMicroUSD, lease.SlashBPSOnBreach)
+				bondReturned = lease.ProviderBondMicroUSD - slashedBond
+			} else {
+				status = LeaseCompleted
+				slashedBond = 0
+				bondReturned = lease.ProviderBondMicroUSD
+			}
 		}
 	} else {
 		// Negative-control unverified mode (slashing & price-enforcement disabled):
@@ -705,10 +1019,7 @@ func (m *Market) SettleLease(leaseID string, report DeliveryReport, nowUnix int6
 			buyerRefund = lease.EscrowLockedMicroUSD - providerPayout
 		} else {
 			status = LeaseCompleted
-			providerPayout = ComputeTokenCostMicroUSD(delivered, billedRate)
-			if providerPayout > lease.EscrowLockedMicroUSD {
-				providerPayout = lease.EscrowLockedMicroUSD
-			}
+			providerPayout = cappedTokenPayout(delivered, billedRate)
 			buyerRefund = lease.EscrowLockedMicroUSD - providerPayout
 		}
 		slashedBond = 0
@@ -766,8 +1077,10 @@ func (m *Market) SettleLease(leaseID string, report DeliveryReport, nowUnix int6
 	return rec, nil
 }
 
-// FailoverLease re-allocates undelivered tokens from a failed or slashed lease
-// onto the highest-ranked healthy alternative provider using Enso selection.
+// FailoverLease re-allocates undelivered tokens from a settled, unrecovered
+// failed or slashed lease onto the highest-ranked healthy alternative provider
+// using Enso selection. Active, completed, expired, and already-recovered
+// leases are rejected fail-closed.
 func (m *Market) FailoverLease(failedLeaseID string, nowUnix int64) (*Lease, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -776,13 +1089,36 @@ func (m *Market) FailoverLease(failedLeaseID string, nowUnix int64) (*Lease, err
 	if !ok {
 		return nil, fmt.Errorf("%w: lease %s", ErrNotFound, failedLeaseID)
 	}
+	if failed.FailoverToLeaseID != "" || failed.Status == LeaseFailedOver {
+		return nil, fmt.Errorf("%w: lease %s already failed over to %s", ErrLeaseNotEligibleForFailover, failedLeaseID, failed.FailoverToLeaseID)
+	}
+	switch failed.Status {
+	case LeasePartialCompleted, LeaseSlashedNonDelivery, LeaseSlashedBaitSwitch, LeaseSlashedSLABreach:
+		// Settled failure/partial state eligible for failover recovery.
+	default:
+		return nil, fmt.Errorf("%w: lease %s status=%s", ErrLeaseNotEligibleForFailover, failedLeaseID, failed.Status)
+	}
+
 	remainingTokens := failed.AllocatedTokens - failed.DeliveredTokens
 	if remainingTokens <= 0 {
-		return nil, fmt.Errorf("spotmarket: lease %s has no undelivered tokens", failedLeaseID)
+		return nil, fmt.Errorf("%w: lease %s has no undelivered tokens", ErrLeaseNotEligibleForFailover, failedLeaseID)
 	}
 	origOrder, ok := m.orders[failed.OrderID]
 	if !ok {
 		return nil, fmt.Errorf("%w: order %s", ErrNotFound, failed.OrderID)
+	}
+
+	// Exclude the failed provider and any ancestor failed providers in this chain.
+	excludedProviders := map[string]bool{failed.ProviderID: true}
+	seenLeases := map[string]bool{failed.LeaseID: true}
+	for prevID := failed.FailoverFromLeaseID; prevID != "" && !seenLeases[prevID]; {
+		seenLeases[prevID] = true
+		prev, exists := m.leases[prevID]
+		if !exists {
+			break
+		}
+		excludedProviders[prev.ProviderID] = true
+		prevID = prev.FailoverFromLeaseID
 	}
 
 	failoverOrder := origOrder
@@ -793,7 +1129,7 @@ func (m *Market) FailoverLease(failedLeaseID string, nowUnix int64) (*Lease, err
 	candidates := make([]Candidate, 0, len(m.offers))
 	for _, so := range m.offers {
 		o := so.Offer
-		if o.ProviderID == failed.ProviderID {
+		if excludedProviders[o.ProviderID] {
 			continue
 		}
 		if o.ExpiresAtUnix <= nowUnix {
@@ -802,6 +1138,11 @@ func (m *Market) FailoverLease(failedLeaseID string, nowUnix int64) (*Lease, err
 		freeSlots := o.AvailableSlots - m.activeSlotsUsed[o.ProviderID]
 		if freeSlots <= 0 {
 			continue
+		}
+		if m.cfg.VerifySignatures {
+			if err := m.verifyProviderKeyLocked(o.ProviderID, o.ProviderPubKeyHex); err != nil {
+				continue
+			}
 		}
 		// Spot failover uses the provider's already-signed list offer price.
 		synthBid := SignedBid{
@@ -822,10 +1163,11 @@ func (m *Market) FailoverLease(failedLeaseID string, nowUnix int64) (*Lease, err
 			VerificationClass: VerificationCryptoSignature,
 		}
 		candidates = append(candidates, Candidate{
-			SignedBid:   synthBid,
-			SignedOffer: so,
-			Telemetry:   m.telemetry[o.ProviderID],
-			FreeSlots:   freeSlots,
+			SignedBid:                   synthBid,
+			SignedOffer:                 so,
+			Telemetry:                   m.telemetry[o.ProviderID],
+			FreeSlots:                   freeSlots,
+			HardwareAttestationVerified: m.verifiedAttestations[o.OfferID],
 		})
 	}
 
@@ -844,27 +1186,43 @@ func (m *Market) FailoverLease(failedLeaseID string, nowUnix int64) (*Lease, err
 	ranked, _ := RankCandidates(failoverOrder, verifiedCandidates, nowUnix, false)
 	for _, rc := range ranked {
 		offer := rc.Candidate.SignedOffer.Offer
-		cost := ComputeTokenCostMicroUSD(remainingTokens, offer.Pricing.MicroUSDPer1MTokens)
+		cost, err := ComputeTokenCostMicroUSDChecked(remainingTokens, offer.Pricing.MicroUSDPer1MTokens)
+		if err != nil {
+			continue
+		}
 		if m.buyerBalances[origOrder.BuyerID] < cost {
 			continue
 		}
+		nextEscrow, err := addInt64Checked(m.buyerEscrow[origOrder.BuyerID], cost)
+		if err != nil {
+			continue
+		}
+
 		bond := int64(0)
+		var nextLocked int64
 		if m.cfg.EnforceSlashing && m.cfg.MinBondBPS > 0 {
-			bond = (cost*int64(m.cfg.MinBondBPS) + 9999) / 10000
+			bond, err = mulDivCeilChecked(cost, int64(m.cfg.MinBondBPS), 10000)
+			if err != nil {
+				continue
+			}
 			if bond < 1 {
 				bond = 1
 			}
 			if m.providerBalances[offer.ProviderID] < bond {
 				continue
 			}
+			nextLocked, err = addInt64Checked(m.providerLockedBonds[offer.ProviderID], bond)
+			if err != nil {
+				continue
+			}
 		}
 
 		// Lock buyer escrow & provider bond conserving total balance.
 		m.buyerBalances[origOrder.BuyerID] -= cost
-		m.buyerEscrow[origOrder.BuyerID] += cost
+		m.buyerEscrow[origOrder.BuyerID] = nextEscrow
 		if bond > 0 {
 			m.providerBalances[offer.ProviderID] -= bond
-			m.providerLockedBonds[offer.ProviderID] += bond
+			m.providerLockedBonds[offer.ProviderID] = nextLocked
 		}
 
 		m.leaseSeq++
@@ -873,6 +1231,7 @@ func (m *Market) FailoverLease(failedLeaseID string, nowUnix int64) (*Lease, err
 		if slashBPS <= 0 {
 			slashBPS = 5000
 		}
+		targetTTFT := effectiveLeaseTargetTTFT(offer.SLO.TargetTTFTMs, origOrder.MaxTTFTMs)
 		newLease := &Lease{
 			LeaseID:                   newLeaseID,
 			OrderID:                   origOrder.OrderID,
@@ -886,6 +1245,8 @@ func (m *Market) FailoverLease(failedLeaseID string, nowUnix int64) (*Lease, err
 			EscrowLockedMicroUSD:      cost,
 			ProviderBondMicroUSD:      bond,
 			SlashBPSOnBreach:          slashBPS,
+			TargetTTFTMs:              targetTTFT,
+			MinThroughputTokPerSec:    offer.SLO.MinThroughputTokPerSec,
 			StartedAtUnix:             nowUnix,
 			FailoverFromLeaseID:       failedLeaseID,
 		}
@@ -894,6 +1255,7 @@ func (m *Market) FailoverLease(failedLeaseID string, nowUnix int64) (*Lease, err
 		m.activeSlotsUsed[offer.ProviderID]++
 
 		failed.Status = LeaseFailedOver
+		failed.FailoverToLeaseID = newLeaseID
 		cp := *newLease
 		return &cp, nil
 	}
@@ -909,6 +1271,7 @@ func (m *Market) ExpireStale(nowUnix int64) int {
 	for id, so := range m.offers {
 		if so.Offer.ExpiresAtUnix <= nowUnix {
 			delete(m.offers, id)
+			delete(m.verifiedAttestations, id)
 			expired++
 		}
 	}
@@ -930,6 +1293,26 @@ func (m *Market) ExpireStale(nowUnix int64) int {
 		expired++
 	}
 	return expired
+}
+
+// Order returns a copy of an order by ID.
+func (m *Market) Order(orderID string) (Order, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	ord, ok := m.orders[orderID]
+	if !ok {
+		return Order{}, false
+	}
+	if len(ord.AllowedRegions) > 0 {
+		ord.AllowedRegions = append([]string(nil), ord.AllowedRegions...)
+	}
+	if len(ord.AllowedJurisdictions) > 0 {
+		ord.AllowedJurisdictions = append([]string(nil), ord.AllowedJurisdictions...)
+	}
+	if len(ord.BlockedJurisdictions) > 0 {
+		ord.BlockedJurisdictions = append([]string(nil), ord.BlockedJurisdictions...)
+	}
+	return ord, true
 }
 
 // Telemetry returns a copy of a provider's measured telemetry.
@@ -993,18 +1376,15 @@ func (m *Market) updateTelemetryLocked(providerID string, report DeliveryReport,
 	switch status {
 	case LeaseCompleted:
 		t.CompletedJobs++
-	case LeaseSlashedBaitSwitch:
+	case LeaseSlashedBaitSwitch, LeaseSlashedNonDelivery, LeaseSlashedSLABreach:
 		t.FailedJobs++
 		t.SlashedJobs++
 	default:
 		t.FailedJobs++
-		if status == LeaseSlashedNonDelivery {
-			t.SlashedJobs++
-		}
 	}
 
-	// Laplace-smoothed reliability with 4x slash penalty so bait-and-switch or
-	// chronically crashing providers are rapidly demoted by Enso.
+	// Laplace-smoothed reliability with 4x slash penalty so bait-and-switch,
+	// SLA-breaching, or chronically crashing providers are rapidly demoted by Enso.
 	const priorSuccess = 9.0
 	const priorTotal = 10.0
 	num := priorSuccess + float64(t.CompletedJobs)

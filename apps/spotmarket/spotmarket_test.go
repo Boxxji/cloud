@@ -4,6 +4,7 @@ package spotmarket
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -161,8 +162,15 @@ func TestReverseAuctionPartialFillSlashingFailoverAndConservation(t *testing.T) 
 	kp1, _ := DeriveKeyPair("p", 99, 1)
 	kp2, _ := DeriveKeyPair("p", 99, 2)
 	kp3, _ := DeriveKeyPair("p", 99, 3)
-	for _, pid := range []string{"prov-1", "prov-2", "prov-3"} {
-		if err := m.DepositProvider(pid, 2_000_000); err != nil {
+	for _, entry := range []struct {
+		id string
+		kp *KeyPair
+	}{
+		{"prov-1", kp1},
+		{"prov-2", kp2},
+		{"prov-3", kp3},
+	} {
+		if err := m.DepositProviderWithKey(entry.id, entry.kp.PubKeyHex, 2_000_000); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -230,10 +238,10 @@ func TestReverseAuctionPartialFillSlashingFailoverAndConservation(t *testing.T) 
 		t.Fatalf("partial fill sum mismatch: %d + %d", leases[0].AllocatedTokens, leases[1].AllocatedTokens)
 	}
 
-	// Lease 0 completes honestly
+	// Lease 0 completes honestly within promised SLA
 	rcpt0, err := m.SettleLease(leases[0].LeaseID, DeliveryReport{
 		LeaseID: leases[0].LeaseID, DeliveredTokens: leases[0].AllocatedTokens,
-		ObservedTTFTMs: 85, ObservedLatencyMs: 390, ObservedTokPerSec: 122, Completed: true,
+		ObservedTTFTMs: 85, ObservedLatencyMs: computeGenerationLatencyMs(85, leases[0].AllocatedTokens, 122), ObservedTokPerSec: 122, Completed: true,
 	}, now+10)
 	if err != nil {
 		t.Fatalf("SettleLease 0: %v", err)
@@ -262,11 +270,15 @@ func TestReverseAuctionPartialFillSlashingFailoverAndConservation(t *testing.T) 
 	if foLease.ProviderID == leases[1].ProviderID || foLease.ProviderID != "prov-1" || foLease.AllocatedTokens != leases[1].AllocatedTokens {
 		t.Fatalf("unexpected failover lease: %+v", foLease)
 	}
-	if _, err := m.SettleLease(foLease.LeaseID, DeliveryReport{
+	foRcpt, err := m.SettleLease(foLease.LeaseID, DeliveryReport{
 		LeaseID: foLease.LeaseID, DeliveredTokens: foLease.AllocatedTokens,
-		ObservedTTFTMs: 92, ObservedLatencyMs: 410, ObservedTokPerSec: 118, Completed: true,
-	}, now+20); err != nil {
+		ObservedTTFTMs: 88, ObservedLatencyMs: computeGenerationLatencyMs(88, foLease.AllocatedTokens, 121), ObservedTokPerSec: 121, Completed: true,
+	}, now+20)
+	if err != nil {
 		t.Fatalf("SettleLease failover: %v", err)
+	}
+	if foRcpt.Status != LeaseCompleted || foRcpt.SlashedBondMicroUSD != 0 {
+		t.Fatalf("unexpected failover receipt: %+v", foRcpt)
 	}
 
 	if err := m.CheckConservation(); err != nil {
@@ -280,11 +292,11 @@ func TestReverseAuctionPartialFillSlashingFailoverAndConservation(t *testing.T) 
 func TestSovereigntyExportVerifyForkAndTamperDetection(t *testing.T) {
 	now := int64(1760000000)
 	m := NewMarket(DefaultConfig())
-	_ = m.DepositBuyer("buyer-sov", 5_000_000)
-	_ = m.DepositProvider("prov-sov", 2_000_000)
-
 	kpProv, _ := DeriveKeyPair("sov-prov", 55, 1)
 	kpExp, _ := DeriveKeyPair("sov-exp", 55, 2)
+	_ = m.DepositBuyer("buyer-sov", 5_000_000)
+	_ = m.DepositProviderWithKey("prov-sov", kpProv.PubKeyHex, 2_000_000)
+
 	_ = m.RegisterPeer(PeerNode{PeerID: "peer-1", Endpoint: "https://peer1.example", PubKeyHex: kpProv.PubKeyHex, Regions: []string{"eu-central"}, LastSeenUnix: now, OperatorClass: "independent"})
 	off := testOffer(t, kpProv, "offer-sov", "prov-sov", "independent", 400_000, now, 1)
 	if err := m.RegisterOffer(off, now); err != nil {
@@ -331,7 +343,7 @@ func TestDualSurfaceHTTPZipAndStdNetHTTP(t *testing.T) {
 	setupSrv := func() *Server {
 		m := NewMarket(DefaultConfig())
 		_ = m.DepositBuyer("buyer-http", 5_000_000)
-		_ = m.DepositProvider("prov-http", 2_000_000)
+		_ = m.DepositProviderWithKey("prov-http", kpProv.PubKeyHex, 2_000_000)
 		srv, err := NewServer(m, kpExp.PrivateKey)
 		if err != nil {
 			t.Fatalf("NewServer: %v", err)
@@ -343,19 +355,28 @@ func TestDualSurfaceHTTPZipAndStdNetHTTP(t *testing.T) {
 	offer := testOffer(t, kpProv, "offer-http-1", "prov-http", "independent", 420_000, now, 1)
 	offerJSON, _ := json.Marshal(offer)
 
-	// 1. Test zip.App surface
+	// 1. Test zip.App surface (typed ops + zip.CallerOf principal headers)
 	srvZip := setupSrv()
 	app := zip.New(zip.Config{Logger: luxlog.New("test")})
 	if err := Mount(app, luxlog.New("test"), srvZip); err != nil {
 		t.Fatalf("Mount: %v", err)
 	}
-	doZip := func(method, path string, body []byte) (int, []byte) {
+	doZip := func(method, path string, body []byte, user, org string, admin bool) (int, []byte) {
 		var r io.Reader
 		if body != nil {
 			r = bytes.NewReader(body)
 		}
 		req := httptest.NewRequest(method, path, r)
 		req.Header.Set("Content-Type", "application/json")
+		if user != "" {
+			req.Header.Set("X-User-Id", user)
+		}
+		if org != "" {
+			req.Header.Set("X-Org-Id", org)
+		}
+		if admin {
+			req.Header.Set("X-User-IsAdmin", "true")
+		}
 		resp, err := app.Test(req, zip.TestConfig{Timeout: 10 * time.Second, FailOnTimeout: true})
 		if err != nil {
 			t.Fatalf("zip %s %s: %v", method, path, err)
@@ -364,14 +385,22 @@ func TestDualSurfaceHTTPZipAndStdNetHTTP(t *testing.T) {
 		b, _ := io.ReadAll(resp.Body)
 		return resp.StatusCode, b
 	}
-	if code, _ := doZip(http.MethodGet, "/v1/spotmarket/health", nil); code != http.StatusOK {
+	if code, _ := doZip(http.MethodGet, "/v1/spotmarket/health", nil, "", "", false); code != http.StatusOK {
 		t.Fatalf("zip health want 200, got %d", code)
 	}
-	if code, b := doZip(http.MethodPost, "/v1/spotmarket/offers", offerJSON); code != http.StatusCreated {
+	if code, b := doZip(http.MethodPost, "/v1/spotmarket/offers", offerJSON, "", "", false); code != http.StatusCreated {
 		t.Fatalf("zip post offer want 201, got %d: %s", code, string(b))
 	}
-	if code, b := doZip(http.MethodGet, "/v1/spotmarket/export", nil); code != http.StatusOK {
-		t.Fatalf("zip export want 200, got %d: %s", code, string(b))
+	if code, b := doZip(http.MethodGet, "/v1/spotmarket/offers?model=llama-3.3-70b&jurisdiction=DE", nil, "", "", false); code != http.StatusOK {
+		t.Fatalf("zip get offers want 200, got %d: %s", code, string(b))
+	} else {
+		var out listOffersOut
+		if err := json.Unmarshal(b, &out); err != nil || len(out.Data) != 1 {
+			t.Fatalf("zip get offers unexpected payload: %s (err=%v)", string(b), err)
+		}
+	}
+	if code, b := doZip(http.MethodGet, "/v1/spotmarket/export", nil, "admin-user", "admin", true); code != http.StatusOK {
+		t.Fatalf("zip export (admin) want 200, got %d: %s", code, string(b))
 	} else {
 		var bundle MarketExportBundle
 		if err := json.Unmarshal(b, &bundle); err != nil || VerifyExportBundle(bundle) != nil {
@@ -381,6 +410,8 @@ func TestDualSurfaceHTTPZipAndStdNetHTTP(t *testing.T) {
 
 	// 2. Test standalone standard-library net/http surface (zero zip dependency)
 	srvStd := setupSrv()
+	srvStd.Acting = func(_ context.Context) (string, error) { return "buyer-http", nil }
+	srvStd.AuthorizeExport = func(_ context.Context) error { return nil }
 	h := srvStd.Handler()
 	doStd := func(method, path string, body []byte) (int, []byte) {
 		var r io.Reader
@@ -465,10 +496,13 @@ func Test100ProviderSimulationReproducibilityAndInvariants(t *testing.T) {
 		}
 	}
 	// Verify negative regimes honestly surface real boundary degradation:
-	// 1. Unverified control loses useful tokens & fails adversarial detection
-	if rep1.NegativeRegimes[0].AdversarialDetectionPct >= 25.0 || rep1.NegativeRegimes[0].TokenFulfillRatePct >= p.TokenFulfillRatePct {
-		t.Fatalf("unverified negative control did not degrade as expected: det=%.2f%% fulfill=%.2f%%",
-			rep1.NegativeRegimes[0].AdversarialDetectionPct, rep1.NegativeRegimes[0].TokenFulfillRatePct)
+	// 1. Unverified control loses useful tokens, drops delivery-based completion, & fails adversarial detection
+	if rep1.NegativeRegimes[0].AdversarialDetectionPct >= 25.0 ||
+		rep1.NegativeRegimes[0].TokenFulfillRatePct >= p.TokenFulfillRatePct ||
+		rep1.NegativeRegimes[0].CompletionRatePct >= rep1.NegativeRegimes[0].ClearRatePct {
+		t.Fatalf("unverified negative control did not degrade as expected: det=%.2f%% fulfill=%.2f%% comp=%.2f%% clear=%.2f%%",
+			rep1.NegativeRegimes[0].AdversarialDetectionPct, rep1.NegativeRegimes[0].TokenFulfillRatePct,
+			rep1.NegativeRegimes[0].CompletionRatePct, rep1.NegativeRegimes[0].ClearRatePct)
 	}
 	// 2. Fleet saturation shows price surge and graceful admission rejection
 	if rep1.NegativeRegimes[1].RealizedCostPer1MUsefulUSD <= p.RealizedCostPer1MUsefulUSD || rep1.NegativeRegimes[1].AdmissionRejectPct <= 0 {
@@ -479,6 +513,11 @@ func Test100ProviderSimulationReproducibilityAndInvariants(t *testing.T) {
 	if rep1.NegativeRegimes[2].VerificationOverheadMicroUS <= p.VerificationOverheadMicroUS {
 		t.Fatalf("TTL churn boundary did not show verification overhead rise: churn=%d primary=%d",
 			rep1.NegativeRegimes[2].VerificationOverheadMicroUS, p.VerificationOverheadMicroUS)
+	}
+	// 4. Latency quantiles must reflect realistic millisecond generation durations (not 1000x too small)
+	if rep1.FixedBaseline.LatencyP50Ms < 100_000 || p.LatencyP50Ms < 100_000 {
+		t.Fatalf("latency quantiles appear to be in seconds instead of milliseconds: baseline=%.2fms spot=%.2fms",
+			rep1.FixedBaseline.LatencyP50Ms, p.LatencyP50Ms)
 	}
 	if !rep1.Sovereignty.SignatureVerified || !rep1.Sovereignty.PostForkClearOK || rep1.Sovereignty.ForkLedgerDriftMicro != 0 || rep1.Sovereignty.PostForkHanzoCalls != 0 {
 		t.Fatalf("sovereignty check failed: %+v", rep1.Sovereignty)
