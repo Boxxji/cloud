@@ -6,12 +6,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	protocol "github.com/hanzoai/commerce/payment/x402"
@@ -22,8 +25,9 @@ import (
 // top of github.com/hanzoai/commerce/payment/x402:
 //
 //  1. Canonical request-body hashing & provider-signed exact price quote issuance;
-//  2. Idempotent duplicate retry replay (returns cached verified response without
-//     double-charging) and idempotency payload-mismatch rejection (HTTP 409);
+//  2. Authenticated idempotent duplicate retry replay (bound to caller identity,
+//     method, URL, request body hash, and payment authorization) and conflict
+//     rejection (HTTP 409);
 //  3. Pre-inference cryptographic verification of SignedPriceQuote, EIP-712
 //     ERC-3009 authorization, validity window, atomic nonce reservation, and
 //     independent facilitator Verify;
@@ -37,6 +41,9 @@ type SettlementGuard struct {
 	NonceStore  NonceReplayStore
 	Ledger      ReceiptLedger
 	Now         func() time.Time
+
+	fallbackOnce  sync.Once
+	fallbackStore *MemoryNonceStore
 }
 
 func (g *SettlementGuard) clock() time.Time {
@@ -44,6 +51,19 @@ func (g *SettlementGuard) clock() time.Time {
 		return g.Now()
 	}
 	return time.Now()
+}
+
+// nonceStore returns the configured NonceReplayStore or an always-on in-memory
+// process-local guard so concurrent duplicate authorizations can never bypass
+// admission even when no external replay store was explicitly wired.
+func (g *SettlementGuard) nonceStore() NonceReplayStore {
+	if g.NonceStore != nil {
+		return g.NonceStore
+	}
+	g.fallbackOnce.Do(func() {
+		g.fallbackStore = NewMemoryNonceStore()
+	})
+	return g.fallbackStore
 }
 
 // ZipPaywall returns a zip middleware enforcing SettlementGuard on priced routes.
@@ -60,31 +80,32 @@ func (g *SettlementGuard) ZipPaywall(name func(method, path string) string) zip.
 		reqBodyHash := HashRequestBody(reqBody)
 		idemKey := strings.TrimSpace(c.Header(HeaderIdempotencyKey))
 		sigHeader := c.Header(protocol.HeaderPaymentSignature)
-		reqURL := fc.Scheme() + "://" + c.Host() + fc.OriginalURL()
+		reqTarget := fc.OriginalURL()
+		reqURL := fc.Scheme() + "://" + c.Host() + reqTarget
+		callerOrg := strings.TrimSpace(c.Org())
+		callerUser := strings.TrimSpace(c.User())
 		model, maxTokens := extractInferenceHints(reqBody, c.Header(HeaderRequestModel))
 
-		// Fast path: idempotent retry after commit (even without re-verifying).
-		if idemKey != "" && g.NonceStore != nil {
-			if rec, ok := g.NonceStore.LookupIdempotency(c.Context(), idemKey); ok {
-				if rec.RequestBodyHash != reqBodyHash {
-					return c.JSON(http.StatusConflict, map[string]any{
-						"x402Version": protocol.Version,
-						"error":       "idempotency_key_payload_mismatch",
-					})
-				}
-				if rec.Committed && rec.Response != nil {
-					return writeCachedZipResponse(c, rec.Response)
-				}
-			}
-		}
-
-		// No payment signature -> issue 402 challenge (with provider-signed quote if configured).
+		// No payment signature -> issue 402 challenge (never serve cached responses
+		// without authenticating the payer and request identity).
 		if sigHeader == "" {
 			ref := g.challenge(c.Context(), key, reqURL, model, maxTokens, reqBodyHash, protocol.HeaderPaymentSignature+" header is required")
 			return writeZipRefusal(c, ref)
 		}
 
-		admitted, ref := g.admit(c.Context(), key, reqURL, model, maxTokens, reqBodyHash, idemKey, sigHeader)
+		admitted, ref := g.admit(c.Context(), admitInput{
+			resource:    key,
+			method:      method,
+			reqTarget:   reqTarget,
+			reqURL:      reqURL,
+			model:       model,
+			maxTokens:   maxTokens,
+			reqBodyHash: reqBodyHash,
+			idemKey:     idemKey,
+			sigHeader:   sigHeader,
+			callerOrg:   callerOrg,
+			callerUser:  callerUser,
+		})
 		if ref != nil {
 			return writeZipRefusal(c, ref)
 		}
@@ -95,7 +116,7 @@ func (g *SettlementGuard) ZipPaywall(name func(method, path string) string) zip.
 		settled := false
 		defer func() {
 			if !settled {
-				_ = g.releaseNonce(c.Context(), admitted.claim, idemKey)
+				_ = g.releaseNonce(c.Context(), admitted.claim, admitted.scopedIdemKey)
 			}
 		}()
 
@@ -103,7 +124,7 @@ func (g *SettlementGuard) ZipPaywall(name func(method, path string) string) zip.
 		statusCode := fc.Response().StatusCode()
 		if err != nil || statusCode >= 400 {
 			// Failed inference: NEVER settle; release nonce and record VOIDED ($0).
-			_ = g.releaseNonce(c.Context(), admitted.claim, idemKey)
+			_ = g.releaseNonce(c.Context(), admitted.claim, admitted.scopedIdemKey)
 			settled = true
 			g.recordReceipt(c.Context(), Receipt{
 				QuoteID:        admitted.quoteID,
@@ -126,7 +147,7 @@ func (g *SettlementGuard) ZipPaywall(name func(method, path string) string) zip.
 
 		sResp, ref, facID, facOp := g.settle(c.Context(), admitted)
 		if ref != nil {
-			_ = g.releaseNonce(c.Context(), admitted.claim, idemKey)
+			_ = g.releaseNonce(c.Context(), admitted.claim, admitted.scopedIdemKey)
 			settled = true
 			g.recordReceipt(c.Context(), Receipt{
 				QuoteID:             admitted.quoteID,
@@ -179,16 +200,24 @@ func (g *SettlementGuard) ZipPaywall(name func(method, path string) string) zip.
 		if statusCode == 0 {
 			statusCode = http.StatusOK
 		}
-		if g.NonceStore != nil {
-			_ = g.NonceStore.Commit(c.Context(), admitted.claim, idemKey, &CachedResponse{
-				StatusCode:            statusCode,
-				ContentType:           ct,
-				Body:                  respBody,
-				PaymentResponseHeader: payRespHeader,
-				ReceiptID:             rcpt.ReceiptID,
+		// Settlement succeeded on the facilitator: never release the nonce even if
+		// durable replay-store commit fails.
+		settled = true
+		if err := g.commitSettlement(c.Context(), admitted.claim, admitted.scopedIdemKey, &CachedResponse{
+			StatusCode:            statusCode,
+			ContentType:           ct,
+			Body:                  respBody,
+			PaymentResponseHeader: payRespHeader,
+			ReceiptID:             rcpt.ReceiptID,
+		}); err != nil {
+			c.SetHeader("Cache-Control", "no-store")
+			return c.JSON(http.StatusInternalServerError, map[string]any{
+				"x402Version": protocol.Version,
+				"error":       "settlement_commit_failed",
+				"receiptId":   rcpt.ReceiptID,
+				"transaction": sResp.Transaction,
 			})
 		}
-		settled = true
 		return nil
 	}
 }
@@ -220,24 +249,11 @@ func (g *SettlementGuard) HTTPMiddleware(name func(method, path string) string) 
 			reqBodyHash := HashRequestBody(reqBody)
 			idemKey := strings.TrimSpace(r.Header.Get(HeaderIdempotencyKey))
 			sigHeader := r.Header.Get(protocol.HeaderPaymentSignature)
+			reqTarget := r.URL.RequestURI()
 			reqURL := buildRequestURL(r)
+			callerOrg := strings.TrimSpace(r.Header.Get("X-Org-Id"))
+			callerUser := strings.TrimSpace(r.Header.Get("X-User-Id"))
 			model, maxTokens := extractInferenceHints(reqBody, r.Header.Get(HeaderRequestModel))
-
-			if idemKey != "" && g.NonceStore != nil {
-				if rec, ok := g.NonceStore.LookupIdempotency(r.Context(), idemKey); ok {
-					if rec.RequestBodyHash != reqBodyHash {
-						writeHTTPJSON(w, http.StatusConflict, map[string]any{
-							"x402Version": protocol.Version,
-							"error":       "idempotency_key_payload_mismatch",
-						})
-						return
-					}
-					if rec.Committed && rec.Response != nil {
-						writeCachedHTTPResponse(w, rec.Response)
-						return
-					}
-				}
-			}
 
 			if sigHeader == "" {
 				ref := g.challenge(r.Context(), key, reqURL, model, maxTokens, reqBodyHash, protocol.HeaderPaymentSignature+" header is required")
@@ -245,7 +261,19 @@ func (g *SettlementGuard) HTTPMiddleware(name func(method, path string) string) 
 				return
 			}
 
-			admitted, ref := g.admit(r.Context(), key, reqURL, model, maxTokens, reqBodyHash, idemKey, sigHeader)
+			admitted, ref := g.admit(r.Context(), admitInput{
+				resource:    key,
+				method:      method,
+				reqTarget:   reqTarget,
+				reqURL:      reqURL,
+				model:       model,
+				maxTokens:   maxTokens,
+				reqBodyHash: reqBodyHash,
+				idemKey:     idemKey,
+				sigHeader:   sigHeader,
+				callerOrg:   callerOrg,
+				callerUser:  callerUser,
+			})
 			if ref != nil {
 				writeHTTPRefusal(w, ref)
 				return
@@ -258,7 +286,7 @@ func (g *SettlementGuard) HTTPMiddleware(name func(method, path string) string) 
 			settled := false
 			defer func() {
 				if !settled {
-					_ = g.releaseNonce(r.Context(), admitted.claim, idemKey)
+					_ = g.releaseNonce(r.Context(), admitted.claim, admitted.scopedIdemKey)
 				}
 			}()
 
@@ -270,7 +298,7 @@ func (g *SettlementGuard) HTTPMiddleware(name func(method, path string) string) 
 			}
 
 			if status >= 400 {
-				_ = g.releaseNonce(r.Context(), admitted.claim, idemKey)
+				_ = g.releaseNonce(r.Context(), admitted.claim, admitted.scopedIdemKey)
 				settled = true
 				g.recordReceipt(r.Context(), Receipt{
 					QuoteID:        admitted.quoteID,
@@ -296,7 +324,7 @@ func (g *SettlementGuard) HTTPMiddleware(name func(method, path string) string) 
 
 			sResp, ref, facID, facOp := g.settle(r.Context(), admitted)
 			if ref != nil {
-				_ = g.releaseNonce(r.Context(), admitted.claim, idemKey)
+				_ = g.releaseNonce(r.Context(), admitted.claim, admitted.scopedIdemKey)
 				settled = true
 				g.recordReceipt(r.Context(), Receipt{
 					QuoteID:             admitted.quoteID,
@@ -345,20 +373,43 @@ func (g *SettlementGuard) HTTPMiddleware(name func(method, path string) string) 
 			if rcpt.ReceiptID != "" {
 				w.Header().Set(HeaderReceiptID, rcpt.ReceiptID)
 			}
-			if g.NonceStore != nil {
-				_ = g.NonceStore.Commit(r.Context(), admitted.claim, idemKey, &CachedResponse{
-					StatusCode:            status,
-					ContentType:           rec.header.Get("Content-Type"),
-					Body:                  append([]byte(nil), rec.buf.Bytes()...),
-					PaymentResponseHeader: payRespHeader,
-					ReceiptID:             rcpt.ReceiptID,
-				})
-			}
+			// Settlement succeeded on the facilitator: never release the nonce even if
+			// durable replay-store commit fails.
 			settled = true
+			if err := g.commitSettlement(r.Context(), admitted.claim, admitted.scopedIdemKey, &CachedResponse{
+				StatusCode:            status,
+				ContentType:           rec.header.Get("Content-Type"),
+				Body:                  append([]byte(nil), rec.buf.Bytes()...),
+				PaymentResponseHeader: payRespHeader,
+				ReceiptID:             rcpt.ReceiptID,
+			}); err != nil {
+				w.Header().Set("Cache-Control", "no-store")
+				writeHTTPJSON(w, http.StatusInternalServerError, map[string]any{
+					"x402Version": protocol.Version,
+					"error":       "settlement_commit_failed",
+					"receiptId":   rcpt.ReceiptID,
+					"transaction": sResp.Transaction,
+				})
+				return
+			}
 			w.WriteHeader(status)
 			_, _ = w.Write(rec.buf.Bytes())
 		})
 	}
+}
+
+type admitInput struct {
+	resource    string
+	method      string
+	reqTarget   string
+	reqURL      string
+	model       string
+	maxTokens   int
+	reqBodyHash string
+	idemKey     string
+	sigHeader   string
+	callerOrg   string
+	callerUser  string
 }
 
 type admittedPayment struct {
@@ -366,6 +417,7 @@ type admittedPayment struct {
 	offered       protocol.PaymentRequirements
 	resource      protocol.ResourceInfo
 	claim         NonceClaim
+	scopedIdemKey string
 	quoteID       string
 	facilitatorID string
 	operator      string
@@ -410,19 +462,19 @@ func (g *SettlementGuard) challenge(ctx context.Context, resource, reqURL, model
 	}
 }
 
-func (g *SettlementGuard) admit(ctx context.Context, resource, reqURL, model string, maxTokens int, reqBodyHash, idemKey, sigHeader string) (*admittedPayment, *protocol.Refusal) {
-	accepts, info, ok := g.Table.Quote(resource)
+func (g *SettlementGuard) admit(ctx context.Context, in admitInput) (*admittedPayment, *protocol.Refusal) {
+	accepts, info, ok := g.Table.Quote(in.resource)
 	if !ok {
-		return nil, &protocol.Refusal{Status: http.StatusInternalServerError, Reason: "resource is not for sale: " + resource}
+		return nil, &protocol.Refusal{Status: http.StatusInternalServerError, Reason: "resource is not for sale: " + in.resource}
 	}
-	info.URL = reqURL
+	info.URL = in.reqURL
 	deny := func(status int, reason string) *protocol.Refusal {
-		ref := g.challenge(ctx, resource, reqURL, model, maxTokens, reqBodyHash, reason)
+		ref := g.challenge(ctx, in.resource, in.reqURL, in.model, in.maxTokens, in.reqBodyHash, reason)
 		ref.Status = status
 		return ref
 	}
 
-	pay, err := protocol.ParsePayment(sigHeader)
+	pay, err := protocol.ParsePayment(in.sigHeader)
 	if err != nil {
 		return nil, &protocol.Refusal{Status: http.StatusBadRequest, Reason: protocol.ReasonOf(err, protocol.ReasonInvalidPayload)}
 	}
@@ -438,35 +490,10 @@ func (g *SettlementGuard) admit(ctx context.Context, resource, reqURL, model str
 		return nil, deny(http.StatusPaymentRequired, protocol.ReasonOf(protocol.Same(accepts[0], pay.Accepted), protocol.ReasonInvalidRequirements))
 	}
 
-	// Verify provider-signed exact price quote bound to the request body.
-	var quoteID string
-	if g.QuoteSigner != nil {
-		q, present, err := ExtractQuoteExtension(pay.Extensions)
-		if err != nil {
-			return nil, deny(http.StatusPaymentRequired, protocol.ReasonInvalidRequirements)
-		}
-		if present {
-			if err := g.QuoteSigner.VerifyQuote(q, reqBodyHash, g.clock()); err != nil {
-				return nil, deny(http.StatusPaymentRequired, protocol.ReasonOf(err, protocol.ReasonSignature))
-			}
-			if q.Resource != resource ||
-				!strings.EqualFold(q.Network, offered.Network) ||
-				!strings.EqualFold(q.Asset, offered.Asset) ||
-				!strings.EqualFold(q.PayTo, offered.PayTo) ||
-				strings.TrimSpace(q.AmountAtomic) != strings.TrimSpace(offered.Amount) {
-				return nil, deny(http.StatusPaymentRequired, protocol.ReasonInvalidRequirements)
-			}
-			quoteID = q.QuoteID
-		} else {
-			return nil, deny(http.StatusPaymentRequired, "signed_quote_required")
-		}
-	}
-
-	// Offline EIP-712 / ERC-3009 verification and validity window check.
+	// Authenticate the payer's ERC-3009 EIP-712 signature BEFORE checking cached
+	// idempotency records so unauthenticated callers or other tenants cannot
+	// retrieve or probe cached responses.
 	if err := protocol.Verify(*offered, pay); err != nil {
-		return nil, deny(http.StatusPaymentRequired, protocol.ReasonOf(err, protocol.ReasonVerifyError))
-	}
-	if err := protocol.InWindow(pay.Payload.Authorization, g.clock()); err != nil {
 		return nil, deny(http.StatusPaymentRequired, protocol.ReasonOf(err, protocol.ReasonVerifyError))
 	}
 
@@ -476,32 +503,81 @@ func (g *SettlementGuard) admit(ctx context.Context, resource, reqURL, model str
 		From:    pay.Payload.Authorization.From,
 		Nonce:   pay.Payload.Authorization.Nonce,
 	}
+	scopedIdemKey := scopeIdempotencyKey(in.idemKey, in.callerOrg, in.callerUser, claim.From)
+	reqFingerprint := computeRequestFingerprint(in.method, in.reqTarget, in.reqBodyHash, in.callerOrg, in.callerUser)
+	store := g.nonceStore()
 
-	// Atomic idempotency & nonce replay check before touching facilitator or inference.
-	if g.NonceStore != nil {
-		res, err := g.NonceStore.Reserve(ctx, claim, idemKey, reqBodyHash)
+	// Authenticated idempotency fast path: replay only when caller identity,
+	// full request identity (method, path, query, body hash, org, user), and
+	// payment authorization claim all match a durably committed settlement.
+	if scopedIdemKey != "" {
+		if rec, ok := store.LookupIdempotency(ctx, scopedIdemKey); ok {
+			if rec.RequestBodyHash != reqFingerprint {
+				return nil, &protocol.Refusal{Status: http.StatusConflict, Reason: "idempotency_key_payload_mismatch"}
+			}
+			if rec.ClaimKey != "" && rec.ClaimKey != claim.Key() {
+				return nil, &protocol.Refusal{Status: http.StatusConflict, Reason: "idempotency_key_payment_mismatch"}
+			}
+			if rec.PendingPersist {
+				return nil, &protocol.Refusal{Status: http.StatusInternalServerError, Reason: "settlement_commit_pending"}
+			}
+			if rec.Committed && rec.Response != nil {
+				return &admittedPayment{cached: rec.Response}, nil
+			}
+			if rec.InFlight {
+				return nil, &protocol.Refusal{Status: http.StatusConflict, Reason: "identical idempotent request is already in flight"}
+			}
+		}
+	}
+
+	// Verify provider-signed exact price quote bound to the request body.
+	var quoteID string
+	if g.QuoteSigner != nil {
+		q, present, err := ExtractQuoteExtension(pay.Extensions)
 		if err != nil {
-			return nil, &protocol.Refusal{Status: http.StatusInternalServerError, Reason: protocol.ReasonVerifyError}
+			return nil, deny(http.StatusPaymentRequired, protocol.ReasonInvalidRequirements)
 		}
-		switch res.Outcome {
-		case ReserveIdempotentHit:
-			return &admittedPayment{cached: res.Cached}, nil
-		case ReserveIdempotencyMismatch, ReserveIdempotencyInFlight:
-			return nil, &protocol.Refusal{Status: http.StatusConflict, Reason: res.Reason}
-		case ReserveNonceReplay, ReserveNonceInFlight:
-			return nil, deny(http.StatusPaymentRequired, protocol.ReasonInvalidTransaction)
+		if present {
+			if err := g.QuoteSigner.VerifyQuote(q, in.reqBodyHash, g.clock()); err != nil {
+				return nil, deny(http.StatusPaymentRequired, protocol.ReasonOf(err, protocol.ReasonSignature))
+			}
+			if q.Resource != in.resource || !quoteMatchesRequirements(q, *offered) {
+				return nil, deny(http.StatusPaymentRequired, protocol.ReasonInvalidRequirements)
+			}
+			quoteID = q.QuoteID
+		} else {
+			return nil, deny(http.StatusPaymentRequired, "signed_quote_required")
 		}
+	}
+
+	// Validity window check for fresh (non-replayed) payments.
+	if err := protocol.InWindow(pay.Payload.Authorization, g.clock()); err != nil {
+		return nil, deny(http.StatusPaymentRequired, protocol.ReasonOf(err, protocol.ReasonVerifyError))
+	}
+
+	// Atomic idempotency & in-flight/spent nonce guard before touching facilitator or inference.
+	res, err := store.Reserve(ctx, claim, scopedIdemKey, reqFingerprint)
+	if err != nil {
+		return nil, &protocol.Refusal{Status: http.StatusInternalServerError, Reason: protocol.ReasonVerifyError}
+	}
+	switch res.Outcome {
+	case ReserveIdempotentHit:
+		return &admittedPayment{cached: res.Cached}, nil
+	case ReserveIdempotencyMismatch, ReserveIdempotencyInFlight:
+		return nil, &protocol.Refusal{Status: http.StatusConflict, Reason: res.Reason}
+	case ReserveNonceReplay, ReserveNonceInFlight:
+		return nil, deny(http.StatusPaymentRequired, protocol.ReasonInvalidTransaction)
 	}
 
 	vctx, cancel := context.WithTimeout(ctx, time.Duration(offered.MaxTimeoutSeconds)*time.Second)
 	defer cancel()
 	vResp, err := g.Facilitator.Verify(vctx, pay, *offered)
 	if err != nil {
-		_ = g.releaseNonce(ctx, claim, idemKey)
+		_ = g.releaseNonce(ctx, claim, scopedIdemKey)
 		return nil, &protocol.Refusal{Status: http.StatusInternalServerError, Reason: protocol.ReasonVerifyError}
 	}
 	if !vResp.IsValid {
-		_ = g.releaseNonce(ctx, claim, idemKey)
+		_ = g.releaseNonce(ctx, claim, scopedIdemKey)
 		reason := vResp.InvalidReason
 		if reason == "" {
 			reason = protocol.ReasonVerifyError
@@ -521,6 +597,7 @@ func (g *SettlementGuard) admit(ctx context.Context, resource, reqURL, model str
 		offered:       *offered,
 		resource:      info,
 		claim:         claim,
+		scopedIdemKey: scopedIdemKey,
 		quoteID:       quoteID,
 		facilitatorID: facID,
 		operator:      facOp,
@@ -566,11 +643,58 @@ func (g *SettlementGuard) settle(ctx context.Context, adm *admittedPayment) (pro
 	}, facID, facOp
 }
 
-func (g *SettlementGuard) releaseNonce(ctx context.Context, claim NonceClaim, idemKey string) error {
-	if g.NonceStore == nil {
-		return nil
+func (g *SettlementGuard) releaseNonce(ctx context.Context, claim NonceClaim, scopedIdemKey string) error {
+	return g.nonceStore().Release(ctx, claim, scopedIdemKey)
+}
+
+func (g *SettlementGuard) commitSettlement(ctx context.Context, claim NonceClaim, scopedIdemKey string, cached *CachedResponse) error {
+	store := g.nonceStore()
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := store.Commit(ctx, claim, scopedIdemKey, cached); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if ctx.Err() != nil {
+			break
+		}
 	}
-	return g.NonceStore.Release(ctx, claim, idemKey)
+	return lastErr
+}
+
+func scopeIdempotencyKey(rawKey, org, user, payer string) string {
+	rawKey = strings.TrimSpace(rawKey)
+	if rawKey == "" {
+		return ""
+	}
+	parts := []string{
+		"org=" + strings.ToLower(strings.TrimSpace(org)),
+		"user=" + strings.ToLower(strings.TrimSpace(user)),
+		"payer=" + strings.ToLower(strings.TrimSpace(payer)),
+		"key=" + rawKey,
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return "idem:" + hex.EncodeToString(sum[:])
+}
+
+func computeRequestFingerprint(method, reqTarget, reqBodyHash, org, user string) string {
+	parts := []string{
+		strings.ToUpper(strings.TrimSpace(method)),
+		strings.TrimSpace(reqTarget),
+		strings.TrimSpace(reqBodyHash),
+		strings.ToLower(strings.TrimSpace(org)),
+		strings.ToLower(strings.TrimSpace(user)),
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return "req:" + hex.EncodeToString(sum[:])
+}
+
+func quoteMatchesRequirements(q SignedPriceQuote, r protocol.PaymentRequirements) bool {
+	return strings.EqualFold(strings.TrimSpace(q.Network), strings.TrimSpace(r.Network)) &&
+		strings.EqualFold(strings.TrimSpace(q.Asset), strings.TrimSpace(r.Asset)) &&
+		strings.EqualFold(strings.TrimSpace(q.PayTo), strings.TrimSpace(r.PayTo)) &&
+		strings.TrimSpace(q.AmountAtomic) == strings.TrimSpace(r.Amount)
 }
 
 func (g *SettlementGuard) recordReceipt(ctx context.Context, rec Receipt) Receipt {
@@ -784,19 +908,38 @@ func (a *AgentClient) DoPaid(ctx context.Context, method, targetURL string, reqB
 	if a.Now != nil {
 		now = a.Now
 	}
+	var verifiedQuote *SignedPriceQuote
 	if q, ok, err := ExtractQuoteExtension(pr.Extensions); err != nil {
 		return resp1, body1, nil, err
 	} else if ok {
 		if err := VerifySignedQuoteStandalone(q, a.ExpectedProvider, HashRequestBody(reqBody), now()); err != nil {
 			return resp1, body1, nil, fmt.Errorf("x402: untrusted or tampered quote: %w", err)
 		}
+		qCopy := q
+		verifiedQuote = &qCopy
+		matchedAccepts := make([]protocol.PaymentRequirements, 0, len(pr.Accepts))
+		for _, r := range pr.Accepts {
+			if quoteMatchesRequirements(q, r) {
+				matchedAccepts = append(matchedAccepts, r)
+			}
+		}
+		if len(matchedAccepts) == 0 {
+			return resp1, body1, nil, errors.New("x402: payment requirements do not match verified signed quote")
+		}
+		pr.Accepts = matchedAccepts
 	} else if a.ExpectedProvider != "" {
 		return resp1, body1, nil, errors.New("x402: missing required provider signed quote")
 	}
 
-	allow := a.Allow
-	if allow == nil {
-		allow = func(protocol.ResourceInfo, protocol.PaymentRequirements) bool { return true }
+	userAllow := a.Allow
+	allow := func(info protocol.ResourceInfo, r protocol.PaymentRequirements) bool {
+		if verifiedQuote != nil && !quoteMatchesRequirements(*verifiedQuote, r) {
+			return false
+		}
+		if userAllow != nil {
+			return userAllow(info, r)
+		}
+		return true
 	}
 	signer := protocol.Signer{Key: a.Key, Allow: allow, Now: now}
 	pay, err := signer.Pay(ctx, pr)

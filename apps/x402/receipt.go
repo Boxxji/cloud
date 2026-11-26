@@ -79,13 +79,105 @@ type ReceiptFilter struct {
 // ReversalEvent reports a facilitator settlement revert, chain reorg, or
 // dispute reversal for deterministic receipt reconciliation.
 type ReversalEvent struct {
-	ReceiptID     string `json:"receiptId,omitempty"`
-	FacilitatorID string `json:"facilitatorId"`
-	Transaction   string `json:"transaction,omitempty"`
-	ReversalTx    string `json:"reversalTx,omitempty"`
-	Reason        string `json:"reason"`
-	RequireRefund bool   `json:"requireRefund,omitempty"`
-	Timestamp     int64  `json:"timestamp,omitempty"`
+	ReceiptID            string `json:"receiptId,omitempty"`
+	FacilitatorID        string `json:"facilitatorId"`
+	Transaction          string `json:"transaction,omitempty"`
+	ReversalTx           string `json:"reversalTx,omitempty"`
+	Reason               string `json:"reason"`
+	RequireRefund        bool   `json:"requireRefund,omitempty"`
+	Timestamp            int64  `json:"timestamp,omitempty"`
+	FacilitatorAddress   string `json:"facilitatorAddress,omitempty"`
+	FacilitatorSignature string `json:"facilitatorSignature,omitempty"`
+}
+
+var reversalDomainHash = crypto.Keccak256([]byte("HanzoX402ReversalEvent:v1"))
+
+// Digest computes the deterministic domain-separated Keccak-256 digest over
+// every canonical field of ev excluding FacilitatorSignature.
+func (ev ReversalEvent) Digest() ([32]byte, error) {
+	var out [32]byte
+	if strings.TrimSpace(ev.FacilitatorID) == "" {
+		return out, errors.New("x402: reversal event requires facilitatorId")
+	}
+	if strings.TrimSpace(ev.ReceiptID) == "" && strings.TrimSpace(ev.Transaction) == "" {
+		return out, errors.New("x402: reversal event requires receiptId or transaction")
+	}
+	if strings.TrimSpace(ev.ReversalTx) == "" {
+		return out, errors.New("x402: reversal event requires reversalTx")
+	}
+	if strings.TrimSpace(ev.Reason) == "" {
+		return out, errors.New("x402: reversal event requires reason")
+	}
+	cp := ev
+	cp.FacilitatorSignature = ""
+	cp.FacilitatorAddress = strings.ToLower(strings.TrimSpace(cp.FacilitatorAddress))
+	raw, err := json.Marshal(cp)
+	if err != nil {
+		return out, fmt.Errorf("x402: marshal reversal event: %w", err)
+	}
+	structHash := crypto.Keccak256(raw)
+	copy(out[:], crypto.Keccak256([]byte{0x19, 0x01}, reversalDomainHash, structHash))
+	return out, nil
+}
+
+// SignReversalEvent signs ev with a facilitator's secp256k1 private key.
+func SignReversalEvent(key *ecdsa.PrivateKey, ev *ReversalEvent) error {
+	if key == nil || ev == nil {
+		return errors.New("x402: reversal signing requires key and event")
+	}
+	ev.FacilitatorAddress = strings.ToLower(crypto.PubkeyToAddress(key.PublicKey).Hex())
+	digest, err := ev.Digest()
+	if err != nil {
+		return err
+	}
+	sig, err := crypto.Sign(digest[:], key)
+	if err != nil {
+		return fmt.Errorf("x402: sign reversal event: %w", err)
+	}
+	canonical, err := protocol.Canonical(protocol.Hex(sig))
+	if err != nil {
+		return fmt.Errorf("x402: canonical reversal signature: %w", err)
+	}
+	ev.FacilitatorSignature = canonical
+	return nil
+}
+
+// VerifyReversalEventSignature verifies the secp256k1 facilitator signature on ev
+// and, when expectedFacilitatorAddr is non-empty, checks that the recovered signer
+// matches expectedFacilitatorAddr.
+func VerifyReversalEventSignature(ev ReversalEvent, expectedFacilitatorAddr string) error {
+	if strings.TrimSpace(ev.FacilitatorSignature) == "" {
+		return errors.New("x402: reversal event missing facilitatorSignature")
+	}
+	digest, err := ev.Digest()
+	if err != nil {
+		return err
+	}
+	recovered, err := protocol.Recover(digest, ev.FacilitatorSignature)
+	if err != nil {
+		return fmt.Errorf("x402: invalid reversal facilitatorSignature: %w", err)
+	}
+	if strings.TrimSpace(ev.FacilitatorAddress) != "" {
+		declared, err := protocol.Address(ev.FacilitatorAddress)
+		if err != nil {
+			return fmt.Errorf("x402: invalid reversal facilitatorAddress: %w", err)
+		}
+		if recovered != declared {
+			return fmt.Errorf("x402: reversal signer %s does not match facilitatorAddress %s",
+				protocol.Hex(recovered[:]), ev.FacilitatorAddress)
+		}
+	}
+	if strings.TrimSpace(expectedFacilitatorAddr) != "" {
+		want, err := protocol.Address(expectedFacilitatorAddr)
+		if err != nil {
+			return fmt.Errorf("x402: invalid expected facilitator address: %w", err)
+		}
+		if recovered != want {
+			return fmt.Errorf("x402: reversal signer %s does not match trusted facilitator %s",
+				protocol.Hex(recovered[:]), expectedFacilitatorAddr)
+		}
+	}
+	return nil
 }
 
 // ExportVerification summarizes independent offline verification of a JSONL
@@ -116,15 +208,24 @@ func (r Receipt) ComputeRecordHash() ([32]byte, error) {
 // MemoryReceiptLedger is a concurrency-safe, hash-chained, optionally
 // secp256k1-signed and JSONL-persisted ReceiptLedger.
 type MemoryReceiptLedger struct {
-	mu          sync.RWMutex
-	seq         uint64
-	headHash    string
-	journal     []Receipt
-	byID        map[string]Receipt
-	byFacTx     map[string]string // lower(facilitatorId|tx) -> receiptID
-	key         *ecdsa.PrivateKey
-	journalPath string
-	now         func() time.Time
+	mu               sync.RWMutex
+	seq              uint64
+	headHash         string
+	journal          []Receipt
+	byID             map[string]Receipt
+	byFacTx          map[string]string // lower(facilitatorId|tx) -> receiptID
+	key              *ecdsa.PrivateKey
+	journalPath      string
+	now              func() time.Time
+	reversalVerifier func(ctx context.Context, ev ReversalEvent, target Receipt) error
+}
+
+// SetReversalVerifier installs an independent reversal-evidence validator that
+// ReconcileReversal must pass before transitioning any receipt.
+func (l *MemoryReceiptLedger) SetReversalVerifier(fn func(ctx context.Context, ev ReversalEvent, target Receipt) error) {
+	l.mu.Lock()
+	l.reversalVerifier = fn
+	l.mu.Unlock()
 }
 
 // NewMemoryReceiptLedger creates an in-memory ReceiptLedger. key may be nil
@@ -153,21 +254,23 @@ func NewFileReceiptLedger(path string, key *ecdsa.PrivateKey) (*MemoryReceiptLed
 		return nil, fmt.Errorf("x402: open receipt ledger: %w", err)
 	}
 	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
+	rd := bufio.NewReaderSize(f, 64*1024)
+	for {
+		rawLine, readErr := rd.ReadBytes('\n')
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return nil, fmt.Errorf("x402: scan receipt ledger: %w", readErr)
 		}
-		var r Receipt
-		if err := json.Unmarshal([]byte(line), &r); err != nil {
-			return nil, fmt.Errorf("x402: corrupt receipt ledger: %w", err)
+		line := strings.TrimSpace(string(rawLine))
+		if line != "" {
+			var r Receipt
+			if err := json.Unmarshal([]byte(line), &r); err != nil {
+				return nil, fmt.Errorf("x402: corrupt receipt ledger: %w", err)
+			}
+			l.indexEntryLocked(r)
 		}
-		l.indexEntryLocked(r)
-	}
-	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("x402: scan receipt ledger: %w", err)
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
 	}
 	return l, nil
 }
@@ -210,8 +313,7 @@ func (l *MemoryReceiptLedger) appendLocked(rec Receipt) (Receipt, error) {
 	if l.key != nil {
 		rec.ProviderAddress = strings.ToLower(crypto.PubkeyToAddress(l.key.PublicKey).Hex())
 	}
-	l.seq++
-	rec.Seq = l.seq
+	rec.Seq = l.seq + 1
 	rec.PrevHash = l.headHash
 	hash, err := rec.ComputeRecordHash()
 	if err != nil {
@@ -315,45 +417,54 @@ func (l *MemoryReceiptLedger) List(_ context.Context, filter ReceiptFilter) []Re
 }
 
 // ReconcileReversal deterministically locates the exact receipt by ReceiptID or
-// (FacilitatorID, Transaction), validates facilitator attribution, and appends a
-// new hash-chained REVERSED or REFUND_REQUIRED transition record.
-func (l *MemoryReceiptLedger) ReconcileReversal(_ context.Context, ev ReversalEvent) (Receipt, error) {
+// (FacilitatorID, Transaction), validates facilitator attribution and reversal
+// evidence, and appends a new hash-chained REVERSED or REFUND_REQUIRED record.
+func (l *MemoryReceiptLedger) ReconcileReversal(ctx context.Context, ev ReversalEvent) (Receipt, error) {
 	if strings.TrimSpace(ev.FacilitatorID) == "" {
 		return Receipt{}, errors.New("x402: reversal event requires facilitatorId")
 	}
 	if strings.TrimSpace(ev.ReceiptID) == "" && strings.TrimSpace(ev.Transaction) == "" {
 		return Receipt{}, errors.New("x402: reversal event requires receiptId or transaction")
 	}
+	if strings.TrimSpace(ev.ReversalTx) == "" {
+		return Receipt{}, errors.New("x402: reversal event requires reversalTx")
+	}
 	if strings.TrimSpace(ev.Reason) == "" {
 		return Receipt{}, errors.New("x402: reversal event requires reason")
+	}
+	if strings.TrimSpace(ev.FacilitatorSignature) != "" || strings.TrimSpace(ev.FacilitatorAddress) != "" {
+		if err := VerifyReversalEventSignature(ev, ev.FacilitatorAddress); err != nil {
+			return Receipt{}, err
+		}
+	}
+
+	l.mu.RLock()
+	target, found := l.lookupReversalTargetLocked(ev)
+	verifier := l.reversalVerifier
+	l.mu.RUnlock()
+	if !found {
+		return Receipt{}, fmt.Errorf("x402: reversal target receipt not found (facilitator=%q receiptId=%q tx=%q)",
+			ev.FacilitatorID, ev.ReceiptID, ev.Transaction)
+	}
+	if err := validateReversalTarget(ev, target); err != nil {
+		return Receipt{}, err
+	}
+	if verifier != nil {
+		if err := verifier(ctx, ev, target); err != nil {
+			return Receipt{}, fmt.Errorf("x402: reversal evidence verification failed: %w", err)
+		}
 	}
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	var target Receipt
-	var found bool
-	if ev.ReceiptID != "" {
-		target, found = l.byID[ev.ReceiptID]
-	} else {
-		if id, ok := l.byFacTx[facTxKey(ev.FacilitatorID, ev.Transaction)]; ok {
-			target, found = l.byID[id]
-		}
-	}
+	target, found = l.lookupReversalTargetLocked(ev)
 	if !found {
 		return Receipt{}, fmt.Errorf("x402: reversal target receipt not found (facilitator=%q receiptId=%q tx=%q)",
 			ev.FacilitatorID, ev.ReceiptID, ev.Transaction)
 	}
-	if !strings.EqualFold(target.FacilitatorID, ev.FacilitatorID) {
-		return Receipt{}, fmt.Errorf("x402: reversal facilitator mismatch: receipt settled by %q, reversal from %q",
-			target.FacilitatorID, ev.FacilitatorID)
-	}
-	if ev.Transaction != "" && target.Transaction != "" && !strings.EqualFold(target.Transaction, ev.Transaction) {
-		return Receipt{}, fmt.Errorf("x402: reversal transaction mismatch: receipt tx %q, reversal tx %q",
-			target.Transaction, ev.Transaction)
-	}
-	if target.Status != StatusSettled && target.Status != StatusReversed && target.Status != StatusRefundRequired {
-		return Receipt{}, fmt.Errorf("x402: cannot reverse receipt in status %q", target.Status)
+	if err := validateReversalTarget(ev, target); err != nil {
+		return Receipt{}, err
 	}
 
 	next := target
@@ -369,6 +480,33 @@ func (l *MemoryReceiptLedger) ReconcileReversal(_ context.Context, ev ReversalEv
 		next.UpdatedAt = ev.Timestamp
 	}
 	return l.appendLocked(next)
+}
+
+func (l *MemoryReceiptLedger) lookupReversalTargetLocked(ev ReversalEvent) (Receipt, bool) {
+	if ev.ReceiptID != "" {
+		target, found := l.byID[ev.ReceiptID]
+		return target, found
+	}
+	if id, ok := l.byFacTx[facTxKey(ev.FacilitatorID, ev.Transaction)]; ok {
+		target, found := l.byID[id]
+		return target, found
+	}
+	return Receipt{}, false
+}
+
+func validateReversalTarget(ev ReversalEvent, target Receipt) error {
+	if !strings.EqualFold(target.FacilitatorID, ev.FacilitatorID) {
+		return fmt.Errorf("x402: reversal facilitator mismatch: receipt settled by %q, reversal from %q",
+			target.FacilitatorID, ev.FacilitatorID)
+	}
+	if ev.Transaction != "" && target.Transaction != "" && !strings.EqualFold(target.Transaction, ev.Transaction) {
+		return fmt.Errorf("x402: reversal transaction mismatch: receipt tx %q, reversal tx %q",
+			target.Transaction, ev.Transaction)
+	}
+	if target.Status != StatusSettled && target.Status != StatusReversed && target.Status != StatusRefundRequired {
+		return fmt.Errorf("x402: cannot reverse receipt in status %q", target.Status)
+	}
+	return nil
 }
 
 // ExportJSONL writes the complete immutable hash-chained audit trail as JSONL.

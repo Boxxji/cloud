@@ -82,6 +82,13 @@ type Config struct {
 	// Ledger, when non-nil, records hash-chained provider-signed receipts,
 	// failed-inference voids, and facilitator reversal reconciliations.
 	Ledger ReceiptLedger
+	// ReversalVerifier, when non-nil, authenticates or independently verifies
+	// reversal events submitted to POST /v1/x402/reconcile before mutating Ledger.
+	ReversalVerifier func(ctx context.Context, ev ReversalEvent) error
+	// FacilitatorSigners maps facilitator IDs (case-insensitive) to their trusted
+	// secp256k1 signer addresses so POST /v1/x402/reconcile can cryptographically
+	// authenticate facilitator-signed ReversalEvents.
+	FacilitatorSigners map[string]string
 	// Now overrides wall clock time for deterministic testing.
 	Now func() time.Time
 }
@@ -199,11 +206,15 @@ func Mount(app *zip.App, log luxlog.Logger, cfg Config) error {
 
 	enhanced := cfg.QuoteSigner != nil || cfg.NonceStore != nil || cfg.Ledger != nil || multi != nil
 	if enhanced {
+		nonceStore := cfg.NonceStore
+		if nonceStore == nil {
+			nonceStore = NewMemoryNonceStore()
+		}
 		guard := &SettlementGuard{
 			Table:       table,
 			Facilitator: fac,
 			QuoteSigner: cfg.QuoteSigner,
-			NonceStore:  cfg.NonceStore,
+			NonceStore:  nonceStore,
 			Ledger:      cfg.Ledger,
 			Now:         cfg.Now,
 		}
@@ -213,11 +224,21 @@ func Mount(app *zip.App, log luxlog.Logger, cfg Config) error {
 		app.Use(protocol.Paywall(gate, pricedKey(table)))
 	}
 
+	var facSigners map[string]string
+	if len(cfg.FacilitatorSigners) > 0 {
+		facSigners = make(map[string]string, len(cfg.FacilitatorSigners))
+		for k, v := range cfg.FacilitatorSigners {
+			facSigners[strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(v)
+		}
+	}
+
 	o := ops{
-		table:       table,
-		quoteSigner: cfg.QuoteSigner,
-		ledger:      cfg.Ledger,
-		multi:       multi,
+		table:              table,
+		quoteSigner:        cfg.QuoteSigner,
+		ledger:             cfg.Ledger,
+		multi:              multi,
+		reversalVerifier:   cfg.ReversalVerifier,
+		facilitatorSigners: facSigners,
 	}
 	g := app.Group("/v1/x402")
 	g.Get("/prices", o.prices)
@@ -263,10 +284,12 @@ func pricedKey(t *protocol.Table) func(method, p string) string {
 // ops binds the typed ops. A typed handler takes no service parameter, so the table
 // arrives as a receiver.
 type ops struct {
-	table       *protocol.Table
-	quoteSigner QuoteSigner
-	ledger      ReceiptLedger
-	multi       *MultiFacilitator
+	table              *protocol.Table
+	quoteSigner        QuoteSigner
+	ledger             ReceiptLedger
+	multi              *MultiFacilitator
+	reversalVerifier   func(ctx context.Context, ev ReversalEvent) error
+	facilitatorSigners map[string]string
 }
 
 // noIn is the input of an op that takes nothing.
@@ -378,6 +401,11 @@ func (o ops) receipts(ctx context.Context, in *receiptsIn) (*receiptsOut, error)
 		}
 	}
 	list := o.ledger.List(ctx, filter)
+	if !zip.CallerOf(ctx).Admin {
+		for i := range list {
+			list[i].IdempotencyKey = ""
+		}
+	}
 	return &receiptsOut{
 		InterfaceVersion: InterfaceVersion,
 		Count:            len(list),
@@ -417,6 +445,17 @@ func (o ops) reconcile(ctx context.Context, in *ReversalEvent) (*reconcileOut, e
 	}
 	if in == nil {
 		return nil, zip.ErrBadRequest("x402: reversal event is required")
+	}
+	if o.reversalVerifier != nil {
+		if err := o.reversalVerifier(ctx, *in); err != nil {
+			return nil, zip.ErrForbidden(err.Error())
+		}
+	} else if signerAddr, ok := o.facilitatorSigners[strings.ToLower(strings.TrimSpace(in.FacilitatorID))]; ok && signerAddr != "" {
+		if err := VerifyReversalEventSignature(*in, signerAddr); err != nil {
+			return nil, zip.ErrForbidden(err.Error())
+		}
+	} else if !zip.CallerOf(ctx).Admin {
+		return nil, zip.ErrForbidden("x402: reversal reconciliation requires operator authorization or trusted facilitator signature")
 	}
 	rec, err := o.ledger.ReconcileReversal(ctx, *in)
 	if err != nil {

@@ -91,7 +91,7 @@ func (q SignedPriceQuote) Digest() ([32]byte, error) {
 		return out, fmt.Errorf("x402: quote providerAddress: %w", err)
 	}
 	amt, ok := new(big.Int).SetString(q.AmountAtomic, 10)
-	if !ok || amt.Sign() <= 0 {
+	if !ok || amt.Sign() <= 0 || amt.BitLen() > 256 {
 		return out, fmt.Errorf("x402: quote invalid amountAtomic %q", q.AmountAtomic)
 	}
 	if q.MaxTokens < 0 || q.IssuedAt < 0 || q.ExpiresAt <= q.IssuedAt {

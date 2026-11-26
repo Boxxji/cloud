@@ -6,7 +6,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,6 +65,7 @@ type IdempotencyRecord struct {
 	RequestBodyHash string          `json:"requestBodyHash"`
 	InFlight        bool            `json:"inFlight"`
 	Committed       bool            `json:"committed"`
+	PendingPersist  bool            `json:"pendingPersist,omitempty"`
 	Response        *CachedResponse `json:"response,omitempty"`
 	UpdatedAt       int64           `json:"updatedAt"`
 }
@@ -88,6 +91,7 @@ type MemoryNonceStore struct {
 	inflight    map[string]struct{}
 	spent       map[string]int64
 	idempotency map[string]*IdempotencyRecord
+	pending     []nonceJournalEntry
 	journalPath string
 	now         func() time.Time
 }
@@ -116,29 +120,32 @@ func NewFileNonceStore(path string) (*MemoryNonceStore, error) {
 		return nil, fmt.Errorf("x402: open nonce store: %w", err)
 	}
 	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
+	rd := bufio.NewReaderSize(f, 64*1024)
+	for {
+		rawLine, readErr := rd.ReadBytes('\n')
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return nil, fmt.Errorf("x402: scan nonce journal: %w", readErr)
 		}
-		var entry nonceJournalEntry
-		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			return nil, fmt.Errorf("x402: corrupt nonce journal: %w", err)
+		line := strings.TrimSpace(string(rawLine))
+		if line != "" {
+			var entry nonceJournalEntry
+			if err := json.Unmarshal([]byte(line), &entry); err != nil {
+				return nil, fmt.Errorf("x402: corrupt nonce journal: %w", err)
+			}
+			if entry.ClaimKey != "" {
+				s.spent[entry.ClaimKey] = entry.CommittedAt
+			}
+			if entry.Idempotency != nil && entry.Idempotency.Key != "" {
+				rec := *entry.Idempotency
+				rec.InFlight = false
+				rec.Committed = true
+				rec.PendingPersist = false
+				s.idempotency[rec.Key] = &rec
+			}
 		}
-		if entry.ClaimKey != "" {
-			s.spent[entry.ClaimKey] = entry.CommittedAt
+		if errors.Is(readErr, io.EOF) {
+			break
 		}
-		if entry.Idempotency != nil && entry.Idempotency.Key != "" {
-			rec := *entry.Idempotency
-			rec.InFlight = false
-			rec.Committed = true
-			s.idempotency[rec.Key] = &rec
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("x402: scan nonce journal: %w", err)
 	}
 	return s, nil
 }
@@ -172,6 +179,11 @@ func (s *MemoryNonceStore) Reserve(_ context.Context, claim NonceClaim, idempote
 					Outcome: ReserveIdempotencyMismatch,
 					Reason:  "idempotency key reused with a different payment authorization",
 				}, nil
+			}
+			if rec.PendingPersist {
+				if err := s.flushPendingLocked(); err != nil {
+					return ReserveResult{}, fmt.Errorf("x402: flush pending settlement journal: %w", err)
+				}
 			}
 			if rec.Committed && rec.Response != nil {
 				copied := cloneCachedResponse(rec.Response)
@@ -216,7 +228,10 @@ func (s *MemoryNonceStore) Reserve(_ context.Context, claim NonceClaim, idempote
 }
 
 // Commit marks the ERC-3009 nonce permanently spent and stores the cached
-// response for exact idempotent retries.
+// response for exact idempotent retries. When journal-backed, persistence must
+// succeed before an idempotency record is promoted to Committed; on I/O failure
+// the settled nonce remains spent in memory and the journal entry is retained
+// as PendingPersist so FlushPending or a later Commit can durably recover it.
 func (s *MemoryNonceStore) Commit(_ context.Context, claim NonceClaim, idempotencyKey string, cached *CachedResponse) error {
 	claimKey := claim.Key()
 	idempotencyKey = strings.TrimSpace(idempotencyKey)
@@ -229,8 +244,10 @@ func (s *MemoryNonceStore) Commit(_ context.Context, claim NonceClaim, idempoten
 	s.spent[claimKey] = now
 
 	var savedRec *IdempotencyRecord
+	var rec *IdempotencyRecord
 	if idempotencyKey != "" {
-		rec, ok := s.idempotency[idempotencyKey]
+		var ok bool
+		rec, ok = s.idempotency[idempotencyKey]
 		if !ok {
 			rec = &IdempotencyRecord{
 				Key:      idempotencyKey,
@@ -239,37 +256,107 @@ func (s *MemoryNonceStore) Commit(_ context.Context, claim NonceClaim, idempoten
 			s.idempotency[idempotencyKey] = rec
 		}
 		rec.InFlight = false
-		rec.Committed = true
 		rec.Response = cloneCachedResponse(cached)
 		rec.UpdatedAt = now
 		cp := *rec
+		cp.Committed = true
+		cp.PendingPersist = false
 		cp.Response = cloneCachedResponse(cached)
 		savedRec = &cp
 	}
 
-	if s.journalPath != "" {
-		entry := nonceJournalEntry{
-			ClaimKey:    claimKey,
-			Idempotency: savedRec,
-			CommittedAt: now,
+	if s.journalPath == "" {
+		if rec != nil {
+			rec.Committed = true
+			rec.PendingPersist = false
 		}
+		return nil
+	}
+
+	entry := nonceJournalEntry{
+		ClaimKey:    claimKey,
+		Idempotency: savedRec,
+		CommittedAt: now,
+	}
+	s.upsertPendingLocked(entry)
+	if rec != nil {
+		rec.Committed = false
+		rec.PendingPersist = true
+	}
+	if err := s.flushPendingLocked(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// FlushPending attempts to durably write any settlements whose previous journal
+// append failed, promoting their idempotency records to Committed on success.
+func (s *MemoryNonceStore) FlushPending() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.flushPendingLocked()
+}
+
+// PendingCount returns the number of settled entries awaiting durable journal persistence.
+func (s *MemoryNonceStore) PendingCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.pending)
+}
+
+func (s *MemoryNonceStore) upsertPendingLocked(entry nonceJournalEntry) {
+	for i := range s.pending {
+		if s.pending[i].ClaimKey == entry.ClaimKey {
+			s.pending[i] = entry
+			return
+		}
+	}
+	s.pending = append(s.pending, entry)
+}
+
+func (s *MemoryNonceStore) flushPendingLocked() error {
+	if s.journalPath == "" || len(s.pending) == 0 {
+		s.pending = nil
+		return nil
+	}
+	var payload []byte
+	for _, entry := range s.pending {
 		line, err := json.Marshal(entry)
 		if err != nil {
 			return fmt.Errorf("x402: marshal nonce journal: %w", err)
 		}
-		f, err := os.OpenFile(s.journalPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-		if err != nil {
-			return fmt.Errorf("x402: append nonce journal: %w", err)
-		}
-		_, werr := f.Write(append(line, '\n'))
-		cerr := f.Close()
-		if werr != nil {
-			return fmt.Errorf("x402: write nonce journal: %w", werr)
-		}
-		if cerr != nil {
-			return fmt.Errorf("x402: close nonce journal: %w", cerr)
+		payload = append(payload, line...)
+		payload = append(payload, '\n')
+	}
+	f, err := os.OpenFile(s.journalPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("x402: append nonce journal: %w", err)
+	}
+	_, werr := f.Write(payload)
+	serr := error(nil)
+	if werr == nil {
+		serr = f.Sync()
+	}
+	cerr := f.Close()
+	if werr != nil {
+		return fmt.Errorf("x402: write nonce journal: %w", werr)
+	}
+	if serr != nil {
+		return fmt.Errorf("x402: sync nonce journal: %w", serr)
+	}
+	if cerr != nil {
+		return fmt.Errorf("x402: close nonce journal: %w", cerr)
+	}
+	for _, entry := range s.pending {
+		if entry.Idempotency != nil && entry.Idempotency.Key != "" {
+			if rec, ok := s.idempotency[entry.Idempotency.Key]; ok {
+				rec.InFlight = false
+				rec.Committed = true
+				rec.PendingPersist = false
+			}
 		}
 	}
+	s.pending = nil
 	return nil
 }
 
@@ -284,7 +371,7 @@ func (s *MemoryNonceStore) Release(_ context.Context, claim NonceClaim, idempote
 
 	delete(s.inflight, claimKey)
 	if idempotencyKey != "" {
-		if rec, ok := s.idempotency[idempotencyKey]; ok && !rec.Committed {
+		if rec, ok := s.idempotency[idempotencyKey]; ok && !rec.Committed && !rec.PendingPersist {
 			delete(s.idempotency, idempotencyKey)
 		}
 	}
@@ -300,12 +387,17 @@ func (s *MemoryNonceStore) IsSpent(_ context.Context, claim NonceClaim) bool {
 }
 
 // LookupIdempotency returns a copy of the stored IdempotencyRecord if present.
+// If the record is PendingPersist, LookupIdempotency attempts to flush pending
+// journal entries before returning.
 func (s *MemoryNonceStore) LookupIdempotency(_ context.Context, idempotencyKey string) (*IdempotencyRecord, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rec, ok := s.idempotency[strings.TrimSpace(idempotencyKey)]
 	if !ok {
 		return nil, false
+	}
+	if rec.PendingPersist {
+		_ = s.flushPendingLocked()
 	}
 	cp := *rec
 	cp.Response = cloneCachedResponse(rec.Response)
