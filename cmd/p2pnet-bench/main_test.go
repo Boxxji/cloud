@@ -66,8 +66,22 @@ func TestBenchmarkAllRegimesAndDossierParity(t *testing.T) {
 		if err != nil || len(data) < 200 {
 			t.Fatalf("expected non-empty %s, err=%v len=%d", fn, err, len(data))
 		}
-		if strings.Contains(string(data), "NaN") || strings.Contains(string(data), "+Inf") || strings.Contains(string(data), "-Inf") {
+		text := string(data)
+		if strings.Contains(text, "NaN") || strings.Contains(text, "+Inf") || strings.Contains(text, "-Inf") {
 			t.Fatalf("%s contains NaN/Inf", fn)
+		}
+		if fn == "raw_results.json" {
+			if strings.Contains(text, `"ttft_overall"`) {
+				t.Fatalf("raw_results.json must not report unlabeled ttft_overall")
+			}
+			if !strings.Contains(text, `"estimated_client_ttft"`) || !strings.Contains(text, `"provider_local_ttft"`) || !strings.Contains(text, `"ttft_methodology"`) {
+				t.Fatalf("raw_results.json must distinguish estimated_client_ttft and provider_local_ttft with methodology")
+			}
+		}
+		if fn == "README.md" {
+			if !strings.Contains(text, "estimated client TTFT") || !strings.Contains(text, "measured provider-local first-token") {
+				t.Fatalf("README.md must explicitly label estimated client TTFT vs measured provider-local first-token")
+			}
 		}
 	}
 }

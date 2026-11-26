@@ -173,9 +173,15 @@ func ForkFromBundle(ctx context.Context, cfg NodeConfig, bundle MeshExportBundle
 	}
 
 	for _, p := range bundle.BootstrapPeers {
+		p.LivenessVerified = false
+		p.RTTMs = 0
+		p.ConsecutiveFailures = 0
 		node.Table.UpsertPeer(p)
 	}
 	for _, p := range bundle.RoutingTable {
+		p.LivenessVerified = false
+		p.RTTMs = 0
+		p.ConsecutiveFailures = 0
 		node.Table.UpsertPeer(p)
 	}
 	for _, ann := range bundle.Announcements {

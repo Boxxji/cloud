@@ -129,6 +129,9 @@ func (rt *RoutingTable) UpsertPeer(info PeerInfo) bool {
 			}
 			if !cp.LivenessVerified {
 				cp.LivenessVerified = bucket[i].LivenessVerified
+				if cp.ConsecutiveFailures == 0 {
+					cp.ConsecutiveFailures = bucket[i].ConsecutiveFailures
+				}
 			}
 			// Move refreshed entry to tail (most recently seen).
 			bucket = append(bucket[:i], bucket[i+1:]...)
@@ -317,7 +320,9 @@ type DHTStore struct {
 	mu                    sync.RWMutex
 	policy                VerifyPolicy
 	announcements         map[PeerID]CapabilityAnnouncement
+	lastAnnouncement      map[PeerID]CapabilityAnnouncement
 	digests               map[string]struct{}
+	removedDigests        map[PeerID]string
 	highestSeq            map[PeerID]uint64
 	seenNonces            map[PeerID]map[string]struct{}
 	senderNewPeerWindow   map[PeerID]int
@@ -334,7 +339,9 @@ func NewDHTStore(policy VerifyPolicy) *DHTStore {
 	return &DHTStore{
 		policy:               policy,
 		announcements:        make(map[PeerID]CapabilityAnnouncement),
+		lastAnnouncement:     make(map[PeerID]CapabilityAnnouncement),
 		digests:              make(map[string]struct{}),
+		removedDigests:       make(map[PeerID]string),
 		highestSeq:           make(map[PeerID]uint64),
 		seenNonces:           make(map[PeerID]map[string]struct{}),
 		senderNewPeerWindow:  make(map[PeerID]int),
@@ -358,20 +365,29 @@ func (s *DHTStore) HasDigest(ann CapabilityAnnouncement) bool {
 // PutAnnouncement verifies ann fail-closed (unless policy.DisableVerification
 // is explicitly set for the negative-control benchmark) and stores it.
 // senderID identifies the gossip/RPC neighbor relaying ann (empty for local).
-// livenessOK indicates whether the announced peer passed a liveness check or
-// is an already-known peer; unknown peers exceeding the per-sender Sybil burst
-// quota without liveness verification are rejected with ErrSybilFloodDetected.
+// livenessOK indicates whether the announced peer passed a local liveness check
+// or is an already-known peer; unknown peers exceeding the per-sender Sybil
+// burst quota without local liveness verification are rejected with
+// ErrSybilFloodDetected.
 func (s *DHTStore) PutAnnouncement(ann CapabilityAnnouncement, senderID PeerID, livenessOK bool, nowUnix int64) error {
 	s.verifyOps.Add(1)
 	if err := VerifyAnnouncementStateless(ann, nowUnix, s.policy); err != nil {
 		s.recordReject(err)
 		return err
 	}
+	digest := AnnouncementDigest(ann)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if !s.policy.DisableVerification {
+	_, active := s.announcements[ann.PeerID]
+	// Safe rehydration: if an identical previously-verified announcement was
+	// removed while still valid (not expired), allow restoring that exact
+	// record without tripping nonce/sequence replay guards. Any modified or
+	// lower-sequence announcement continues to fail closed.
+	isRehydration := !active && digest != "" && s.removedDigests[ann.PeerID] == digest
+
+	if !s.policy.DisableVerification && !isRehydration {
 		// Anti-replay nonce check.
 		if nonces, ok := s.seenNonces[ann.PeerID]; ok {
 			if _, used := nonces[ann.Nonce]; used {
@@ -385,7 +401,7 @@ func (s *DHTStore) PutAnnouncement(ann CapabilityAnnouncement, senderID PeerID, 
 			return fmt.Errorf("%w: peer %s seq %d <= %d", ErrSequenceRollback, ann.PeerID, ann.Seq, prevSeq)
 		}
 		// Sybil burst & unprobed admission guard.
-		if _, known := s.announcements[ann.PeerID]; !known && !livenessOK && senderID != "" {
+		if !active && !livenessOK && senderID != "" {
 			if s.senderWindowStart == 0 || nowUnix-s.senderWindowStart >= 60 {
 				s.senderWindowStart = nowUnix
 				s.senderNewPeerWindow = make(map[PeerID]int)
@@ -403,8 +419,10 @@ func (s *DHTStore) PutAnnouncement(ann CapabilityAnnouncement, senderID PeerID, 
 		cp.VerificationClass = "unverified_negative_control"
 	}
 	s.announcements[cp.PeerID] = cp
-	if d := AnnouncementDigest(cp); d != "" {
-		s.digests[d] = struct{}{}
+	s.lastAnnouncement[cp.PeerID] = cp
+	delete(s.removedDigests, cp.PeerID)
+	if digest != "" {
+		s.digests[digest] = struct{}{}
 	}
 	if cp.Seq > s.highestSeq[cp.PeerID] {
 		s.highestSeq[cp.PeerID] = cp.Seq
@@ -454,11 +472,32 @@ func (s *DHTStore) GetAnnouncement(peerID PeerID, nowUnix int64) (CapabilityAnno
 	return CloneAnnouncement(ann), true
 }
 
-// RemoveAnnouncement removes peerID's active announcement (e.g., on confirmed death).
+// LastAnnouncement returns the highest-sequence verified announcement ever
+// stored for peerID (even if expired or removed), used for cryptographic
+// self-sequence catch-up after an operator restarts a peer identity.
+func (s *DHTStore) LastAnnouncement(peerID PeerID) (CapabilityAnnouncement, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ann, ok := s.lastAnnouncement[peerID]
+	if !ok {
+		return CapabilityAnnouncement{}, false
+	}
+	return CloneAnnouncement(ann), true
+}
+
+// RemoveAnnouncement removes peerID's active announcement while recording its
+// digest so an identical still-valid verified record can be safely rehydrated
+// later if the peer becomes reachable again.
 func (s *DHTStore) RemoveAnnouncement(peerID PeerID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.announcements, peerID)
+	if ann, ok := s.announcements[peerID]; ok {
+		if d := AnnouncementDigest(ann); d != "" {
+			delete(s.digests, d)
+			s.removedDigests[peerID] = d
+		}
+		delete(s.announcements, peerID)
+	}
 }
 
 // ListAnnouncements returns all non-expired announcements sorted by PeerID.

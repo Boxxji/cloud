@@ -120,7 +120,9 @@ type RegimeResult struct {
 	RoutingLatencyPreKill     LatencySummary       `json:"routing_latency_pre_kill"`
 	RoutingLatencyPostKill    LatencySummary       `json:"routing_latency_post_kill"`
 	RoutingLatencyOverall     LatencySummary       `json:"routing_latency_overall"`
-	TTFTOverall               LatencySummary       `json:"ttft_overall"`
+	ProviderLocalTTFT         LatencySummary       `json:"provider_local_ttft"`
+	EstimatedClientTTFT       LatencySummary       `json:"estimated_client_ttft"`
+	TTFTMethodology           string               `json:"ttft_methodology,omitempty"`
 	ThroughputReqPerSec       float64              `json:"throughput_req_per_sec"`
 	ThroughputTokPerSec       float64              `json:"throughput_tok_per_sec"`
 	TotalVerifyOps            int64                `json:"total_verify_ops"`
@@ -723,7 +725,7 @@ func runCentralizedBaseline(ctx context.Context, seed int64, nodeCount, totalReq
 	}
 	convMs := elapsedMs(convStart)
 
-	var routeLats, ttfts []float64
+	var routeLats, providerTTFTs, estClientTTFTs []float64
 	var usefulTokens, computeMicroUSD int64
 	completed, natCompleted := 0, 0
 	providerHits := make(map[p2pnet.PeerID]int)
@@ -759,7 +761,8 @@ func runCentralizedBaseline(ctx context.Context, seed int64, nodeCount, totalReq
 		}
 		totalLat := elapsedMs(t0)
 		routeLats = append(routeLats, totalLat)
-		ttfts = append(ttfts, res.Response.TTFTMs+totalLat*0.45)
+		providerTTFTs = append(providerTTFTs, res.Response.TTFTMs)
+		estClientTTFTs = append(estClientTTFTs, res.Response.TTFTMs+totalLat*0.45)
 		completed++
 		if res.UsedRelay {
 			natCompleted++
@@ -783,6 +786,8 @@ func runCentralizedBaseline(ctx context.Context, seed int64, nodeCount, totalReq
 	cost := computeCostBreakdown(usefulTokens, computeMicroUSD, totalVerify, totalBytes, hanzoCalls, true)
 	hhi, activeProvs := computeProviderHHI(providerHits)
 
+	const ttftNote = "estimated_client_ttft is an analytical estimate (provider_local_ttft + 0.45 * complete_routing_latency); the unary RPC transport buffers full responses rather than streaming client-observed first-token events"
+
 	return RegimeResult{
 		Name:                      "centralized_registry_baseline",
 		Description:               "20-node mesh relying on a single centralized HTTP registration & provider-lookup service.",
@@ -804,7 +809,9 @@ func runCentralizedBaseline(ctx context.Context, seed int64, nodeCount, totalReq
 		NATRelayedCompleted:       natCompleted,
 		RoutingLatencyPreKill:     summarizeLatencies(routeLats),
 		RoutingLatencyOverall:     summarizeLatencies(routeLats),
-		TTFTOverall:               summarizeLatencies(ttfts),
+		ProviderLocalTTFT:         summarizeLatencies(providerTTFTs),
+		EstimatedClientTTFT:       summarizeLatencies(estClientTTFTs),
+		TTFTMethodology:           ttftNote,
 		ThroughputReqPerSec:       round2(float64(completed) / elapsedSec),
 		ThroughputTokPerSec:       round2(float64(usefulTokens) / elapsedSec),
 		TotalVerifyOps:            totalVerify,
@@ -837,7 +844,7 @@ func runDecentralizedPrimary(ctx context.Context, seed int64, nodeCount, totalRe
 	preReqs := totalReqs / 2
 	postReqs := totalReqs - preReqs
 
-	var preLats, postLats, allLats, ttfts []float64
+	var preLats, postLats, allLats, providerTTFTs, estClientTTFTs []float64
 	var usefulTokens, computeMicroUSD int64
 	preCompleted, postCompleted, natCompleted := 0, 0, 0
 	providerHits := make(map[p2pnet.PeerID]int)
@@ -863,7 +870,8 @@ func runDecentralizedPrimary(ctx context.Context, seed int64, nodeCount, totalRe
 		}
 		preLats = append(preLats, res.RoutingLatencyMs)
 		allLats = append(allLats, res.RoutingLatencyMs)
-		ttfts = append(ttfts, res.Response.TTFTMs+res.RoutingLatencyMs*0.45)
+		providerTTFTs = append(providerTTFTs, res.Response.TTFTMs)
+		estClientTTFTs = append(estClientTTFTs, res.Response.TTFTMs+res.RoutingLatencyMs*0.45)
 		usefulTokens += int64(2048 + res.Response.TokensGenerated)
 		computeMicroUSD += res.Response.CostMicroUSD
 		providerHits[res.Response.ServedByPeerID]++
@@ -921,7 +929,8 @@ func runDecentralizedPrimary(ctx context.Context, seed int64, nodeCount, totalRe
 		}
 		postLats = append(postLats, res.RoutingLatencyMs)
 		allLats = append(allLats, res.RoutingLatencyMs)
-		ttfts = append(ttfts, res.Response.TTFTMs+res.RoutingLatencyMs*0.45)
+		providerTTFTs = append(providerTTFTs, res.Response.TTFTMs)
+		estClientTTFTs = append(estClientTTFTs, res.Response.TTFTMs+res.RoutingLatencyMs*0.45)
 		usefulTokens += int64(2048 + res.Response.TokensGenerated)
 		computeMicroUSD += res.Response.CostMicroUSD
 		providerHits[res.Response.ServedByPeerID]++
@@ -1009,6 +1018,8 @@ func runDecentralizedPrimary(ctx context.Context, seed int64, nodeCount, totalRe
 	hhi, activeProvs := computeProviderHHI(providerHits)
 	totalCompleted := preCompleted + postCompleted
 
+	const ttftNote = "estimated_client_ttft is an analytical estimate (provider_local_ttft + 0.45 * complete_routing_latency); the unary RPC transport buffers full responses rather than streaming client-observed first-token events"
+
 	return RegimeResult{
 		Name:                      "hip1350_decentralized_p2p_20n",
 		Description:               "Primary 20-node decentralized Kademlia DHT + gossip + mutual-TLS 1.3 + UDP probe + circuit-relay mesh with ALL 3 bootstrap nodes and 2 intermediate relays killed mid-run.",
@@ -1038,7 +1049,9 @@ func runDecentralizedPrimary(ctx context.Context, seed int64, nodeCount, totalRe
 		RoutingLatencyPreKill:     summarizeLatencies(preLats),
 		RoutingLatencyPostKill:    summarizeLatencies(postLats),
 		RoutingLatencyOverall:     summarizeLatencies(allLats),
-		TTFTOverall:               summarizeLatencies(ttfts),
+		ProviderLocalTTFT:         summarizeLatencies(providerTTFTs),
+		EstimatedClientTTFT:       summarizeLatencies(estClientTTFTs),
+		TTFTMethodology:           ttftNote,
 		ThroughputReqPerSec:       round2(float64(totalCompleted) / totalWorkSec),
 		ThroughputTokPerSec:       round2(float64(usefulTokens) / totalWorkSec),
 		TotalVerifyOps:            totalVerify,
@@ -1130,7 +1143,7 @@ func runNegUnverifiedControl(ctx context.Context, seed int64, nodeCount, totalRe
 		_ = topo.nodes[cidx].SubmitAnnouncement(ctx, forgedHijackAd, rogue.ID.PeerID)
 	}
 
-	var lats, ttfts []float64
+	var lats, providerTTFTs, estClientTTFTs []float64
 	hijacked, legitCompleted := 0, 0
 	var usefulTokens, computeMicroUSD int64
 	reqStart := time.Now()
@@ -1148,7 +1161,8 @@ func runNegUnverifiedControl(ctx context.Context, seed int64, nodeCount, totalRe
 			continue
 		}
 		lats = append(lats, res.RoutingLatencyMs)
-		ttfts = append(ttfts, res.Response.TTFTMs+res.RoutingLatencyMs*0.45)
+		providerTTFTs = append(providerTTFTs, res.Response.TTFTMs)
+		estClientTTFTs = append(estClientTTFTs, res.Response.TTFTMs+res.RoutingLatencyMs*0.45)
 		if res.Hijacked {
 			hijacked++
 		} else {
@@ -1166,6 +1180,8 @@ func runNegUnverifiedControl(ctx context.Context, seed int64, nodeCount, totalRe
 		totalBytes += tel.BytesSent + tel.BytesReceived
 	}
 	cost := computeCostBreakdown(usefulTokens, computeMicroUSD, totalVerify, totalBytes, 0, false)
+
+	const ttftNote = "estimated_client_ttft is an analytical estimate (provider_local_ttft + 0.45 * complete_routing_latency); the unary RPC transport buffers full responses rather than streaming client-observed first-token events"
 
 	return RegimeResult{
 		Name:                      "neg_unverified_advertisements_control",
@@ -1189,7 +1205,9 @@ func runNegUnverifiedControl(ctx context.Context, seed int64, nodeCount, totalRe
 		HijackRatePct:             round2(100.0 * float64(hijacked) / float64(totalReqs)),
 		RoutingLatencyPreKill:     summarizeLatencies(lats),
 		RoutingLatencyOverall:     summarizeLatencies(lats),
-		TTFTOverall:               summarizeLatencies(ttfts),
+		ProviderLocalTTFT:         summarizeLatencies(providerTTFTs),
+		EstimatedClientTTFT:       summarizeLatencies(estClientTTFTs),
+		TTFTMethodology:           ttftNote,
 		ThroughputReqPerSec:       round2(float64(legitCompleted) / elapsedSec),
 		ThroughputTokPerSec:       round2(float64(usefulTokens) / elapsedSec),
 		TotalVerifyOps:            totalVerify,
@@ -1629,12 +1647,13 @@ func renderDossierREADME(rep BenchmarkReport) string {
 		primary.Cost.BandwidthOverheadMicroUSD, primary.TotalBytesTransferred,
 		baseline.Cost.RealizedUSDPer1MTokens, baseline.Cost.RegistryOverheadMicroUSD, baseline.HanzoCalls,
 		primary.SavingsVsBaselinePct)
-	fmt.Fprintf(&b, "2. **Performance**: Full 20-node Kademlia + gossip convergence completed in **%.2f ms** (mean **%.2f** discovered peers per node; signed UDP/QUIC-ready probe mean RTT **%.2f ms**). Overall routing latency p50/p95/p99 = **%.2f / %.2f / %.2f ms** (pre-kill p50/p95/p99 = **%.2f / %.2f / %.2f ms**, post-kill p50/p95/p99 = **%.2f / %.2f / %.2f ms**), TTFT p50/p95/p99 = **%.2f / %.2f / %.2f ms**, throughput = **%.2f req/s** (**%.2f tok/s**), with **%.2f%%** pre-kill completion and **%.2f%%** post-kill completion (including **%d** NAT circuit-relayed inference completions and **%d** automatic routing failovers).\n",
+	fmt.Fprintf(&b, "2. **Performance**: Full 20-node Kademlia + gossip convergence completed in **%.2f ms** (mean **%.2f** discovered peers per node; signed UDP/QUIC-ready probe mean RTT **%.2f ms**). Overall routing latency p50/p95/p99 = **%.2f / %.2f / %.2f ms** (pre-kill p50/p95/p99 = **%.2f / %.2f / %.2f ms**, post-kill p50/p95/p99 = **%.2f / %.2f / %.2f ms**), measured provider-local first-token p50/p95/p99 = **%.2f / %.2f / %.2f ms**, estimated client TTFT (unary-buffered estimate: provider-local first-token + 45%% routing latency; not streamed client-observed TTFT) p50/p95/p99 = **%.2f / %.2f / %.2f ms**, throughput = **%.2f req/s** (**%.2f tok/s**), with **%.2f%%** pre-kill completion and **%.2f%%** post-kill completion (including **%d** NAT circuit-relayed inference completions and **%d** automatic routing failovers).\n",
 		primary.ConvergenceMs, primary.MeanDiscoveredPeers, primary.UDPProbeMeanRTTMs,
 		primary.RoutingLatencyOverall.P50Ms, primary.RoutingLatencyOverall.P95Ms, primary.RoutingLatencyOverall.P99Ms,
 		primary.RoutingLatencyPreKill.P50Ms, primary.RoutingLatencyPreKill.P95Ms, primary.RoutingLatencyPreKill.P99Ms,
 		primary.RoutingLatencyPostKill.P50Ms, primary.RoutingLatencyPostKill.P95Ms, primary.RoutingLatencyPostKill.P99Ms,
-		primary.TTFTOverall.P50Ms, primary.TTFTOverall.P95Ms, primary.TTFTOverall.P99Ms,
+		primary.ProviderLocalTTFT.P50Ms, primary.ProviderLocalTTFT.P95Ms, primary.ProviderLocalTTFT.P99Ms,
+		primary.EstimatedClientTTFT.P50Ms, primary.EstimatedClientTTFT.P95Ms, primary.EstimatedClientTTFT.P99Ms,
 		primary.ThroughputReqPerSec, primary.ThroughputTokPerSec,
 		primary.PreKillCompletionPct, primary.PostKillCompletionPct,
 		primary.NATRelayedCompleted, primary.RoutingFailovers)
@@ -1659,6 +1678,7 @@ func renderDossierREADME(rep BenchmarkReport) string {
 		negPart.PostKillCompleted, negPart.PostKillRequests, negPart.PostKillCompletionPct)
 
 	fmt.Fprintf(&b, "## 6. Limitations & Pre-Production Security Review\n\n")
+	fmt.Fprintf(&b, "- **Unary Buffered Inference & Estimated Client TTFT**: The current `INFER_REQUEST` RPC buffers the complete inference response until generation finishes and does not stream token chunks to the client. Accordingly, `provider_local_ttft` reports measured provider-local first-token hash timing, while `estimated_client_ttft` (`provider_local_ttft + 0.45 * complete_routing_latency`) is explicitly an analytical estimate rather than a measured client-observed streaming first-token event.\n")
 	fmt.Fprintf(&b, "- **Transport & QUIC-v1 Framing**: To preserve zero new `go.mod` dependencies and zero host imports, the current transport runs mutual-TLS 1.3 over loopback TCP streams alongside a real signed UDP/QUIC-v1 probe socket advertising `/udp/<port>/quic-v1/p2p/<peerID>` multiaddrs. Full QUIC-v1 multiplexed streams (`quic-go` or `rust-libp2p` QUIC bridge) can swap directly beneath the internal RPC framing layer without changing identities, announcements, or DHT routing.\n")
 	fmt.Fprintf(&b, "- **NAT Hole-Punching (DCUtR)**: Symmetric NAT traversal is fully implemented via zero-registry circuit-relay v2 with automatic relay failover; direct UDP hole-punching upgrade (DCUtR) is an incremental transport optimization for WAN deployments.\n")
 	fmt.Fprintf(&b, "- **Sybil Resistance at Internet Scale**: On an open WAN, an adversary controlling many distinct live IP/key pairs can still pass `network_liveness_probe`. Production deployments should layer S/Kademlia static crypto puzzles, per-/24 IP-diversity bucket quotas, and bonded provider stake (`hanzoai/cloud#14`/`#17`), and undergo independent external security review prior to routing production value.\n")

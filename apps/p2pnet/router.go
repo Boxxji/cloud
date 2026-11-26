@@ -4,6 +4,7 @@ package p2pnet
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
@@ -30,6 +31,15 @@ type NodeConfig struct {
 	AnnouncementTTLSec    int64
 	Policy                VerifyPolicy
 	HanzoRegistryDisabled bool
+	// InitialSeq optionally sets a minimum sequence floor for announcements
+	// published by this node's identity.
+	InitialSeq uint64
+	// SequenceStore optionally persists per-identity announcement sequences
+	// across process restarts so reusing an Identity never rolls back sequences.
+	SequenceStore SequenceStore
+	// MaintenanceInterval optionally overrides how frequently the background
+	// lifecycle loop checks for expiring self-announcements and expired records.
+	MaintenanceInterval time.Duration
 	// RogueHijackMode, when true on an adversarial test node, responds to
 	// routed requests with tampered/hijacked payloads to measure impact under
 	// the unverified negative-control regime.
@@ -73,22 +83,25 @@ type RouteResult struct {
 // Node is a full autonomous P2P discovery, Kademlia DHT, gossip, circuit-relay,
 // and model-routing node operating over real loopback TLS 1.3 and UDP sockets.
 type Node struct {
-	ID      *Identity
-	Config  NodeConfig
-	Table   *RoutingTable
-	Store   *DHTStore
-	tlsCert tls.Certificate
+	ID        *Identity
+	Config    NodeConfig
+	Table     *RoutingTable
+	Store     *DHTStore
+	tlsCert   tls.Certificate
+	bootNonce string
 
-	mu            sync.RWMutex
-	tcpListener   net.Listener
-	udpConn       net.PacketConn
-	tcpAddr       string
-	udpAddr       string
-	relayAddrs    []string
-	seq           uint64
-	selfAnnounce  CapabilityAnnouncement
-	relaySessions map[PeerID]*relaySession // populated when NATMode == NATRelayServer
-	natRelays     map[PeerID]net.Conn      // outbound relay tunnels when NATMode == NATRelayed
+	mu               sync.RWMutex
+	renewMu          sync.Mutex
+	tcpListener      net.Listener
+	udpConn          net.PacketConn
+	tcpAddr          string
+	udpAddr          string
+	relayAddrs       []string
+	seq              uint64
+	selfAnnounce     CapabilityAnnouncement
+	relaySessions    map[PeerID]*relaySession // populated when NATMode == NATRelayServer
+	natRelays        map[PeerID]net.Conn      // outbound relay tunnels when NATMode == NATRelayed
+	providerFailures map[PeerID]int           // temporary routing failure counts (cleared on recovery)
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -132,18 +145,39 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	if cfg.Policy.MaxClockSkewSec == 0 && !cfg.Policy.DisableVerification {
 		cfg.Policy = DefaultVerifyPolicy()
 	}
+
+	seqFloor := cfg.InitialSeq
+	if idSeq := id.LastSeq(); idSeq > seqFloor {
+		seqFloor = idSeq
+	}
+	if cfg.SequenceStore != nil {
+		persisted, err := cfg.SequenceStore.LoadSequence(id.PeerID)
+		if err != nil {
+			return nil, fmt.Errorf("p2pnet: load sequence for %s: %w", id.PeerID, err)
+		}
+		if persisted > seqFloor {
+			seqFloor = persisted
+		}
+	}
+	id.ObserveSeq(seqFloor)
+
 	cert, err := GeneratePeerTLSCert(id)
 	if err != nil {
 		return nil, err
 	}
+	var bn [4]byte
+	_, _ = rand.Read(bn[:])
 	n := &Node{
-		ID:            id,
-		Config:        cfg,
-		Table:         NewRoutingTable(id.PeerID, DefaultK),
-		Store:         NewDHTStore(cfg.Policy),
-		tlsCert:       cert,
-		relaySessions: make(map[PeerID]*relaySession),
-		natRelays:     make(map[PeerID]net.Conn),
+		ID:               id,
+		Config:           cfg,
+		Table:            NewRoutingTable(id.PeerID, DefaultK),
+		Store:            NewDHTStore(cfg.Policy),
+		tlsCert:          cert,
+		bootNonce:        hex.EncodeToString(bn[:]),
+		seq:              seqFloor,
+		relaySessions:    make(map[PeerID]*relaySession),
+		natRelays:        make(map[PeerID]net.Conn),
+		providerFailures: make(map[PeerID]int),
 	}
 	return n, nil
 }
@@ -157,12 +191,178 @@ func (n *Node) nowUnix() int64 {
 
 func (n *Node) nextReqID() string {
 	seq := n.reqCounter.Add(1)
-	return fmt.Sprintf("%s-%d", string(n.ID.PeerID)[:10], seq)
+	return fmt.Sprintf("%s-%s-%d", string(n.ID.PeerID)[:10], n.bootNonce, seq)
+}
+
+func (n *Node) currentSeq() uint64 {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if idSeq := n.ID.LastSeq(); idSeq > n.seq {
+		return idSeq
+	}
+	return n.seq
+}
+
+func (n *Node) nextAnnouncementSeq() (uint64, error) {
+	n.mu.Lock()
+	next := n.ID.AdvanceSeq(n.seq)
+	n.seq = next
+	n.mu.Unlock()
+	if n.Config.SequenceStore != nil {
+		if err := n.Config.SequenceStore.SaveSequence(n.ID.PeerID, next); err != nil {
+			return 0, fmt.Errorf("p2pnet: save sequence %d for %s: %w", next, n.ID.PeerID, err)
+		}
+	}
+	return next, nil
+}
+
+func (n *Node) observeSelfSeq(seq uint64) {
+	if seq == 0 {
+		return
+	}
+	n.mu.Lock()
+	if seq > n.seq {
+		n.seq = seq
+	}
+	n.ID.ObserveSeq(seq)
+	cur := n.seq
+	n.mu.Unlock()
+	if n.Config.SequenceStore != nil {
+		_ = n.Config.SequenceStore.SaveSequence(n.ID.PeerID, cur)
+	}
+}
+
+func (n *Node) verifySelfSignedAnnouncement(ann CapabilityAnnouncement) bool {
+	if ann.PeerID != n.ID.PeerID || ann.Seq == 0 {
+		return false
+	}
+	pub, err := DecodePublicKeyHex(ann.PublicKey)
+	if err != nil || !pub.Equal(n.ID.PublicKey) {
+		return false
+	}
+	sig, err := hex.DecodeString(strings.TrimSpace(ann.Signature))
+	if err != nil || len(sig) != ed25519.SignatureSize {
+		return false
+	}
+	payload, err := CanonicalAnnouncementBytes(ann)
+	if err != nil {
+		return false
+	}
+	return ed25519.Verify(n.ID.PublicKey, payload, sig)
+}
+
+func (n *Node) announcementRenewLead() int64 {
+	lead := n.Config.AnnouncementTTLSec / 2
+	if lead < 1 {
+		lead = 1
+	}
+	return lead
+}
+
+func (n *Node) maintenanceInterval() time.Duration {
+	if n.Config.MaintenanceInterval > 0 {
+		return n.Config.MaintenanceInterval
+	}
+	if n.Config.Now != nil {
+		return 50 * time.Millisecond
+	}
+	d := time.Duration(n.Config.AnnouncementTTLSec) * time.Second / 4
+	if d < 100*time.Millisecond {
+		return 100 * time.Millisecond
+	}
+	if d > 15*time.Second {
+		return 15 * time.Second
+	}
+	return d
+}
+
+// maybeRenewSelfAnnouncement checks whether this node's active capability
+// announcement is approaching or past its TTL and re-signs a fresh monotonic
+// announcement if so. Returns true if a renewal was performed.
+func (n *Node) maybeRenewSelfAnnouncement() bool {
+	if n.closed.Load() {
+		return false
+	}
+	n.renewMu.Lock()
+	defer n.renewMu.Unlock()
+	if n.closed.Load() {
+		return false
+	}
+	if len(n.Multiaddrs()) == 0 && len(n.RelayMultiaddrs()) == 0 {
+		return false
+	}
+	now := n.nowUnix()
+	ann := n.SelfAnnouncement()
+	lead := n.announcementRenewLead()
+	if ann.PeerID != "" && now+lead < ann.ExpiresAt {
+		return false
+	}
+	_, err := n.RefreshSelfAnnouncement()
+	return err == nil
+}
+
+func (n *Node) maintenanceLoop() {
+	defer n.wg.Done()
+	ticker := time.NewTicker(n.maintenanceInterval())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+		case <-ticker.C:
+			if n.closed.Load() {
+				return
+			}
+			now := n.nowUnix()
+			n.Store.PruneExpired(now)
+			if n.maybeRenewSelfAnnouncement() {
+				pubCtx, cancel := context.WithTimeout(n.ctx, defaultRPCTimeout)
+				n.PublishAnnouncement(pubCtx)
+				cancel()
+			}
+		}
+	}
+}
+
+func (n *Node) recordProviderFailure(peerID PeerID) {
+	if peerID == "" {
+		return
+	}
+	n.mu.Lock()
+	n.providerFailures[peerID]++
+	n.mu.Unlock()
+}
+
+func (n *Node) clearProviderFailure(peerID PeerID) {
+	if peerID == "" {
+		return
+	}
+	n.mu.Lock()
+	delete(n.providerFailures, peerID)
+	n.mu.Unlock()
+}
+
+func (n *Node) providerFailureCount(peerID PeerID) int {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.providerFailures[peerID]
+}
+
+// sanitizeRemotePeerInfo clears transport-claimed liveness and health telemetry
+// on PeerInfo received from untrusted peers over gossip or DHT RPCs. Only local
+// authenticated probes/handshakes may establish LivenessVerified.
+func sanitizeRemotePeerInfo(pi PeerInfo) PeerInfo {
+	cp := ClonePeerInfo(pi)
+	cp.LivenessVerified = false
+	cp.RTTMs = 0
+	cp.ConsecutiveFailures = 0
+	return cp
 }
 
 // Start binds real loopback sockets (TLS 1.3 TCP + UDP probe socket for direct
-// and relay-server nodes) and begins serving P2P RPCs. NATRelayed nodes do not
-// open a direct TCP listener; they communicate outbound via circuit relays.
+// and relay-server nodes), begins serving P2P RPCs, and schedules the
+// lifecycle-managed announcement renewal loop. NATRelayed nodes do not open a
+// direct TCP listener; they communicate outbound via circuit relays.
 func (n *Node) Start(parentCtx context.Context) error {
 	if parentCtx == nil {
 		parentCtx = context.Background()
@@ -197,6 +397,9 @@ func (n *Node) Start(parentCtx context.Context) error {
 			return err
 		}
 	}
+
+	n.wg.Add(1)
+	go n.maintenanceLoop()
 	return nil
 }
 
@@ -302,10 +505,10 @@ func (n *Node) RefreshSelfAnnouncement() (CapabilityAnnouncement, error) {
 	}
 	now := n.nowUnix()
 
-	n.mu.Lock()
-	n.seq++
-	seq := n.seq
-	n.mu.Unlock()
+	seq, err := n.nextAnnouncementSeq()
+	if err != nil {
+		return CapabilityAnnouncement{}, err
+	}
 
 	ann, err := SignCapabilityAnnouncement(n.ID, CapabilityAnnouncement{
 		ProtocolVersion: ProtocolVersion,
@@ -611,10 +814,15 @@ func (n *Node) ProbeUDP(ctx context.Context, peer PeerInfo) (float64, error) {
 		return 0, ErrPeerIDMismatch
 	}
 	n.Table.MarkAlive(peer.PeerID, rttMs, n.nowUnix())
+	n.clearProviderFailure(peer.PeerID)
 	return rttMs, nil
 }
 
 func (n *Node) handleRPC(ctx context.Context, remotePeer PeerID, req RPCEnvelope) RPCEnvelope {
+	return n.handleRPCWithRelay(ctx, remotePeer, "", req)
+}
+
+func (n *Node) handleRPCWithRelay(ctx context.Context, remotePeer PeerID, viaRelay PeerID, req RPCEnvelope) RPCEnvelope {
 	resp := RPCEnvelope{
 		RequestID: req.RequestID,
 		Type:      req.Type,
@@ -667,6 +875,11 @@ func (n *Node) handleRPC(ctx context.Context, remotePeer PeerID, req RPCEnvelope
 		if err != nil {
 			res.Reason = err.Error()
 			resp.Error = err.Error()
+			if errors.Is(err, ErrSequenceRollback) && p.Announcement.PeerID == remotePeer {
+				if prev, ok := n.Store.LastAnnouncement(remotePeer); ok {
+					res.ExistingAnnouncement = &prev
+				}
+			}
 		}
 		out, _ := json.Marshal(res)
 		resp.Payload = out
@@ -677,6 +890,7 @@ func (n *Node) handleRPC(ctx context.Context, remotePeer PeerID, req RPCEnvelope
 			resp.Error = err.Error()
 			return resp
 		}
+		n.maybeRenewSelfAnnouncement()
 		count := f.Count
 		if count <= 0 || count > DefaultK {
 			count = DefaultK
@@ -696,8 +910,16 @@ func (n *Node) handleRPC(ctx context.Context, remotePeer PeerID, req RPCEnvelope
 			resp.Error = err.Error()
 			return resp
 		}
+		n.maybeRenewSelfAnnouncement()
 		accepted, rejected := 0, 0
 		for _, ann := range g.Announcements {
+			if ann.PeerID == n.ID.PeerID {
+				if n.verifySelfSignedAnnouncement(ann) && ann.Seq >= n.currentSeq() {
+					n.observeSelfSeq(ann.Seq)
+					_, _ = n.RefreshSelfAnnouncement()
+				}
+				continue
+			}
 			if n.Store.HasDigest(ann) {
 				continue
 			}
@@ -716,7 +938,7 @@ func (n *Node) handleRPC(ctx context.Context, remotePeer PeerID, req RPCEnvelope
 						continue
 					}
 				}
-				n.Table.UpsertPeer(pi)
+				n.Table.UpsertPeer(sanitizeRemotePeerInfo(pi))
 			}
 		}
 		out, _ := json.Marshal(GossipSyncResponse{
@@ -762,7 +984,7 @@ func (n *Node) handleRPC(ctx context.Context, remotePeer PeerID, req RPCEnvelope
 			resp.Error = err.Error()
 			return resp
 		}
-		iresp, err := n.executeInference(ireq)
+		iresp, err := n.executeInference(ireq, viaRelay)
 		if err != nil {
 			resp.Error = err.Error()
 			return resp
@@ -777,15 +999,15 @@ func (n *Node) handleRPC(ctx context.Context, remotePeer PeerID, req RPCEnvelope
 }
 
 // IngestAnnouncement verifies and stores an incoming CapabilityAnnouncement,
-// performing an active TLS liveness check when an unknown peer's sender
-// approaches the Sybil burst threshold, and updates the Kademlia routing table.
+// requiring locally established liveness before exempting an unknown peer from
+// Sybil admission limits, and updates the Kademlia routing table.
 func (n *Node) IngestAnnouncement(ann CapabilityAnnouncement, senderID PeerID, livenessVerified bool) error {
 	now := n.nowUnix()
 	if !n.Config.Policy.DisableVerification {
-		// Reject unprobed announcements claiming unreachable fake endpoints when
-		// sender is flooding unknown identities.
+		// Only locally established liveness (never gossiped membership or
+		// remote-claimed flags) exempts an unknown peer from Sybil admission checks.
 		if _, alreadyKnown := n.Store.GetAnnouncement(ann.PeerID, now); !alreadyKnown && !livenessVerified && senderID != "" {
-			if _, ok := n.Table.GetPeer(ann.PeerID); ok {
+			if pi, ok := n.Table.GetPeer(ann.PeerID); ok && pi.LivenessVerified && pi.ConsecutiveFailures == 0 {
 				livenessVerified = true
 			}
 		}
@@ -793,6 +1015,7 @@ func (n *Node) IngestAnnouncement(ann CapabilityAnnouncement, senderID PeerID, l
 	if err := n.Store.PutAnnouncement(ann, senderID, livenessVerified, now); err != nil {
 		return err
 	}
+	n.clearProviderFailure(ann.PeerID)
 	if ann.PeerID != n.ID.PeerID {
 		n.Table.UpsertPeer(PeerInfo{
 			PeerID:           ann.PeerID,
@@ -811,7 +1034,8 @@ func (n *Node) IngestAnnouncement(ann CapabilityAnnouncement, senderID PeerID, l
 // SubmitAnnouncement validates an externally submitted announcement (e.g., via
 // HTTP or adversarial test harness), enforcing cryptographic verification,
 // replay/sequence checks, and a real mutual-TLS 1.3 liveness probe for unknown
-// newcomer peers to defeat Sybil fake-identity floods fail-closed.
+// or locally unverified newcomer peers to defeat Sybil fake-identity floods
+// fail-closed.
 func (n *Node) SubmitAnnouncement(ctx context.Context, ann CapabilityAnnouncement, senderID PeerID) error {
 	now := n.nowUnix()
 	livenessOK := false
@@ -821,8 +1045,9 @@ func (n *Node) SubmitAnnouncement(ctx context.Context, ann CapabilityAnnouncemen
 			return n.Store.PutAnnouncement(ann, senderID, false, now)
 		}
 		_, knownAnn := n.Store.GetAnnouncement(ann.PeerID, now)
-		_, knownPeer := n.Table.GetPeer(ann.PeerID)
-		if !knownAnn && !knownPeer && ann.PeerID != n.ID.PeerID {
+		pi, knownPeer := n.Table.GetPeer(ann.PeerID)
+		locallyLive := knownPeer && pi.LivenessVerified && pi.ConsecutiveFailures == 0
+		if !knownAnn && !locallyLive && ann.PeerID != n.ID.PeerID {
 			probeCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
 			defer cancel()
 			candidate := PeerInfo{
@@ -840,12 +1065,14 @@ func (n *Node) SubmitAnnouncement(ctx context.Context, ann CapabilityAnnouncemen
 				return sybilErr
 			}
 			livenessOK = true
+		} else if locallyLive {
+			livenessOK = true
 		}
 	}
 	return n.IngestAnnouncement(ann, senderID, livenessOK)
 }
 
-func (n *Node) executeInference(req InferenceRequest) (InferenceResponse, error) {
+func (n *Node) executeInference(req InferenceRequest, viaRelay PeerID) (InferenceResponse, error) {
 	start := time.Now()
 	if n.Config.RogueHijackMode {
 		// Adversarial rogue node simulates a routing hijack under the unverified negative control.
@@ -854,6 +1081,7 @@ func (n *Node) executeInference(req InferenceRequest) (InferenceResponse, error)
 			ModelID:           req.ModelID,
 			ServedByPeerID:    n.ID.PeerID,
 			ServedByPublicKey: n.ID.PublicKeyHex(),
+			ViaRelayPeerID:    viaRelay,
 			TokensGenerated:   0,
 			TTFTMs:            0.1,
 			TotalLatencyMs:    0.1,
@@ -875,7 +1103,7 @@ func (n *Node) executeInference(req InferenceRequest) (InferenceResponse, error)
 	}
 
 	// Deterministic lightweight token hash generation so every inference request
-	// does real CPU work and yields real measured wall-clock TTFT & total latency.
+	// does real CPU work and yields real measured provider-local first-token & total latency.
 	seed := sha256.Sum256([]byte(req.RequestID + ":" + req.ModelID + ":" + req.PromptDigest))
 	h := seed
 	// First token time.
@@ -907,6 +1135,7 @@ func (n *Node) executeInference(req InferenceRequest) (InferenceResponse, error)
 	resp := InferenceResponse{
 		RequestID:       req.RequestID,
 		ModelID:         req.ModelID,
+		ViaRelayPeerID:  viaRelay,
 		TokensGenerated: tokens,
 		TTFTMs:          ttftMs,
 		TotalLatencyMs:  totalMs,
@@ -921,6 +1150,13 @@ func (n *Node) executeInference(req InferenceRequest) (InferenceResponse, error)
 // the peer is behind NAT. Returns the RPC response, used relay peer ID (if any),
 // and measured RTT in milliseconds.
 func (n *Node) callPeer(ctx context.Context, peer PeerInfo, req RPCEnvelope) (RPCEnvelope, PeerID, float64, error) {
+	return n.callPeerWithSkipRelays(ctx, peer, req, nil)
+}
+
+func (n *Node) callPeerWithSkipRelays(ctx context.Context, peer PeerInfo, req RPCEnvelope, skipRelays map[PeerID]bool) (RPCEnvelope, PeerID, float64, error) {
+	if err := ctx.Err(); err != nil {
+		return RPCEnvelope{}, "", 0, err
+	}
 	req.FromPeer = n.ID.PeerID
 	req.ToPeer = peer.PeerID
 	if req.RequestID == "" {
@@ -946,12 +1182,16 @@ func (n *Node) callPeer(ctx context.Context, peer PeerInfo, req RPCEnvelope) (RP
 					n.bytesReceived.Add(recvd)
 					rttMs := sinceMs(start)
 					n.Table.MarkAlive(peer.PeerID, rttMs, n.nowUnix())
+					n.clearProviderFailure(peer.PeerID)
 					return resp, "", rttMs, nil
 				}
 				err = rerr
 			} else {
 				err = werr
 			}
+		}
+		if ctx.Err() != nil {
+			return RPCEnvelope{}, "", 0, ctx.Err()
 		}
 		if len(peer.RelayAddrs) == 0 {
 			n.Table.MarkFailure(peer.PeerID)
@@ -960,10 +1200,30 @@ func (n *Node) callPeer(ctx context.Context, peer PeerInfo, req RPCEnvelope) (RP
 	}
 
 	// 2. Fallback / primary path for NAT-relayed peers via circuit-relay v2.
+	relayAddrs := append([]string(nil), peer.RelayAddrs...)
+	if len(relayAddrs) > 1 {
+		sort.SliceStable(relayAddrs, func(i, j int) bool {
+			ri, _, okI := ParseCircuitMultiaddr(relayAddrs[i])
+			rj, _, okJ := ParseCircuitMultiaddr(relayAddrs[j])
+			if !okI || !okJ {
+				return okI
+			}
+			pi, _ := n.Table.GetPeer(ri)
+			pj, _ := n.Table.GetPeer(rj)
+			return pi.ConsecutiveFailures < pj.ConsecutiveFailures
+		})
+	}
+
 	var lastErr error = ErrRelayUnavailable
-	for _, ra := range peer.RelayAddrs {
+	for _, ra := range relayAddrs {
+		if err := ctx.Err(); err != nil {
+			return RPCEnvelope{}, "", 0, err
+		}
 		relayID, targetID, ok := ParseCircuitMultiaddr(ra)
 		if !ok || targetID != peer.PeerID {
+			continue
+		}
+		if skipRelays != nil && skipRelays[relayID] {
 			continue
 		}
 		relayInfo, found := n.resolvePeer(relayID)
@@ -977,6 +1237,9 @@ func (n *Node) callPeer(ctx context.Context, peer PeerInfo, req RPCEnvelope) (RP
 		start := time.Now()
 		conn, err := dialPeerTLS(ctx, relayHP, n.tlsCert, relayID)
 		if err != nil {
+			if ctx.Err() != nil {
+				return RPCEnvelope{}, "", 0, ctx.Err()
+			}
 			n.Table.MarkFailure(relayID)
 			lastErr = err
 			continue
@@ -995,6 +1258,9 @@ func (n *Node) callPeer(ctx context.Context, peer PeerInfo, req RPCEnvelope) (RP
 		sent, werr := writeFrame(conn, outer)
 		if werr != nil {
 			_ = conn.Close()
+			if ctx.Err() != nil {
+				return RPCEnvelope{}, "", 0, ctx.Err()
+			}
 			n.Table.MarkFailure(relayID)
 			lastErr = werr
 			continue
@@ -1004,6 +1270,9 @@ func (n *Node) callPeer(ctx context.Context, peer PeerInfo, req RPCEnvelope) (RP
 		outerResp, recvd, rerr := readFrame(conn)
 		_ = conn.Close()
 		if rerr != nil {
+			if ctx.Err() != nil {
+				return RPCEnvelope{}, "", 0, ctx.Err()
+			}
 			n.Table.MarkFailure(relayID)
 			lastErr = rerr
 			continue
@@ -1021,9 +1290,13 @@ func (n *Node) callPeer(ctx context.Context, peer PeerInfo, req RPCEnvelope) (RP
 		rttMs := sinceMs(start)
 		n.Table.MarkAlive(relayID, rttMs, n.nowUnix())
 		n.Table.MarkAlive(peer.PeerID, rttMs, n.nowUnix())
+		n.clearProviderFailure(peer.PeerID)
 		return innerResp, relayID, rttMs, nil
 	}
 
+	if ctx.Err() != nil {
+		return RPCEnvelope{}, "", 0, ctx.Err()
+	}
 	n.Table.MarkFailure(peer.PeerID)
 	return RPCEnvelope{}, "", 0, lastErr
 }
@@ -1110,7 +1383,11 @@ func (n *Node) RegisterWithRelay(ctx context.Context, relayPeer PeerInfo) (strin
 	}
 	n.mu.Unlock()
 
-	n.Table.UpsertPeer(relayPeer)
+	verifiedRelay := ClonePeerInfo(relayPeer)
+	verifiedRelay.LivenessVerified = true
+	verifiedRelay.LastSeen = n.nowUnix()
+	verifiedRelay.ConsecutiveFailures = 0
+	n.Table.UpsertPeer(verifiedRelay)
 	n.wg.Add(1)
 	go n.serveNATRelayLoop(relayPeer.PeerID, rresp.CircuitAddr, conn)
 	return rresp.CircuitAddr, nil
@@ -1140,7 +1417,7 @@ func (n *Node) serveNATRelayLoop(relayID PeerID, circuitAddr string, conn net.Co
 		}
 		n.bytesReceived.Add(recvd)
 		n.rpcsReceived.Add(1)
-		resp := n.handleRPC(n.ctx, req.FromPeer, req)
+		resp := n.handleRPCWithRelay(n.ctx, req.FromPeer, relayID, req)
 		sent, err := writeFrame(conn, resp)
 		if err != nil {
 			return
@@ -1201,7 +1478,7 @@ func (n *Node) Bootstrap(ctx context.Context, bootstrapPeers []PeerInfo) error {
 		if bp.PeerID == "" || bp.PeerID == n.ID.PeerID {
 			continue
 		}
-		n.Table.UpsertPeer(bp)
+		n.Table.UpsertPeer(sanitizeRemotePeerInfo(bp))
 	}
 	if n.Config.NATMode == NATRelayed {
 		if err := n.EnsureRelays(ctx, 2); err != nil {
@@ -1244,6 +1521,7 @@ func (n *Node) Ping(ctx context.Context, peer PeerInfo) (float64, error) {
 	if presp.Nonce != nonce || presp.PeerID != peer.PeerID {
 		return 0, ErrPeerIDMismatch
 	}
+	n.clearProviderFailure(peer.PeerID)
 	return rttMs, nil
 }
 
@@ -1305,7 +1583,7 @@ func (n *Node) FindNode(ctx context.Context, target [32]byte) []PeerInfo {
 						discoveredAny = true
 						mu.Unlock()
 					}
-					n.Table.UpsertPeer(dp)
+					n.Table.UpsertPeer(sanitizeRemotePeerInfo(dp))
 				}
 			}(peer)
 		}
@@ -1320,6 +1598,10 @@ func (n *Node) FindNode(ctx context.Context, target [32]byte) []PeerInfo {
 // PublishAnnouncement stores this node's latest signed announcement on the
 // K closest peers to self and to each advertised model's DHT key.
 func (n *Node) PublishAnnouncement(ctx context.Context) int {
+	return n.publishAnnouncementPass(ctx, true)
+}
+
+func (n *Node) publishAnnouncementPass(ctx context.Context, allowCatchup bool) int {
 	ann := n.SelfAnnouncement()
 	if ann.PeerID == "" {
 		return 0
@@ -1335,6 +1617,7 @@ func (n *Node) PublishAnnouncement(ctx context.Context) int {
 	}
 	payload, _ := json.Marshal(PutAnnouncementRequest{Announcement: ann})
 	var stored atomic.Int32
+	var caughtUp atomic.Bool
 	var wg sync.WaitGroup
 	for _, peer := range targets {
 		wg.Add(1)
@@ -1344,12 +1627,31 @@ func (n *Node) PublishAnnouncement(ctx context.Context) int {
 				Type:    RPCPutAnnouncement,
 				Payload: payload,
 			})
-			if err == nil && resp.Error == "" {
+			if err != nil {
+				return
+			}
+			if resp.Error == "" {
 				stored.Add(1)
+				return
+			}
+			if allowCatchup && len(resp.Payload) > 0 {
+				var putResp PutAnnouncementResponse
+				if uerr := json.Unmarshal(resp.Payload, &putResp); uerr == nil && putResp.ExistingAnnouncement != nil {
+					prev := *putResp.ExistingAnnouncement
+					if n.verifySelfSignedAnnouncement(prev) && prev.Seq >= ann.Seq {
+						n.observeSelfSeq(prev.Seq)
+						caughtUp.Store(true)
+					}
+				}
 			}
 		}(peer)
 	}
 	wg.Wait()
+	if allowCatchup && caughtUp.Load() {
+		if _, err := n.RefreshSelfAnnouncement(); err == nil {
+			return n.publishAnnouncementPass(ctx, false)
+		}
+	}
 	return int(stored.Load())
 }
 
@@ -1359,6 +1661,7 @@ func (n *Node) GossipRound(ctx context.Context, fanout int) int {
 	if fanout <= 0 {
 		fanout = 4
 	}
+	n.maybeRenewSelfAnnouncement()
 	peers := n.Table.AllPeers()
 	if len(peers) == 0 {
 		return 0
@@ -1383,6 +1686,7 @@ func (n *Node) GossipRound(ctx context.Context, fanout int) int {
 	})
 
 	var learned atomic.Int32
+	var needSelfRepublish atomic.Bool
 	var wg sync.WaitGroup
 	for _, peer := range peers {
 		wg.Add(1)
@@ -1401,6 +1705,13 @@ func (n *Node) GossipRound(ctx context.Context, fanout int) int {
 				return
 			}
 			for _, ann := range gresp.Announcements {
+				if ann.PeerID == n.ID.PeerID {
+					if n.verifySelfSignedAnnouncement(ann) && ann.Seq >= n.currentSeq() {
+						n.observeSelfSeq(ann.Seq)
+						needSelfRepublish.Store(true)
+					}
+					continue
+				}
 				if n.Store.HasDigest(ann) {
 					continue
 				}
@@ -1416,12 +1727,17 @@ func (n *Node) GossipRound(ctx context.Context, fanout int) int {
 							continue
 						}
 					}
-					n.Table.UpsertPeer(dp)
+					n.Table.UpsertPeer(sanitizeRemotePeerInfo(dp))
 				}
 			}
 		}(peer)
 	}
 	wg.Wait()
+	if needSelfRepublish.Load() {
+		if _, err := n.RefreshSelfAnnouncement(); err == nil {
+			n.PublishAnnouncement(ctx)
+		}
+	}
 	return int(learned.Load())
 }
 
@@ -1437,6 +1753,7 @@ func (n *Node) FindProviders(ctx context.Context, modelID string) []CapabilityAn
 		Count:   DefaultK,
 	})
 
+	var needSelfRepublish atomic.Bool
 	for round := 0; round < 4; round++ {
 		candidates := n.Table.ClosestPeers(target, DefaultK)
 		var batch []PeerInfo
@@ -1470,6 +1787,13 @@ func (n *Node) FindProviders(ctx context.Context, modelID string) []CapabilityAn
 					return
 				}
 				for _, ann := range fpr.Providers {
+					if ann.PeerID == n.ID.PeerID {
+						if n.verifySelfSignedAnnouncement(ann) && ann.Seq >= n.currentSeq() {
+							n.observeSelfSeq(ann.Seq)
+							needSelfRepublish.Store(true)
+						}
+						continue
+					}
 					if !n.Store.HasDigest(ann) {
 						_ = n.IngestAnnouncement(ann, p.PeerID, false)
 					}
@@ -1482,12 +1806,18 @@ func (n *Node) FindProviders(ctx context.Context, modelID string) []CapabilityAn
 								continue
 							}
 						}
-						n.Table.UpsertPeer(dp)
+						n.Table.UpsertPeer(sanitizeRemotePeerInfo(dp))
 					}
 				}
 			}(peer)
 		}
 		wg.Wait()
+	}
+
+	if needSelfRepublish.Load() {
+		if _, err := n.RefreshSelfAnnouncement(); err == nil {
+			n.PublishAnnouncement(ctx)
+		}
 	}
 
 	return n.Store.ProvidersForModel(modelID, n.nowUnix())
@@ -1499,6 +1829,9 @@ func (n *Node) FindProviders(ctx context.Context, modelID string) []CapabilityAn
 // ErrNoRouteFound when no verified reachable provider exists.
 func (n *Node) RouteInference(ctx context.Context, req InferenceRequest) (RouteResult, error) {
 	start := time.Now()
+	if err := ctx.Err(); err != nil {
+		return RouteResult{RoutingLatencyMs: sinceMs(start)}, err
+	}
 	if req.RequestID == "" {
 		req.RequestID = n.nextReqID()
 	}
@@ -1512,6 +1845,9 @@ func (n *Node) RouteInference(ctx context.Context, req InferenceRequest) (RouteR
 	if len(candidates) == 0 {
 		candidates = n.FindProviders(ctx, req.ModelID)
 	}
+	if err := ctx.Err(); err != nil {
+		return RouteResult{RoutingLatencyMs: sinceMs(start)}, err
+	}
 	if len(candidates) == 0 {
 		return RouteResult{}, ErrNoRouteFound
 	}
@@ -1521,20 +1857,41 @@ func (n *Node) RouteInference(ctx context.Context, req InferenceRequest) (RouteR
 	failovers := 0
 
 	for pass := 0; pass < 2; pass++ {
+		if err := ctx.Err(); err != nil {
+			return RouteResult{
+				RoutingLatencyMs: sinceMs(start),
+				Attempts:         attempts,
+				Failovers:        failovers,
+			}, err
+		}
 		if pass == 1 {
 			candidates = n.FindProviders(ctx, req.ModelID)
+			if err := ctx.Err(); err != nil {
+				return RouteResult{
+					RoutingLatencyMs: sinceMs(start),
+					Attempts:         attempts,
+					Failovers:        failovers,
+				}, err
+			}
 		}
 		ranked := n.rankCandidates(req.ModelID, req.RequestID, candidates)
 		for _, ann := range ranked {
+			if err := ctx.Err(); err != nil {
+				return RouteResult{
+					RoutingLatencyMs: sinceMs(start),
+					Attempts:         attempts,
+					Failovers:        failovers,
+				}, err
+			}
 			if tried[ann.PeerID] {
 				continue
 			}
 			tried[ann.PeerID] = true
-			attempts++
 
 			// Local shortcut if this node itself serves the model.
 			if ann.PeerID == n.ID.PeerID {
-				iresp, err := n.executeInference(req)
+				attempts++
+				iresp, err := n.executeInference(req, "")
 				if err == nil {
 					return RouteResult{
 						Response:         iresp,
@@ -1556,43 +1913,89 @@ func (n *Node) RouteInference(ctx context.Context, req InferenceRequest) (RouteR
 				Role:       ann.Role,
 			}
 			reqPayload, _ := json.Marshal(req)
-			rpcResp, viaRelay, _, err := n.callPeer(ctx, peer, RPCEnvelope{
-				Type:    RPCInferRequest,
-				Payload: reqPayload,
-			})
-			if err != nil || rpcResp.Error != "" {
-				failovers++
-				n.routingFailovers.Add(1)
-				// Evict dead provider announcement if unreachable so subsequent routes are fast.
-				n.Store.RemoveAnnouncement(ann.PeerID)
-				continue
+			skipRelays := make(map[PeerID]bool)
+			maxRelayTries := len(peer.RelayAddrs)
+			if maxRelayTries < 1 {
+				maxRelayTries = 1
 			}
 
-			var iresp InferenceResponse
-			if err := json.Unmarshal(rpcResp.Payload, &iresp); err != nil {
-				failovers++
-				n.routingFailovers.Add(1)
-				continue
-			}
-			if !n.Config.Policy.DisableVerification {
-				if err := VerifyInferenceResponse(iresp, ann.PeerID); err != nil {
+			for try := 0; try < maxRelayTries; try++ {
+				if err := ctx.Err(); err != nil {
+					return RouteResult{
+						RoutingLatencyMs: sinceMs(start),
+						Attempts:         attempts,
+						Failovers:        failovers,
+					}, err
+				}
+				attempts++
+				rpcResp, viaRelay, _, err := n.callPeerWithSkipRelays(ctx, peer, RPCEnvelope{
+					Type:    RPCInferRequest,
+					Payload: reqPayload,
+				}, skipRelays)
+				if ctx.Err() != nil {
+					return RouteResult{
+						RoutingLatencyMs: sinceMs(start),
+						Attempts:         attempts,
+						Failovers:        failovers,
+					}, ctx.Err()
+				}
+				if err != nil || rpcResp.Error != "" {
 					failovers++
 					n.routingFailovers.Add(1)
-					n.Store.RemoveAnnouncement(ann.PeerID)
-					continue
+					// Retain the verified announcement while recording temporary
+					// provider health failure so transient errors or cancellations
+					// never permanently suppress a reachable provider.
+					n.recordProviderFailure(ann.PeerID)
+					break
 				}
+
+				var iresp InferenceResponse
+				if err := json.Unmarshal(rpcResp.Payload, &iresp); err != nil {
+					failovers++
+					n.routingFailovers.Add(1)
+					if viaRelay != "" {
+						n.Table.MarkFailure(viaRelay)
+						skipRelays[viaRelay] = true
+						continue
+					}
+					n.recordProviderFailure(ann.PeerID)
+					break
+				}
+				if !n.Config.Policy.DisableVerification {
+					verifyErr := VerifyInferenceResponseForRequest(iresp, req, ann.PeerID)
+					if verifyErr == nil && viaRelay != "" && iresp.ViaRelayPeerID != "" && iresp.ViaRelayPeerID != viaRelay {
+						verifyErr = fmt.Errorf("%w: response relay %s != observed relay %s", ErrResponseMismatch, iresp.ViaRelayPeerID, viaRelay)
+					}
+					if verifyErr != nil {
+						failovers++
+						n.routingFailovers.Add(1)
+						if viaRelay != "" {
+							// An untrusted relay may have replayed or tampered with
+							// the response; penalize the relay and try alternate relays
+							// without permanently removing the provider's announcement.
+							n.Table.MarkFailure(viaRelay)
+							skipRelays[viaRelay] = true
+							continue
+						}
+						n.Table.MarkFailure(ann.PeerID)
+						n.recordProviderFailure(ann.PeerID)
+						break
+					}
+				}
+				// Leave provider-signed response fields unmodified; relay path
+				// telemetry is exposed on RouteResult.UsedRelay / RelayPeerID.
+				n.clearProviderFailure(ann.PeerID)
+				hijacked := strings.Contains(iresp.OutputDigest, "HIJACKED")
+				return RouteResult{
+					Response:         iresp,
+					RoutingLatencyMs: sinceMs(start),
+					Attempts:         attempts,
+					Failovers:        failovers,
+					UsedRelay:        viaRelay != "",
+					RelayPeerID:      viaRelay,
+					Hijacked:         hijacked,
+				}, nil
 			}
-			iresp.ViaRelayPeerID = viaRelay
-			hijacked := strings.Contains(iresp.OutputDigest, "HIJACKED")
-			return RouteResult{
-				Response:         iresp,
-				RoutingLatencyMs: sinceMs(start),
-				Attempts:         attempts,
-				Failovers:        failovers,
-				UsedRelay:        viaRelay != "",
-				RelayPeerID:      viaRelay,
-				Hijacked:         hijacked,
-			}, nil
 		}
 	}
 
@@ -1603,10 +2006,11 @@ func (n *Node) RouteInference(ctx context.Context, req InferenceRequest) (RouteR
 	}, ErrNoRouteFound
 }
 
-// rankCandidates neutrally orders verified model providers by observed RTT,
-// advertised price, and base latency with zero operator preference. Providers
-// within 20% of the lowest score are deterministically load-balanced by
-// sha256(requestID || peerID) to prevent single-provider hot-spotting.
+// rankCandidates neutrally orders verified model providers by temporary health,
+// observed RTT, advertised price, and base latency with zero operator
+// preference. Healthy providers within 20% of the lowest score are
+// deterministically load-balanced by sha256(requestID || peerID) to prevent
+// single-provider hot-spotting.
 func (n *Node) rankCandidates(modelID, requestID string, anns []CapabilityAnnouncement) []CapabilityAnnouncement {
 	cp := make([]CapabilityAnnouncement, len(anns))
 	copy(cp, anns)
@@ -1614,16 +2018,32 @@ func (n *Node) rankCandidates(modelID, requestID string, anns []CapabilityAnnoun
 		return cp
 	}
 	scores := make(map[PeerID]float64, len(cp))
-	minScore := -1.0
+	failures := make(map[PeerID]int, len(cp))
+	minHealthyScore := -1.0
+	minAnyScore := -1.0
 	for _, a := range cp {
 		sc := n.candidateScore(modelID, a)
+		fc := n.providerFailureCount(a.PeerID)
 		scores[a.PeerID] = sc
-		if minScore < 0 || sc < minScore {
-			minScore = sc
+		failures[a.PeerID] = fc
+		if minAnyScore < 0 || sc < minAnyScore {
+			minAnyScore = sc
 		}
+		if fc == 0 && (minHealthyScore < 0 || sc < minHealthyScore) {
+			minHealthyScore = sc
+		}
+	}
+	minScore := minHealthyScore
+	if minScore < 0 {
+		minScore = minAnyScore
 	}
 	bandCeiling := minScore * 1.20
 	sort.Slice(cp, func(i, j int) bool {
+		fi := failures[cp[i].PeerID]
+		fj := failures[cp[j].PeerID]
+		if fi != fj {
+			return fi < fj
+		}
 		si := scores[cp[i].PeerID]
 		sj := scores[cp[j].PeerID]
 		inBandI := si <= bandCeiling

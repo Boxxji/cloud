@@ -76,9 +76,10 @@ type PutAnnouncementRequest struct {
 }
 
 type PutAnnouncementResponse struct {
-	Stored   bool   `json:"stored"`
-	Reason   string `json:"reason,omitempty"`
-	Verified bool   `json:"verified"`
+	Stored               bool                    `json:"stored"`
+	Reason               string                  `json:"reason,omitempty"`
+	Verified             bool                    `json:"verified"`
+	ExistingAnnouncement *CapabilityAnnouncement `json:"existing_announcement,omitempty"`
 }
 
 // FindProvidersRequest / FindProvidersResponse implement Kademlia FIND_PROVIDERS.
@@ -225,6 +226,22 @@ func VerifyInferenceResponse(resp InferenceResponse, expectedPeer PeerID) error 
 	}
 	if !ed25519.Verify(pub, payload, sig) {
 		return ErrInvalidSignature
+	}
+	return nil
+}
+
+// VerifyInferenceResponseForRequest validates the serving provider's Ed25519
+// signature and PeerID binding AND cryptographically binds the signed response
+// to the outstanding request's RequestID and ModelID to prevent relay replay.
+func VerifyInferenceResponseForRequest(resp InferenceResponse, req InferenceRequest, expectedPeer PeerID) error {
+	if err := VerifyInferenceResponse(resp, expectedPeer); err != nil {
+		return err
+	}
+	if resp.RequestID == "" || resp.RequestID != req.RequestID {
+		return fmt.Errorf("%w: response request_id %q != expected %q", ErrResponseMismatch, resp.RequestID, req.RequestID)
+	}
+	if resp.ModelID == "" || resp.ModelID != req.ModelID {
+		return fmt.Errorf("%w: response model_id %q != expected %q", ErrResponseMismatch, resp.ModelID, req.ModelID)
 	}
 	return nil
 }

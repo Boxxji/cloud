@@ -17,7 +17,11 @@ import (
 	"math/big"
 	"math/bits"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -95,15 +99,137 @@ var (
 	ErrNoRouteFound           = errors.New("p2pnet: no reachable verified provider route found")
 	ErrRelayUnavailable       = errors.New("p2pnet: circuit relay unavailable")
 	ErrBundleTampered         = errors.New("p2pnet: export bundle digest or signature invalid")
+	ErrResponseMismatch       = errors.New("p2pnet: inference response does not match request")
 )
 
 // Identity holds a node's Ed25519 keypair, self-certifying PeerID, and
-// Kademlia XOR key hash.
+// Kademlia XOR key hash. It also tracks the highest announcement sequence
+// issued by this identity in-process so reusing an Identity across restarts
+// preserves monotonic sequencing.
 type Identity struct {
 	PeerID     PeerID
 	PublicKey  ed25519.PublicKey
 	PrivateKey ed25519.PrivateKey
 	KeyHash    [32]byte
+	lastSeq    atomic.Uint64
+}
+
+// LastSeq returns the highest announcement sequence recorded on this Identity.
+func (id *Identity) LastSeq() uint64 {
+	if id == nil {
+		return 0
+	}
+	return id.lastSeq.Load()
+}
+
+// ObserveSeq raises this Identity's sequence floor to at least seq.
+func (id *Identity) ObserveSeq(seq uint64) {
+	if id == nil || seq == 0 {
+		return
+	}
+	for {
+		cur := id.lastSeq.Load()
+		if seq <= cur {
+			return
+		}
+		if id.lastSeq.CompareAndSwap(cur, seq) {
+			return
+		}
+	}
+}
+
+// AdvanceSeq atomically advances this Identity's sequence to max(lastSeq, floor)+1
+// and returns the newly allocated monotonic sequence number.
+func (id *Identity) AdvanceSeq(floor uint64) uint64 {
+	if id == nil {
+		return floor + 1
+	}
+	for {
+		cur := id.lastSeq.Load()
+		base := cur
+		if floor > base {
+			base = floor
+		}
+		next := base + 1
+		if id.lastSeq.CompareAndSwap(cur, next) {
+			return next
+		}
+	}
+}
+
+// SequenceStore durably persists the highest issued announcement sequence per
+// PeerID across process restarts.
+type SequenceStore interface {
+	LoadSequence(peerID PeerID) (uint64, error)
+	SaveSequence(peerID PeerID, seq uint64) error
+}
+
+// FileSequenceStore persists per-PeerID announcement sequences in a JSON file
+// using atomic temp-file writes so restarts never roll back sequences.
+type FileSequenceStore struct {
+	mu   sync.Mutex
+	path string
+}
+
+// NewFileSequenceStore creates a durable JSON-backed SequenceStore at path.
+func NewFileSequenceStore(path string) *FileSequenceStore {
+	return &FileSequenceStore{path: path}
+}
+
+// LoadSequence returns the persisted sequence for peerID, or 0 if not present.
+func (fs *FileSequenceStore) LoadSequence(peerID PeerID) (uint64, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	m, err := fs.readLocked()
+	if err != nil {
+		return 0, err
+	}
+	return m[peerID], nil
+}
+
+// SaveSequence atomically persists seq for peerID if it exceeds the stored value.
+func (fs *FileSequenceStore) SaveSequence(peerID PeerID, seq uint64) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	m, err := fs.readLocked()
+	if err != nil {
+		return err
+	}
+	if seq <= m[peerID] {
+		return nil
+	}
+	m[peerID] = seq
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(fs.path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	tmp := fs.path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, fs.path)
+}
+
+func (fs *FileSequenceStore) readLocked() (map[PeerID]uint64, error) {
+	raw, err := os.ReadFile(fs.path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return make(map[PeerID]uint64), nil
+		}
+		return nil, err
+	}
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return make(map[PeerID]uint64), nil
+	}
+	m := make(map[PeerID]uint64)
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 // GenerateIdentity creates a new Ed25519 identity. When rng is nil,
