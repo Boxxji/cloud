@@ -429,6 +429,15 @@ func (w *WorkerNode) handleExecute(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "quote signed by different provider", http.StatusBadRequest)
 		return
 	}
+	reqHash := CanonicalRequestHash(req.Request)
+	if req.Quote.RequestHash != "" && req.Quote.RequestHash != reqHash {
+		http.Error(rw, fmt.Sprintf("%s: quote requestHash (%s) != request hash (%s)", ErrInvalidQuote, req.Quote.RequestHash, reqHash), http.StatusBadRequest)
+		return
+	}
+	if req.Request.Model != "" && req.Request.Model != req.Quote.ModelID {
+		http.Error(rw, fmt.Sprintf("%s: request model (%s) != quote model (%s)", ErrInvalidQuote, req.Request.Model, req.Quote.ModelID), http.StatusBadRequest)
+		return
+	}
 
 	if simTTFT > 0 {
 		select {
@@ -447,7 +456,6 @@ func (w *WorkerNode) handleExecute(rw http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	reqHash := CanonicalRequestHash(req.Request)
 	promptTokens := estimatePromptTokens(req.Request.Messages)
 	completionTokens := req.Request.MaxTokens
 	if completionTokens <= 0 {

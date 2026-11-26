@@ -3,9 +3,10 @@
 // Package gateway implements the HIP-1350 permissionless Enso inference gateway
 // and stateless multi-provider scheduling protocol.
 //
-// It imports only github.com/zap-proto/zip, github.com/luxfi/crypto/secp256k1,
-// github.com/luxfi/log, golang.org/x/crypto/sha3, and the Go standard library —
-// never its host application.
+// It imports only github.com/zap-proto/zip, github.com/valyala/fasthttp,
+// github.com/luxfi/crypto/secp256k1, github.com/luxfi/log,
+// golang.org/x/crypto/sha3, and the Go standard library — never its host
+// application.
 package gateway
 
 import (
@@ -410,22 +411,37 @@ func (w WorkerRecord) FindModel(modelID string) (ModelSpec, bool) {
 	return ModelSpec{}, false
 }
 
+func modelSpecStructHash(m ModelSpec) [32]byte {
+	typeHash := Keccak256Bytes([]byte(
+		"ModelSpec(string modelId,string modelDigest,int64 maxContextTokens,string license)",
+	))
+	idHash := Keccak256Bytes([]byte(m.ModelID))
+	digestHash := Keccak256Bytes([]byte(m.ModelDigest))
+	ctxWord := encodeInt64Word(int64(m.MaxContextTokens))
+	licHash := Keccak256Bytes([]byte(m.License))
+	return Keccak256Bytes(typeHash[:], idHash[:], digestHash[:], ctxWord[:], licHash[:])
+}
+
 func canonicalModelsDigest(models []ModelSpec) [32]byte {
 	cp := append([]ModelSpec(nil), models...)
 	sort.Slice(cp, func(i, j int) bool {
 		if cp[i].ModelID != cp[j].ModelID {
 			return cp[i].ModelID < cp[j].ModelID
 		}
-		return cp[i].ModelDigest < cp[j].ModelDigest
-	})
-	var b strings.Builder
-	for i, m := range cp {
-		if i > 0 {
-			b.WriteByte('|')
+		if cp[i].ModelDigest != cp[j].ModelDigest {
+			return cp[i].ModelDigest < cp[j].ModelDigest
 		}
-		fmt.Fprintf(&b, "%s:%s:%d:%s", m.ModelID, m.ModelDigest, m.MaxContextTokens, m.License)
+		if cp[i].MaxContextTokens != cp[j].MaxContextTokens {
+			return cp[i].MaxContextTokens < cp[j].MaxContextTokens
+		}
+		return cp[i].License < cp[j].License
+	})
+	buf := make([]byte, 0, len(cp)*32)
+	for _, m := range cp {
+		h := modelSpecStructHash(m)
+		buf = append(buf, h[:]...)
 	}
-	return Keccak256Bytes([]byte(b.String()))
+	return Keccak256Bytes(buf)
 }
 
 func workerRecordStructHash(rec WorkerRecord) ([32]byte, error) {
@@ -819,13 +835,38 @@ func ComputeOutputHash(content string) string {
 
 // VerifyReceipt performs full offline cryptographic verification of an
 // ExecutionReceipt against its originating InferenceQuote (if non-nil),
-// expectedRequestHash (if non-empty), and actual responseContent (if non-empty).
+// expectedRequestHash (if non-empty), and actual responseContent (always
+// checked, including when responseContent is empty).
 func VerifyReceipt(
 	domain EIP712Domain,
 	r ExecutionReceipt,
 	expectedQuote *InferenceQuote,
 	expectedRequestHash string,
 	responseContent string,
+) error {
+	return verifyReceipt(domain, r, expectedQuote, expectedRequestHash, &responseContent)
+}
+
+// VerifyReceiptWithoutContent performs offline cryptographic verification of an
+// ExecutionReceipt against its originating InferenceQuote (if non-nil) and
+// expectedRequestHash (if non-empty) without comparing r.OutputHash against a
+// completion body. Callers that hold the returned completion text must use
+// VerifyReceipt instead so empty/truncated outputs are verified.
+func VerifyReceiptWithoutContent(
+	domain EIP712Domain,
+	r ExecutionReceipt,
+	expectedQuote *InferenceQuote,
+	expectedRequestHash string,
+) error {
+	return verifyReceipt(domain, r, expectedQuote, expectedRequestHash, nil)
+}
+
+func verifyReceipt(
+	domain EIP712Domain,
+	r ExecutionReceipt,
+	expectedQuote *InferenceQuote,
+	expectedRequestHash string,
+	responseContent *string,
 ) error {
 	if r.ProtocolVersion != ProtocolVersion {
 		return fmt.Errorf("%w: invalid receipt protocol version %q", ErrInvalidReceipt, r.ProtocolVersion)
@@ -868,14 +909,18 @@ func VerifyReceipt(
 		if r.ModelID != expectedQuote.ModelID || r.ModelDigest != expectedQuote.ModelDigest {
 			return fmt.Errorf("%w: receipt model differs from quote model", ErrInvalidReceipt)
 		}
+		if expectedQuote.RequestHash != "" && r.RequestHash != expectedQuote.RequestHash {
+			return fmt.Errorf("%w: receipt request hash (%s) does not match bound quote request hash (%s)",
+				ErrInvalidReceipt, r.RequestHash, expectedQuote.RequestHash)
+		}
 	}
 
 	if expectedRequestHash != "" && r.RequestHash != expectedRequestHash {
 		return fmt.Errorf("%w: request hash mismatch (%s != %s)", ErrInvalidReceipt, r.RequestHash, expectedRequestHash)
 	}
 
-	if responseContent != "" {
-		actual := ComputeOutputHash(responseContent)
+	if responseContent != nil {
+		actual := ComputeOutputHash(*responseContent)
 		if r.OutputHash != actual {
 			return fmt.Errorf("%w: receipt=%s actual=%s", ErrOutputHashMismatch, r.OutputHash, actual)
 		}
@@ -1011,10 +1056,15 @@ func VerifyDirectorySnapshot(domain EIP712Domain, snap DirectorySnapshot, nowUni
 	if !SameAddress(signer, snap.OperatorAddress) {
 		return fmt.Errorf("%w: snapshot signer %s != operator %s", ErrSignerMismatch, signer, snap.OperatorAddress)
 	}
+	seenProviders := make(map[string]string, len(snap.Workers))
 	for _, w := range snap.Workers {
 		if err := VerifyWorkerRecord(domain, w, nowUnix); err != nil {
 			return fmt.Errorf("%w: worker %s: %v", ErrDirectoryCorrupted, w.ProviderID, err)
 		}
+		if prevOp, exists := seenProviders[w.ProviderID]; exists && !SameAddress(prevOp, w.OperatorAddress) {
+			return fmt.Errorf("%w: worker %s has conflicting operators (%s vs %s)", ErrDirectoryCorrupted, w.ProviderID, prevOp, w.OperatorAddress)
+		}
+		seenProviders[w.ProviderID] = w.OperatorAddress
 	}
 	return nil
 }
@@ -1039,14 +1089,22 @@ func NewPeerDirectory(domain EIP712Domain) *PeerDirectory {
 func (d *PeerDirectory) Domain() EIP712Domain { return d.domain }
 
 // RegisterWorker validates and inserts (or updates) a signed WorkerRecord.
+// Replacement records for an existing ProviderID must be signed by the same
+// cryptographic operator identity to prevent unauthorized provider hijacking.
 func (d *PeerDirectory) RegisterWorker(rec WorkerRecord, nowUnix int64) error {
 	if err := VerifyWorkerRecord(d.domain, rec, nowUnix); err != nil {
 		return err
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if existing, ok := d.workers[rec.ProviderID]; ok && existing.IssuedAt > rec.IssuedAt {
-		return nil
+	if existing, ok := d.workers[rec.ProviderID]; ok {
+		if !SameAddress(existing.OperatorAddress, rec.OperatorAddress) {
+			return fmt.Errorf("%w: provider %s is owned by operator %s, cannot be replaced by %s",
+				ErrSignerMismatch, rec.ProviderID, existing.OperatorAddress, rec.OperatorAddress)
+		}
+		if existing.IssuedAt > rec.IssuedAt {
+			return nil
+		}
 	}
 	d.workers[rec.ProviderID] = rec
 	return nil

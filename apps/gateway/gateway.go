@@ -47,6 +47,10 @@ type GatewayConfig struct {
 // BoolPtr returns a pointer to v for optional GatewayConfig boolean toggles.
 func BoolPtr(v bool) *bool { return &v }
 
+// StringPtr returns a pointer to v for optional string fields such as
+// VerifyReceiptRequest.ResponseContent.
+func StringPtr(v string) *string { return &v }
+
 // Gateway is a permissionless, stateless OpenAI-compatible inference gateway.
 // Multiple independent gateways (Hanzo-operated, community-operated, or forked)
 // run side-by-side with zero shared mutable state.
@@ -372,9 +376,9 @@ func (g *Gateway) ChatCompletions(ctx context.Context, req ChatCompletionRequest
 			},
 		},
 		Usage: ChatCompletionUsage{
-			PromptTokens:     schedRes.Exec.PromptTokens,
-			CompletionTokens: schedRes.Exec.CompletionTokens,
-			TotalTokens:      schedRes.Exec.PromptTokens + schedRes.Exec.CompletionTokens,
+			PromptTokens:     receiptCopy.PromptTokens,
+			CompletionTokens: receiptCopy.CompletionTokens,
+			TotalTokens:      receiptCopy.TotalTokens,
 		},
 		EnsoQuote:   &quoteCopy,
 		EnsoReceipt: &receiptCopy,
@@ -383,11 +387,15 @@ func (g *Gateway) ChatCompletions(ctx context.Context, req ChatCompletionRequest
 }
 
 // VerifyReceiptRequest is the payload for POST /v1/gateway/receipts/verify.
+// Omit ResponseContent (nil) to verify the receipt signature, quote binding,
+// and request hash without checking completion text; supply a non-nil pointer
+// (including empty string "") to enforce OutputHash verification against that
+// exact completion text.
 type VerifyReceiptRequest struct {
 	Receipt         ExecutionReceipt `json:"receipt"`
 	Quote           *InferenceQuote  `json:"quote,omitempty"`
 	RequestHash     string           `json:"request_hash,omitempty"`
-	ResponseContent string           `json:"response_content,omitempty"`
+	ResponseContent *string          `json:"response_content,omitempty"`
 }
 
 // VerifyReceiptResponse reports the result of offline cryptographic verification.
@@ -407,7 +415,7 @@ func (g *Gateway) VerifyReceipt(in VerifyReceiptRequest) (*VerifyReceiptResponse
 		return nil, ErrGatewayDisabled
 	}
 	g.calls.Add(1)
-	if err := VerifyReceipt(g.domain, in.Receipt, in.Quote, in.RequestHash, in.ResponseContent); err != nil {
+	if err := verifyReceipt(g.domain, in.Receipt, in.Quote, in.RequestHash, in.ResponseContent); err != nil {
 		return nil, err
 	}
 	return &VerifyReceiptResponse{
@@ -748,6 +756,15 @@ func (c *MultiGatewayClient) ChatCompletions(ctx context.Context, req ChatComple
 			}
 			if err := VerifyReceipt(c.domain, *out.EnsoReceipt, out.EnsoQuote, reqHash, out.Choices[0].Message.Content); err != nil {
 				lastErr = err
+				continue
+			}
+			if out.Usage.PromptTokens != out.EnsoReceipt.PromptTokens ||
+				out.Usage.CompletionTokens != out.EnsoReceipt.CompletionTokens ||
+				out.Usage.TotalTokens != out.EnsoReceipt.TotalTokens {
+				lastErr = fmt.Errorf("%w: response usage (%d/%d/%d) does not match signed receipt (%d/%d/%d)",
+					ErrInvalidReceipt,
+					out.Usage.PromptTokens, out.Usage.CompletionTokens, out.Usage.TotalTokens,
+					out.EnsoReceipt.PromptTokens, out.EnsoReceipt.CompletionTokens, out.EnsoReceipt.TotalTokens)
 				continue
 			}
 		}

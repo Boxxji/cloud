@@ -820,7 +820,7 @@ func TestZIPAppSurfaceEndToEnd(t *testing.T) {
 		Receipt:         *chatResp.EnsoReceipt,
 		Quote:           chatResp.EnsoQuote,
 		RequestHash:     CanonicalRequestHash(chatReq),
-		ResponseContent: chatResp.Choices[0].Message.Content,
+		ResponseContent: StringPtr(chatResp.Choices[0].Message.Content),
 	})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("/v1/gateway/receipts/verify status=%d body=%s", resp.StatusCode, string(raw))
@@ -908,5 +908,715 @@ func TestPeerDirectoryGossipAndSnapshot(t *testing.T) {
 	tampered.PeerID = "evil-directory"
 	if err := VerifyDirectorySnapshot(top.domain, tampered, time.Now().Unix()); !errors.Is(err, ErrDirectoryCorrupted) {
 		t.Fatalf("expected ErrDirectoryCorrupted on tampered snapshot, got %v", err)
+	}
+}
+
+// --- Targeted Regression Tests for PR Review Findings ---
+
+func TestPeerDirectoryPreservesProviderOwnership(t *testing.T) {
+	domain := DefaultDomain()
+	now := time.Now().Unix()
+	ownerKP, err := KeyPairFromSeed([]byte("ownership-legitimate-owner"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attackerKP, err := KeyPairFromSeed([]byte("ownership-attacker"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	legit := WorkerRecord{
+		ProtocolVersion:    ProtocolVersion,
+		ProviderID:         "worker-owned-1",
+		EndpointURL:        "http://127.0.0.1:19001",
+		Region:             "us-east",
+		Models:             defaultTestModels(),
+		PriceMicroUSDPer1M: 300_000,
+		AdvertisedTTFTMs:   15,
+		CapacityRPM:        500,
+		IssuedAt:           now,
+		ExpiresAt:          now + 3600,
+	}
+	if err := SignWorkerRecord(domain, ownerKP, &legit); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := NewPeerDirectory(domain)
+	if err := dir.RegisterWorker(legit, now); err != nil {
+		t.Fatalf("RegisterWorker legitimate record: %v", err)
+	}
+
+	// Attacker signs a replacement record for the same ProviderID with equal and later IssuedAt.
+	for _, issuedAt := range []int64{now, now + 100} {
+		hijack := WorkerRecord{
+			ProtocolVersion:    ProtocolVersion,
+			ProviderID:         "worker-owned-1",
+			EndpointURL:        "http://127.0.0.1:6666",
+			Region:             "us-east",
+			Models:             defaultTestModels(),
+			PriceMicroUSDPer1M: 100_000,
+			AdvertisedTTFTMs:   5,
+			CapacityRPM:        500,
+			IssuedAt:           issuedAt,
+			ExpiresAt:          issuedAt + 3600,
+		}
+		if err := SignWorkerRecord(domain, attackerKP, &hijack); err != nil {
+			t.Fatal(err)
+		}
+		if err := dir.RegisterWorker(hijack, now); !errors.Is(err, ErrSignerMismatch) {
+			t.Fatalf("expected ErrSignerMismatch when different operator replaces ProviderID (issuedAt=%d), got %v", issuedAt, err)
+		}
+		accepted, rejected := dir.MergeRecords([]WorkerRecord{hijack}, now)
+		if accepted != 0 || rejected != 1 {
+			t.Fatalf("expected gossip merge to reject hijacked record, got accepted=%d rejected=%d", accepted, rejected)
+		}
+	}
+
+	workers := dir.ListWorkers(now)
+	if len(workers) != 1 || !SameAddress(workers[0].OperatorAddress, ownerKP.Address()) || workers[0].EndpointURL != legit.EndpointURL {
+		t.Fatalf("legitimate worker ownership was altered: %+v", workers)
+	}
+
+	// The legitimate owner CAN refresh its own record with a later IssuedAt.
+	updated := legit
+	updated.EndpointURL = "http://127.0.0.1:19002"
+	updated.IssuedAt = now + 10
+	updated.ExpiresAt = now + 7200
+	if err := SignWorkerRecord(domain, ownerKP, &updated); err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.RegisterWorker(updated, now); err != nil {
+		t.Fatalf("legitimate owner refresh failed: %v", err)
+	}
+	workers = dir.ListWorkers(now)
+	if len(workers) != 1 || workers[0].EndpointURL != updated.EndpointURL {
+		t.Fatalf("expected legitimate owner update to apply, got %+v", workers)
+	}
+
+	// VerifyDirectorySnapshot also rejects conflicting operators for the same ProviderID.
+	dirKP, err := KeyPairFromSeed([]byte("ownership-snapshot-signer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hijackForSnap := updated
+	hijackForSnap.EndpointURL = "http://127.0.0.1:6666"
+	if err := SignWorkerRecord(domain, attackerKP, &hijackForSnap); err != nil {
+		t.Fatal(err)
+	}
+	snap := DirectorySnapshot{
+		ProtocolVersion: ProtocolVersion,
+		PeerID:          "peer-conflict",
+		OperatorAddress: dirKP.Address(),
+		ExportedAt:      now,
+		Workers:         []WorkerRecord{updated, hijackForSnap},
+	}
+	digest, err := computeSnapshotSHA256(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap.SnapshotSHA256 = digest
+	sh, err := snapshotStructHash(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap.Signature, err = dirKP.SignDigest(domain.TypedDataDigest(sh))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyDirectorySnapshot(domain, snap, now); !errors.Is(err, ErrDirectoryCorrupted) {
+		t.Fatalf("expected ErrDirectoryCorrupted for conflicting operators in snapshot, got %v", err)
+	}
+}
+
+func TestWorkerRecordModelInventoryUnambiguousEncoding(t *testing.T) {
+	domain := DefaultDomain()
+	now := time.Now().Unix()
+	kp, err := KeyPairFromSeed([]byte("model-encoding-provider"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	modelA := ModelSpec{
+		ModelID:          "model-a",
+		ModelDigest:      "sha256:" + SHA256Hex([]byte("weights-a")),
+		MaxContextTokens: 8192,
+		License:          "Apache-2.0",
+	}
+	modelB := ModelSpec{
+		ModelID:          "model-b",
+		ModelDigest:      "sha256:" + SHA256Hex([]byte("weights-b")),
+		MaxContextTokens: 16384,
+		License:          "MIT",
+	}
+
+	// Order independence: [A, B] and [B, A] produce identical digests.
+	if canonicalModelsDigest([]ModelSpec{modelA, modelB}) != canonicalModelsDigest([]ModelSpec{modelB, modelA}) {
+		t.Fatalf("canonicalModelsDigest should be order-independent")
+	}
+
+	rec := WorkerRecord{
+		ProtocolVersion:    ProtocolVersion,
+		ProviderID:         "worker-two-models",
+		EndpointURL:        "http://127.0.0.1:19100",
+		Region:             "eu-west",
+		Models:             []ModelSpec{modelA, modelB},
+		PriceMicroUSDPer1M: 320_000,
+		AdvertisedTTFTMs:   12,
+		CapacityRPM:        600,
+		IssuedAt:           now,
+		ExpiresAt:          now + 3600,
+	}
+	if err := SignWorkerRecord(domain, kp, &rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyWorkerRecord(domain, rec, now); err != nil {
+		t.Fatalf("VerifyWorkerRecord valid 2-model record failed: %v", err)
+	}
+
+	// Delimiter-smuggling attack: drop modelB and append "|model-b:..." to modelA.License.
+	smuggled := rec
+	smuggledA := modelA
+	smuggledA.License = fmt.Sprintf("%s|%s:%s:%d:%s", modelA.License, modelB.ModelID, modelB.ModelDigest, modelB.MaxContextTokens, modelB.License)
+	smuggled.Models = []ModelSpec{smuggledA}
+
+	if canonicalModelsDigest(smuggled.Models) == canonicalModelsDigest(rec.Models) {
+		t.Fatalf("delimiter-smuggled model inventory collided with original canonicalModelsDigest")
+	}
+	if err := VerifyWorkerRecord(domain, smuggled, now); !errors.Is(err, ErrSignerMismatch) {
+		t.Fatalf("expected ErrSignerMismatch for delimiter-smuggled model inventory, got %v", err)
+	}
+}
+
+func TestVerifyReceiptRejectsEmptyTruncatedCompletion(t *testing.T) {
+	domain := DefaultDomain()
+	now := time.Now().Unix()
+	kp, err := KeyPairFromSeed([]byte("empty-completion-provider"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := ChatCompletionRequest{
+		Model:     "zen-7b-instruct",
+		Messages:  []ChatMessage{{Role: "user", Content: "check empty completion truncation"}},
+		MaxTokens: 32,
+	}
+	reqHash := CanonicalRequestHash(req)
+	quote := InferenceQuote{
+		QuoteID:            "qt-empty-check-1",
+		ProtocolVersion:    ProtocolVersion,
+		ProviderID:         "worker-empty-check",
+		ModelID:            req.Model,
+		ModelDigest:        "sha256:" + SHA256Hex([]byte("weights")),
+		PriceMicroUSDPer1M: 300_000,
+		MaxTTFTMs:          10,
+		MaxTokens:          32,
+		IssuedAt:           now,
+		ExpiresAt:          now + 60,
+		Nonce:              "nonce-empty-check-1",
+		RequestHash:        reqHash,
+	}
+	if err := SignQuote(domain, kp, &quote); err != nil {
+		t.Fatal(err)
+	}
+	qh, err := QuoteHash(domain, quote)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	honestContent := "honest non-empty completion"
+	rcpt := ExecutionReceipt{
+		ReceiptID:         "rcpt-empty-check-1",
+		ProtocolVersion:   ProtocolVersion,
+		VerificationClass: ReceiptVerificationClass,
+		GatewayID:         "gw-empty-check",
+		GatewayOperator:   "Test Gateway",
+		ProviderID:        quote.ProviderID,
+		ModelID:           quote.ModelID,
+		ModelDigest:       quote.ModelDigest,
+		QuoteID:           quote.QuoteID,
+		QuoteHash:         qh,
+		QuoteNonce:        quote.Nonce,
+		RequestHash:       reqHash,
+		OutputHash:        ComputeOutputHash(honestContent),
+		PromptTokens:      10,
+		CompletionTokens:  12,
+		TotalTokens:       22,
+		TTFTMs:            5.0,
+		TotalLatencyMs:    12.0,
+		CompletedAt:       now,
+	}
+	if err := SignReceipt(domain, kp, &rcpt); err != nil {
+		t.Fatal(err)
+	}
+
+	// Empty completion string MUST be hashed and rejected against non-empty receipt.
+	if err := VerifyReceipt(domain, rcpt, &quote, reqHash, ""); !errors.Is(err, ErrOutputHashMismatch) {
+		t.Fatalf("expected ErrOutputHashMismatch when verifying empty completion against non-empty receipt, got %v", err)
+	}
+	// Separate content-omitted API succeeds when caller explicitly does not supply content.
+	if err := VerifyReceiptWithoutContent(domain, rcpt, &quote, reqHash); err != nil {
+		t.Fatalf("VerifyReceiptWithoutContent failed unexpectedly: %v", err)
+	}
+
+	// Gateway.VerifyReceipt distinguishes nil (omitted) from StringPtr("") (empty text).
+	gw, err := NewGateway(GatewayConfig{
+		GatewayID:    "gw-empty-verify-api",
+		OperatorName: "Empty Verify API",
+		OperatorType: OperatorTypeCommunity,
+		Domain:       domain,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gw.VerifyReceipt(VerifyReceiptRequest{
+		Receipt:         rcpt,
+		Quote:           &quote,
+		RequestHash:     reqHash,
+		ResponseContent: nil,
+	}); err != nil {
+		t.Fatalf("VerifyReceipt with omitted ResponseContent failed: %v", err)
+	}
+	if _, err := gw.VerifyReceipt(VerifyReceiptRequest{
+		Receipt:         rcpt,
+		Quote:           &quote,
+		RequestHash:     reqHash,
+		ResponseContent: StringPtr(""),
+	}); !errors.Is(err, ErrOutputHashMismatch) {
+		t.Fatalf("VerifyReceipt with explicit empty ResponseContent expected ErrOutputHashMismatch, got %v", err)
+	}
+
+	// Genuinely empty completion whose OutputHash commits to "" passes VerifyReceipt(..., "").
+	emptyRcpt := rcpt
+	emptyRcpt.ReceiptID = "rcpt-genuinely-empty"
+	emptyRcpt.OutputHash = ComputeOutputHash("")
+	if err := SignReceipt(domain, kp, &emptyRcpt); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyReceipt(domain, emptyRcpt, &quote, reqHash, ""); err != nil {
+		t.Fatalf("VerifyReceipt for genuinely empty output failed: %v", err)
+	}
+
+	// End-to-end: worker truncating content to "" is rejected by Scheduler and triggers fail-closed error.
+	realWorker, err := NewWorkerNode(WorkerConfig{
+		ProviderID:         "worker-truncating",
+		Models:             defaultTestModels(),
+		PriceMicroUSDPer1M: 300_000,
+		AdvertisedTTFTMs:   10,
+		Domain:             domain,
+		KeyPair:            kp,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer realWorker.Close()
+
+	truncProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		upReq, _ := http.NewRequestWithContext(r.Context(), r.Method, realWorker.URL()+r.URL.Path, bytes.NewReader(body))
+		upReq.Header.Set("Content-Type", "application/json")
+		upResp, err := http.DefaultClient.Do(upReq)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer upResp.Body.Close()
+		raw, _ := io.ReadAll(upResp.Body)
+		if r.URL.Path == "/worker/v1/execute" && upResp.StatusCode == http.StatusOK {
+			var er ExecuteResponse
+			if err := json.Unmarshal(raw, &er); err == nil {
+				er.Content = "" // strip completion text while preserving signed receipt
+				writeJSON(w, http.StatusOK, er)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(upResp.StatusCode)
+		_, _ = w.Write(raw)
+	}))
+	defer truncProxy.Close()
+
+	rec, err := realWorker.SignedRecord(now, 3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.EndpointURL = truncProxy.URL
+	if err := SignWorkerRecord(domain, kp, &rec); err != nil {
+		t.Fatal(err)
+	}
+	gwStrict, err := NewGateway(GatewayConfig{
+		GatewayID:       "gw-trunc-reject",
+		OperatorName:    "Trunc Reject",
+		OperatorType:    OperatorTypeCommunity,
+		Domain:          domain,
+		StaticWorkers:   []WorkerRecord{rec},
+		FailoverEnabled: BoolPtr(false),
+		VerifyReceipts:  BoolPtr(true),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gwStrict.ChatCompletions(context.Background(), req); !errors.Is(err, ErrOutputHashMismatch) {
+		t.Fatalf("expected Scheduler to reject truncated empty content with ErrOutputHashMismatch, got %v", err)
+	}
+}
+
+func TestReceiptAndWorkerEnforceQuoteRequestHashBinding(t *testing.T) {
+	domain := DefaultDomain()
+	now := time.Now().Unix()
+	kp, err := KeyPairFromSeed([]byte("quote-binding-worker"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewWorkerNode(WorkerConfig{
+		ProviderID:         "worker-quote-bind",
+		Models:             defaultTestModels(),
+		PriceMicroUSDPer1M: 300_000,
+		AdvertisedTTFTMs:   10,
+		Domain:             domain,
+		KeyPair:            kp,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Close()
+
+	reqA := ChatCompletionRequest{
+		Model:     "zen-7b-instruct",
+		Messages:  []ChatMessage{{Role: "user", Content: "prompt A"}},
+		MaxTokens: 32,
+	}
+	reqB := ChatCompletionRequest{
+		Model:     "zen-7b-instruct",
+		Messages:  []ChatMessage{{Role: "user", Content: "prompt B"}},
+		MaxTokens: 32,
+	}
+	hashA := CanonicalRequestHash(reqA)
+	hashB := CanonicalRequestHash(reqB)
+	if hashA == hashB {
+		t.Fatalf("expected distinct request hashes")
+	}
+
+	// Obtain a valid signed quote bound to request A from the worker.
+	qBody, _ := json.Marshal(QuoteRequest{
+		ModelID:     reqA.Model,
+		MaxTokens:   reqA.MaxTokens,
+		RequestHash: hashA,
+		GatewayID:   "gw-bind-test",
+	})
+	qResp, err := http.Post(worker.URL()+"/worker/v1/quote", "application/json", bytes.NewReader(qBody))
+	if err != nil {
+		t.Fatalf("quote request failed: %v", err)
+	}
+	defer qResp.Body.Close()
+	if qResp.StatusCode != http.StatusOK {
+		t.Fatalf("quote status=%d", qResp.StatusCode)
+	}
+	var quoteA InferenceQuote
+	if err := json.NewDecoder(qResp.Body).Decode(&quoteA); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Worker dispatch MUST reject executing request B under quote bound to request A.
+	execBody, _ := json.Marshal(ExecuteRequest{
+		Quote:           quoteA,
+		Request:         reqB,
+		GatewayID:       "gw-bind-test",
+		GatewayOperator: "Bind Tester",
+	})
+	execResp, err := http.Post(worker.URL()+"/worker/v1/execute", "application/json", bytes.NewReader(execBody))
+	if err != nil {
+		t.Fatalf("execute request failed: %v", err)
+	}
+	defer execResp.Body.Close()
+	if execResp.StatusCode != http.StatusBadRequest {
+		raw, _ := io.ReadAll(execResp.Body)
+		t.Fatalf("expected HTTP 400 when executing prompt B with quote bound to prompt A, got %d: %s", execResp.StatusCode, string(raw))
+	}
+
+	// 2. VerifyReceipt and VerifyReceiptWithoutContent MUST reject a receipt for request B referencing quoteA.
+	qh, err := QuoteHash(domain, quoteA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentB := "output for prompt B"
+	rcptB := ExecutionReceipt{
+		ReceiptID:         "rcpt-mismatched-req",
+		ProtocolVersion:   ProtocolVersion,
+		VerificationClass: ReceiptVerificationClass,
+		GatewayID:         "gw-bind-test",
+		GatewayOperator:   "Bind Tester",
+		ProviderID:        quoteA.ProviderID,
+		ModelID:           quoteA.ModelID,
+		ModelDigest:       quoteA.ModelDigest,
+		QuoteID:           quoteA.QuoteID,
+		QuoteHash:         qh,
+		QuoteNonce:        quoteA.Nonce,
+		RequestHash:       hashB,
+		OutputHash:        ComputeOutputHash(contentB),
+		PromptTokens:      10,
+		CompletionTokens:  10,
+		TotalTokens:       20,
+		TTFTMs:            5.0,
+		TotalLatencyMs:    10.0,
+		CompletedAt:       now,
+	}
+	if err := SignReceipt(domain, kp, &rcptB); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyReceipt(domain, rcptB, &quoteA, hashB, contentB); !errors.Is(err, ErrInvalidReceipt) {
+		t.Fatalf("expected ErrInvalidReceipt when receipt requestHash differs from bound quote, got %v", err)
+	}
+	if err := VerifyReceiptWithoutContent(domain, rcptB, &quoteA, hashB); !errors.Is(err, ErrInvalidReceipt) {
+		t.Fatalf("expected ErrInvalidReceipt from VerifyReceiptWithoutContent on quote/receipt requestHash mismatch, got %v", err)
+	}
+}
+
+func TestStandaloneHTTPHandlerUsesTypedOperationRegistry(t *testing.T) {
+	top := setupDualGatewayTopology(t)
+
+	// 1. Standalone loopback server exposes OpenAPI 3.1 projection from Mount's typed ops.
+	resp, err := http.Get(top.communitySrv.URL + "/.well-known/openapi.json")
+	if err != nil {
+		t.Fatalf("GET /.well-known/openapi.json: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected HTTP 200 for /.well-known/openapi.json, got %d: %s", resp.StatusCode, string(raw))
+	}
+	var spec struct {
+		OpenAPI string                 `json:"openapi"`
+		Paths   map[string]interface{} `json:"paths"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&spec); err != nil {
+		t.Fatalf("decode openapi spec: %v", err)
+	}
+	if spec.OpenAPI == "" {
+		t.Fatalf("expected non-empty openapi version")
+	}
+	for _, path := range []string{
+		"/v1/models",
+		"/v1/chat/completions",
+		"/v1/gateway/health",
+		"/v1/gateway/providers",
+		"/v1/gateway/quotes",
+		"/v1/gateway/receipts/verify",
+		"/v1/gateway/export",
+	} {
+		if _, ok := spec.Paths[path]; !ok {
+			t.Errorf("standalone OpenAPI spec missing typed operation path %s", path)
+		}
+	}
+
+	// 2. Standalone loopback server exposes MCP JSON-RPC projection from the same typed ops.
+	mcpReq := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`
+	mcpResp, err := http.Post(top.communitySrv.URL+"/mcp", "application/json", bytes.NewBufferString(mcpReq))
+	if err != nil {
+		t.Fatalf("POST /mcp: %v", err)
+	}
+	defer mcpResp.Body.Close()
+	mcpRaw, _ := io.ReadAll(mcpResp.Body)
+	if mcpResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected HTTP 200 for POST /mcp, got %d: %s", mcpResp.StatusCode, string(mcpRaw))
+	}
+	var mcpOut struct {
+		Result struct {
+			Tools []map[string]any `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(mcpRaw, &mcpOut); err != nil {
+		t.Fatalf("decode /mcp response: %v (raw=%s)", err, string(mcpRaw))
+	}
+	if len(mcpOut.Result.Tools) < 7 {
+		t.Fatalf("expected at least 7 projected MCP tools from typed ops, got %d", len(mcpOut.Result.Tools))
+	}
+
+	// 3. Standalone /v1/gateway/receipts/verify distinguishes omitted vs explicit empty response_content.
+	chatReq := ChatCompletionRequest{
+		Model:     "zen-7b-instruct",
+		Messages:  []ChatMessage{{Role: "user", Content: "standalone verify probe"}},
+		MaxTokens: 32,
+	}
+	chatResp, err := top.communityGW.ChatCompletions(context.Background(), chatReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifyOmitted, _ := json.Marshal(VerifyReceiptRequest{
+		Receipt:     *chatResp.EnsoReceipt,
+		Quote:       chatResp.EnsoQuote,
+		RequestHash: CanonicalRequestHash(chatReq),
+	})
+	vResp1, err := http.Post(top.communitySrv.URL+"/v1/gateway/receipts/verify", "application/json", bytes.NewReader(verifyOmitted))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = vResp1.Body.Close()
+	if vResp1.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for omitted response_content, got %d", vResp1.StatusCode)
+	}
+
+	verifyEmpty, _ := json.Marshal(VerifyReceiptRequest{
+		Receipt:         *chatResp.EnsoReceipt,
+		Quote:           chatResp.EnsoQuote,
+		RequestHash:     CanonicalRequestHash(chatReq),
+		ResponseContent: StringPtr(""),
+	})
+	vResp2, err := http.Post(top.communitySrv.URL+"/v1/gateway/receipts/verify", "application/json", bytes.NewReader(verifyEmpty))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = vResp2.Body.Close()
+	if vResp2.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for explicit empty response_content against non-empty receipt, got %d", vResp2.StatusCode)
+	}
+}
+
+func TestTamperedTokenMetadataRejectedAndUsageFromSignedReceipt(t *testing.T) {
+	domain := DefaultDomain()
+	now := time.Now().Unix()
+	kp, err := KeyPairFromSeed([]byte("usage-tamper-worker"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	realWorker, err := NewWorkerNode(WorkerConfig{
+		ProviderID:         "worker-usage-tamper",
+		Models:             defaultTestModels(),
+		PriceMicroUSDPer1M: 300_000,
+		AdvertisedTTFTMs:   10,
+		Domain:             domain,
+		KeyPair:            kp,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer realWorker.Close()
+
+	// Proxy worker that inflates unsigned envelope token counts while leaving signed Receipt intact.
+	tamperWorkerProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		upReq, _ := http.NewRequestWithContext(r.Context(), r.Method, realWorker.URL()+r.URL.Path, bytes.NewReader(body))
+		upReq.Header.Set("Content-Type", "application/json")
+		upResp, err := http.DefaultClient.Do(upReq)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer upResp.Body.Close()
+		raw, _ := io.ReadAll(upResp.Body)
+		if r.URL.Path == "/worker/v1/execute" && upResp.StatusCode == http.StatusOK {
+			var er ExecuteResponse
+			if err := json.Unmarshal(raw, &er); err == nil {
+				er.PromptTokens += 5000
+				er.CompletionTokens += 5000
+				writeJSON(w, http.StatusOK, er)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(upResp.StatusCode)
+		_, _ = w.Write(raw)
+	}))
+	defer tamperWorkerProxy.Close()
+
+	rec, err := realWorker.SignedRecord(now, 3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.EndpointURL = tamperWorkerProxy.URL
+	if err := SignWorkerRecord(domain, kp, &rec); err != nil {
+		t.Fatal(err)
+	}
+
+	req := ChatCompletionRequest{
+		Model:     "zen-7b-instruct",
+		Messages:  []ChatMessage{{Role: "user", Content: "check signed usage accounting"}},
+		MaxTokens: 32,
+	}
+
+	// 1. With VerifyReceipts enabled, tampered execute envelope token metadata is rejected fail-closed.
+	gwVerified, err := NewGateway(GatewayConfig{
+		GatewayID:       "gw-usage-verified",
+		OperatorName:    "Usage Verified",
+		OperatorType:    OperatorTypeCommunity,
+		Domain:          domain,
+		StaticWorkers:   []WorkerRecord{rec},
+		FailoverEnabled: BoolPtr(false),
+		VerifyReceipts:  BoolPtr(true),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gwVerified.ChatCompletions(context.Background(), req); !errors.Is(err, ErrInvalidReceipt) {
+		t.Fatalf("expected ErrInvalidReceipt on tampered worker envelope token counts, got %v", err)
+	}
+
+	// 2. Even if VerifyReceipts were disabled, ChatCompletionResponse.Usage is populated from signed Receipt.
+	gwUnverified, err := NewGateway(GatewayConfig{
+		GatewayID:       "gw-usage-from-receipt",
+		OperatorName:    "Usage From Receipt",
+		OperatorType:    OperatorTypeCommunity,
+		Domain:          domain,
+		StaticWorkers:   []WorkerRecord{rec},
+		FailoverEnabled: BoolPtr(false),
+		VerifyReceipts:  BoolPtr(false),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := gwUnverified.ChatCompletions(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unverified ChatCompletions failed: %v", err)
+	}
+	if resp.Usage.PromptTokens != resp.EnsoReceipt.PromptTokens ||
+		resp.Usage.CompletionTokens != resp.EnsoReceipt.CompletionTokens ||
+		resp.Usage.TotalTokens != resp.EnsoReceipt.TotalTokens {
+		t.Fatalf("expected Usage to match signed receipt (%d/%d/%d), got %+v",
+			resp.EnsoReceipt.PromptTokens, resp.EnsoReceipt.CompletionTokens, resp.EnsoReceipt.TotalTokens, resp.Usage)
+	}
+
+	// 3. MultiGatewayClient rejects a gateway response whose Usage disagrees with EnsoReceipt.
+	honestRec, err := realWorker.SignedRecord(now, 3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	honestGW, err := NewGateway(GatewayConfig{
+		GatewayID:     "gw-honest-for-usage-proxy",
+		OperatorName:  "Honest GW",
+		OperatorType:  OperatorTypeCommunity,
+		Domain:        domain,
+		StaticWorkers: []WorkerRecord{honestRec},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	honestSrv := StartLoopbackServer(honestGW)
+	defer honestSrv.Close()
+
+	tamperGWProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		upReq, _ := http.NewRequestWithContext(r.Context(), r.Method, honestSrv.URL+r.URL.Path, bytes.NewReader(body))
+		upReq.Header.Set("Content-Type", "application/json")
+		upResp, err := http.DefaultClient.Do(upReq)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer upResp.Body.Close()
+		raw, _ := io.ReadAll(upResp.Body)
+		var out ChatCompletionResponse
+		if err := json.Unmarshal(raw, &out); err == nil {
+			out.Usage.TotalTokens += 9999
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		w.WriteHeader(upResp.StatusCode)
+		_, _ = w.Write(raw)
+	}))
+	defer tamperGWProxy.Close()
+
+	cli := NewMultiGatewayClient(domain, []GatewayEndpoint{
+		{GatewayID: "tamper-gw", OperatorType: OperatorTypeCommunity, BaseURL: tamperGWProxy.URL, Enabled: true},
+	}, nil)
+	if _, err := cli.ChatCompletions(context.Background(), req); !errors.Is(err, ErrInvalidReceipt) {
+		t.Fatalf("expected MultiGatewayClient to reject tampered Usage with ErrInvalidReceipt, got %v", err)
 	}
 }

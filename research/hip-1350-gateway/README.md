@@ -21,8 +21,8 @@
 3. **Stateless Multi-Provider Scheduler (`apps/gateway/scheduler.go`)**:
    - Supports four deterministic strategies (`lowest_cost`, `lowest_ttft`, `weighted_slo_score`, `failover_resilient`) with zero shared mutable session state required across gateways.
    - Automatically fails over across competing healthy peers on mid-flight provider crash (HTTP 500), timeout, invalid quote, or invalid/corrupted execution receipt.
-4. **OpenAI-Compatible Dual-Surface HTTP API (`apps/gateway/service.go`)**:
-   - Mounts identical OpenAI-compatible routes (`GET /v1/models`, `POST /v1/chat/completions`) and protocol endpoints (`/v1/gateway/health`, `/v1/gateway/providers`, `/v1/gateway/quotes`, `/v1/gateway/receipts/verify`, `/v1/gateway/export`) via both `github.com/zap-proto/zip` (`Mount`) and standard `net/http` loopback servers (`NewHTTPHandler` / `StartLoopbackServer`).
+4. **OpenAI-Compatible Typed Operation Surface (`apps/gateway/service.go`)**:
+   - Registers OpenAI-compatible routes (`GET /v1/models`, `POST /v1/chat/completions`) and protocol endpoints (`/v1/gateway/health`, `/v1/gateway/providers`, `/v1/gateway/quotes`, `/v1/gateway/receipts/verify`, `/v1/gateway/export`) once through `github.com/zap-proto/zip` (`Mount`), projecting REST, OpenAPI (`/.well-known/openapi.json`), MCP (`/mcp`), CLI, and SDKs identically across embedded `zip.App` hosts and standalone `NewApp` / `NewHTTPHandler` / `StartLoopbackServer` deployments.
 
 ---
 
@@ -38,11 +38,11 @@
 
 See [`score_table.md`](./score_table.md) for the compact summary table and [`raw_results.json`](./raw_results.json) for full unrounded arrays. Key highlights measured over live loopback TCP HTTP:
 
-- **1. Cost (`$/1M useful tokens`)**: Measured cryptographic quote + receipt verification overhead is **279.910 µs/req** (**2.0582 vCPU-s / 1M tokens** = **$0.000023 / 1M tokens** at `$0.04/vCPU-hr`). Open gateway competition reduces total cost from **$0.280723/1M** (Hanzo `25 bps`) to **$0.280303/1M** (Community `10 bps`) down to **$0.280023/1M** (self-hosted/forked `0 bps`).
-- **2. Performance**: Sequential (`N = 120`): **TTFT p50 0.107 ms (p99 0.442 ms)**, **E2E p50 2.076 ms / p95 6.176 ms / p99 9.475 ms**, **323.3 req/s** (`43966 tok/s`), **100.0% completion**. Concurrent (`16` clients): **230.7 req/s** (`31376 tok/s`), **p99 88.106 ms**. Mid-flight crash failover (`20` drills): **100.0% completion** with **p50 2.120 ms / p99 7.149 ms** recovery.
+- **1. Cost (`$/1M useful tokens`)**: Measured cryptographic quote + receipt verification overhead is **501.273 µs/req** (**3.6858 vCPU-s / 1M tokens** = **$0.000041 / 1M tokens** at `$0.04/vCPU-hr`). Open gateway competition reduces total cost from **$0.280741/1M** (Hanzo `25 bps`) to **$0.280321/1M** (Community `10 bps`) down to **$0.280041/1M** (self-hosted/forked `0 bps`).
+- **2. Performance**: Sequential (`N = 120`): **Client TTFT (first response byte) p50 3.696 ms (p99 11.538 ms)** (provider-internal receipt TTFT p50 0.000 ms), **E2E p50 4.000 ms / p95 8.000 ms / p99 11.921 ms**, **256.4 req/s** (`34869 tok/s`), **100.0% completion**. Concurrent (`16` clients): **378.3 req/s** (`51455 tok/s`), **p99 68.006 ms**. Mid-flight crash failover (`20` drills): **100.0% completion** with **p50 2.244 ms / p99 4.388 ms** recovery.
 - **3. Trust**: **7 / 7 (100.0%)** adversarial quote/receipt/directory forgery and replay cases rejected fail-closed.
 - **4. Decentralization**: **100.0%** of inference requests completed with **0 Hanzo-operated gateways**.
-- **5. Sovereignty**: Stateless `GatewayExportBundle` (**3601 B**) verified offline in **442.3 µs**, tampered export rejected fail-closed (`true`), and a forked third-party gateway (`Operator C`, `0 bps` fee) booted in **861.8 µs** with all Hanzo services offline, serving **100.0%** verified completions (`0` Hanzo calls).
+- **5. Sovereignty**: Stateless `GatewayExportBundle` (**3601 B**) verified offline in **511.4 µs**, tampered export rejected fail-closed (`true`), and a forked third-party gateway (`Operator C`, `0 bps` fee) booted in **790.8 µs** with all Hanzo services offline, serving **100.0%** verified completions (`0` Hanzo calls).
 
 ---
 
@@ -74,14 +74,14 @@ Under 30% provider fault injection with failover disabled, completion collapsed 
 
 ### Regime 3 — `stale_quote_storm_boundary` (`boundary_regime`, `40` trials, validated=`true`)
 
-Under rapid price churn (every 4 quotes across 4 workers), 5ms TTL forced 4.00 quotes/req (0.0% cache hit, 1.884 ms avg quote refresh) vs 1000ms TTL at 1.90 quotes/req (70.0% cache hit, 0.737 ms avg quote refresh) while maintaining 100% completion and strict single-use execution nonces.
+Under rapid price churn (every 4 quotes across 4 workers), 5ms TTL forced 4.00 quotes/req (0.0% cache hit, 3.095 ms avg quote refresh) vs 1000ms TTL at 1.90 quotes/req (70.0% cache hit, 1.278 ms avg quote refresh) while maintaining 100% completion and strict single-use execution nonces.
 
 | Quote Cache TTL (ms) | Requests | Total Worker Quotes | Quotes / Req | Cache Hit Rate | Avg Quote Refresh (ms) | Avg Total Latency (ms) | Completion |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 5 | 40 | 160 | 4.00 | 0.0% | 1.884 | 3.585 | 100.0% |
-| 25 | 40 | 79 | 1.98 | 67.5% | 1.723 | 3.028 | 100.0% |
-| 150 | 40 | 76 | 1.90 | 70.0% | 1.140 | 2.314 | 100.0% |
-| 1000 | 40 | 76 | 1.90 | 70.0% | 0.737 | 1.467 | 100.0% |
+| 5 | 40 | 160 | 4.00 | 0.0% | 3.095 | 3.878 | 100.0% |
+| 25 | 40 | 82 | 2.05 | 65.0% | 2.137 | 3.140 | 100.0% |
+| 150 | 40 | 76 | 1.90 | 70.0% | 1.295 | 1.700 | 100.0% |
+| 1000 | 40 | 76 | 1.90 | 70.0% | 1.278 | 1.654 | 100.0% |
 
 ---
 

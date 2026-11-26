@@ -564,6 +564,16 @@ func (s *Scheduler) ScheduleAndExecute(
 				lastErr = err
 				continue
 			}
+			if execResp.PromptTokens != execResp.Receipt.PromptTokens ||
+				execResp.CompletionTokens != execResp.Receipt.CompletionTokens {
+				s.recordFailure(cand.Worker.ProviderID)
+				failedProviders = append(failedProviders, cand.Worker.ProviderID)
+				lastErr = fmt.Errorf("%w: execute envelope token counts (%d, %d) do not match signed receipt (%d, %d)",
+					ErrInvalidReceipt,
+					execResp.PromptTokens, execResp.CompletionTokens,
+					execResp.Receipt.PromptTokens, execResp.Receipt.CompletionTokens)
+				continue
+			}
 		}
 		if gatewayKey != nil {
 			if err := SignGatewayAttestation(s.cfg.Domain, gatewayKey, &execResp.Receipt); err != nil {

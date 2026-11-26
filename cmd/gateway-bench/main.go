@@ -17,6 +17,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -69,27 +70,29 @@ type StrategyBenchResult struct {
 	EffectivePriceUSDPer1M float64      `json:"effectivePriceUsdPer1m"`
 	Latency                LatencyStats `json:"latency"`
 	TTFT                   LatencyStats `json:"ttft"`
+	ProviderReportedTTFT   LatencyStats `json:"providerReportedTtft"`
 }
 
 type PerformanceReport struct {
-	SequentialRequests  int                   `json:"sequentialRequests"`
-	SequentialCompleted int                   `json:"sequentialCompleted"`
-	CompletionRate      float64               `json:"completionRate"`
-	SequentialReqPerSec float64               `json:"sequentialReqPerSec"`
-	SequentialTokPerSec float64               `json:"sequentialTokPerSec"`
-	TTFT                LatencyStats          `json:"ttft"`
-	EndToEndLatency     LatencyStats          `json:"endToEndLatency"`
-	ConcurrentClients   int                   `json:"concurrentClients"`
-	ConcurrentRequests  int                   `json:"concurrentRequests"`
-	ConcurrentCompleted int                   `json:"concurrentCompleted"`
-	ConcurrentReqPerSec float64               `json:"concurrentReqPerSec"`
-	ConcurrentTokPerSec float64               `json:"concurrentTokPerSec"`
-	ConcurrentLatency   LatencyStats          `json:"concurrentLatency"`
-	FailoverDrills      int                   `json:"failoverDrills"`
-	FailoverCompleted   int                   `json:"failoverCompleted"`
-	FailoverCompletion  float64               `json:"failoverCompletionRate"`
-	FailoverLatency     LatencyStats          `json:"failoverLatency"`
-	Strategies          []StrategyBenchResult `json:"strategies"`
+	SequentialRequests   int                   `json:"sequentialRequests"`
+	SequentialCompleted  int                   `json:"sequentialCompleted"`
+	CompletionRate       float64               `json:"completionRate"`
+	SequentialReqPerSec  float64               `json:"sequentialReqPerSec"`
+	SequentialTokPerSec  float64               `json:"sequentialTokPerSec"`
+	TTFT                 LatencyStats          `json:"ttft"`
+	ProviderReportedTTFT LatencyStats          `json:"providerReportedTtft"`
+	EndToEndLatency      LatencyStats          `json:"endToEndLatency"`
+	ConcurrentClients    int                   `json:"concurrentClients"`
+	ConcurrentRequests   int                   `json:"concurrentRequests"`
+	ConcurrentCompleted  int                   `json:"concurrentCompleted"`
+	ConcurrentReqPerSec  float64               `json:"concurrentReqPerSec"`
+	ConcurrentTokPerSec  float64               `json:"concurrentTokPerSec"`
+	ConcurrentLatency    LatencyStats          `json:"concurrentLatency"`
+	FailoverDrills       int                   `json:"failoverDrills"`
+	FailoverCompleted    int                   `json:"failoverCompleted"`
+	FailoverCompletion   float64               `json:"failoverCompletionRate"`
+	FailoverLatency      LatencyStats          `json:"failoverLatency"`
+	Strategies           []StrategyBenchResult `json:"strategies"`
 }
 
 type AdversarialCase struct {
@@ -521,6 +524,38 @@ func measureDualGatewayParity(ctx context.Context, cluster *benchCluster) (bool,
 	return httpParity, zipParity, nil
 }
 
+// callWithClientTTFT invokes client.ChatCompletions and measures gateway TTFT
+// at the client HTTP response boundary using httptrace.GotFirstResponseByte.
+// This captures quotation, failover, worker TTFT, generation delay, receipt
+// signing, and gateway verification rather than provider-internal pre-generation
+// timestamps.
+func callWithClientTTFT(
+	ctx context.Context,
+	client *gateway.MultiGatewayClient,
+	req gateway.ChatCompletionRequest,
+) (*gateway.ChatCompletionResponse, float64, float64, error) {
+	var firstByteMicrosPlusOne atomic.Int64
+	t0 := time.Now()
+	traceCtx := httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GotFirstResponseByte: func() {
+			firstByteMicrosPlusOne.Store(time.Since(t0).Microseconds() + 1)
+		},
+	})
+	resp, err := client.ChatCompletions(traceCtx, req)
+	totalMs := float64(time.Since(t0).Microseconds()) / 1000.0
+	if err != nil {
+		return nil, 0, totalMs, err
+	}
+	ttftMs := totalMs
+	if recorded := firstByteMicrosPlusOne.Load(); recorded > 0 {
+		ttftMs = float64(recorded-1) / 1000.0
+		if ttftMs > totalMs {
+			ttftMs = totalMs
+		}
+	}
+	return resp, ttftMs, totalMs, nil
+}
+
 func measurePerformanceAndCost(ctx context.Context, cluster *benchCluster, iters, concurrency int) (PerformanceReport, CostReport, error) {
 	client := gateway.NewMultiGatewayClient(cluster.domain, []gateway.GatewayEndpoint{
 		{GatewayID: cluster.communityGW.GatewayID(), OperatorType: gateway.OperatorTypeCommunity, BaseURL: cluster.communitySrv.URL, Enabled: true},
@@ -534,6 +569,7 @@ func measurePerformanceAndCost(ctx context.Context, cluster *benchCluster, iters
 
 	e2eLat := make([]float64, 0, iters)
 	ttftLat := make([]float64, 0, iters)
+	providerTTFTLat := make([]float64, 0, iters)
 	verifyMicros := make([]float64, 0, iters)
 	totalTokens := 0
 	completed := 0
@@ -547,9 +583,7 @@ func measurePerformanceAndCost(ctx context.Context, cluster *benchCluster, iters
 			Strategy:  string(gateway.StrategyWeightedSLOScore),
 		}
 		reqHash := gateway.CanonicalRequestHash(req)
-		t0 := time.Now()
-		resp, err := client.ChatCompletions(ctx, req)
-		latMs := float64(time.Since(t0).Microseconds()) / 1000.0
+		resp, clientTTFTMs, latMs, err := callWithClientTTFT(ctx, client, req)
 		if err != nil {
 			continue
 		}
@@ -562,7 +596,8 @@ func measurePerformanceAndCost(ctx context.Context, cluster *benchCluster, iters
 		}
 		verifyMicros = append(verifyMicros, float64(time.Since(v0).Nanoseconds())/1000.0)
 		e2eLat = append(e2eLat, latMs)
-		ttftLat = append(ttftLat, resp.EnsoReceipt.TTFTMs)
+		ttftLat = append(ttftLat, clientTTFTMs)
+		providerTTFTLat = append(providerTTFTLat, resp.EnsoReceipt.TTFTMs)
 		totalTokens += resp.Usage.TotalTokens
 		completed++
 	}
@@ -625,22 +660,22 @@ func measurePerformanceAndCost(ctx context.Context, cluster *benchCluster, iters
 	for _, st := range strategies {
 		sLat := make([]float64, 0, stratIters)
 		sTTFT := make([]float64, 0, stratIters)
+		sProviderTTFT := make([]float64, 0, stratIters)
 		sComp := 0
 		provCounts := make(map[string]int)
 		priceSumMicroUSD := uint64(0)
 		for i := 0; i < stratIters; i++ {
-			t0 := time.Now()
-			resp, err := client.ChatCompletions(ctx, gateway.ChatCompletionRequest{
+			resp, clientTTFTMs, latMs, err := callWithClientTTFT(ctx, client, gateway.ChatCompletionRequest{
 				Model:     "zen-7b-instruct",
 				Messages:  []gateway.ChatMessage{{Role: "user", Content: fmt.Sprintf("strat-%s-%d", st, i)}},
 				MaxTokens: 64,
 				Strategy:  string(st),
 			})
-			latMs := float64(time.Since(t0).Microseconds()) / 1000.0
 			if err == nil && resp != nil {
 				sComp++
 				sLat = append(sLat, latMs)
-				sTTFT = append(sTTFT, resp.EnsoReceipt.TTFTMs)
+				sTTFT = append(sTTFT, clientTTFTMs)
+				sProviderTTFT = append(sProviderTTFT, resp.EnsoReceipt.TTFTMs)
 				provCounts[resp.EnsoRoute.ProviderID]++
 				priceSumMicroUSD += resp.EnsoRoute.EffectivePriceMicroUSDPer1M
 			}
@@ -666,6 +701,7 @@ func measurePerformanceAndCost(ctx context.Context, cluster *benchCluster, iters
 			EffectivePriceUSDPer1M: avgPriceUSD,
 			Latency:                computeLatencyStats(sLat),
 			TTFT:                   computeLatencyStats(sTTFT),
+			ProviderReportedTTFT:   computeLatencyStats(sProviderTTFT),
 		})
 	}
 
@@ -731,24 +767,25 @@ func measurePerformanceAndCost(ctx context.Context, cluster *benchCluster, iters
 	}
 
 	perfReport := PerformanceReport{
-		SequentialRequests:  iters,
-		SequentialCompleted: completed,
-		CompletionRate:      float64(completed) / float64(iters),
-		SequentialReqPerSec: round2(float64(completed) / seqElapsedSec),
-		SequentialTokPerSec: round2(float64(totalTokens) / seqElapsedSec),
-		TTFT:                computeLatencyStats(ttftLat),
-		EndToEndLatency:     computeLatencyStats(e2eLat),
-		ConcurrentClients:   concurrency,
-		ConcurrentRequests:  totalConcReqs,
-		ConcurrentCompleted: int(concCompleted.Load()),
-		ConcurrentReqPerSec: round2(float64(concCompleted.Load()) / concElapsedSec),
-		ConcurrentTokPerSec: round2(float64(concTokens.Load()) / concElapsedSec),
-		ConcurrentLatency:   computeLatencyStats(validConcLat),
-		FailoverDrills:      failoverDrills,
-		FailoverCompleted:   failoverComp,
-		FailoverCompletion:  float64(failoverComp) / float64(failoverDrills),
-		FailoverLatency:     computeLatencyStats(failoverLat),
-		Strategies:          stratResults,
+		SequentialRequests:   iters,
+		SequentialCompleted:  completed,
+		CompletionRate:       float64(completed) / float64(iters),
+		SequentialReqPerSec:  round2(float64(completed) / seqElapsedSec),
+		SequentialTokPerSec:  round2(float64(totalTokens) / seqElapsedSec),
+		TTFT:                 computeLatencyStats(ttftLat),
+		ProviderReportedTTFT: computeLatencyStats(providerTTFTLat),
+		EndToEndLatency:      computeLatencyStats(e2eLat),
+		ConcurrentClients:    concurrency,
+		ConcurrentRequests:   totalConcReqs,
+		ConcurrentCompleted:  int(concCompleted.Load()),
+		ConcurrentReqPerSec:  round2(float64(concCompleted.Load()) / concElapsedSec),
+		ConcurrentTokPerSec:  round2(float64(concTokens.Load()) / concElapsedSec),
+		ConcurrentLatency:    computeLatencyStats(validConcLat),
+		FailoverDrills:       failoverDrills,
+		FailoverCompleted:    failoverComp,
+		FailoverCompletion:   float64(failoverComp) / float64(failoverDrills),
+		FailoverLatency:      computeLatencyStats(failoverLat),
+		Strategies:           stratResults,
 	}
 	return perfReport, costReport, nil
 }
@@ -1112,7 +1149,7 @@ func renderScoreTable(r *BenchmarkReport) string {
 		fmt.Fprintf(&b, "| **1. Cost** | %s | **$%.6f / 1M useful tokens** (base `$%.3f` + fee `$%.6f` + verify `$%.6f`) | Open fee competition (0–25 bps) |\n",
 			tier.Tier, tier.TotalUSDPer1MTok, tier.BaseComputeUSDPer1MTok, tier.GatewayFeeUSDPer1MTok, tier.VerifyCryptoCPUUSDPer1MTok)
 	}
-	fmt.Fprintf(&b, "| **2. Performance** | Sequential loopback HTTP (`N = %d`) | **TTFT p50 %.3f ms (p99 %.3f ms)** · **E2E p50 %.3f ms / p95 %.3f ms / p99 %.3f ms** · **%.1f req/s** (`%.0f tok/s`) · **%.1f%% completion** | Sub-10ms local gateway overhead, 100%% completion |\n",
+	fmt.Fprintf(&b, "| **2. Performance** | Sequential loopback HTTP (`N = %d`) | **Client TTFT (first byte) p50 %.3f ms (p99 %.3f ms)** · **E2E p50 %.3f ms / p95 %.3f ms / p99 %.3f ms** · **%.1f req/s** (`%.0f tok/s`) · **%.1f%% completion** | Sub-10ms local gateway overhead, 100%% completion |\n",
 		r.Performance.SequentialRequests,
 		r.Performance.TTFT.P50Ms, r.Performance.TTFT.P99Ms,
 		r.Performance.EndToEndLatency.P50Ms, r.Performance.EndToEndLatency.P95Ms, r.Performance.EndToEndLatency.P99Ms,
@@ -1177,8 +1214,8 @@ func renderReadme(r *BenchmarkReport) string {
 	b.WriteString("3. **Stateless Multi-Provider Scheduler (`apps/gateway/scheduler.go`)**:\n")
 	b.WriteString("   - Supports four deterministic strategies (`lowest_cost`, `lowest_ttft`, `weighted_slo_score`, `failover_resilient`) with zero shared mutable session state required across gateways.\n")
 	b.WriteString("   - Automatically fails over across competing healthy peers on mid-flight provider crash (HTTP 500), timeout, invalid quote, or invalid/corrupted execution receipt.\n")
-	b.WriteString("4. **OpenAI-Compatible Dual-Surface HTTP API (`apps/gateway/service.go`)**:\n")
-	b.WriteString("   - Mounts identical OpenAI-compatible routes (`GET /v1/models`, `POST /v1/chat/completions`) and protocol endpoints (`/v1/gateway/health`, `/v1/gateway/providers`, `/v1/gateway/quotes`, `/v1/gateway/receipts/verify`, `/v1/gateway/export`) via both `github.com/zap-proto/zip` (`Mount`) and standard `net/http` loopback servers (`NewHTTPHandler` / `StartLoopbackServer`).\n\n")
+	b.WriteString("4. **OpenAI-Compatible Typed Operation Surface (`apps/gateway/service.go`)**:\n")
+	b.WriteString("   - Registers OpenAI-compatible routes (`GET /v1/models`, `POST /v1/chat/completions`) and protocol endpoints (`/v1/gateway/health`, `/v1/gateway/providers`, `/v1/gateway/quotes`, `/v1/gateway/receipts/verify`, `/v1/gateway/export`) once through `github.com/zap-proto/zip` (`Mount`), projecting REST, OpenAPI (`/.well-known/openapi.json`), MCP (`/mcp`), CLI, and SDKs identically across embedded `zip.App` hosts and standalone `NewApp` / `NewHTTPHandler` / `StartLoopbackServer` deployments.\n\n")
 
 	b.WriteString("---\n\n")
 	b.WriteString("## 2. Mandatory Acceptance Verification (Dual-Gateway Parity & Hanzo Kill Switch)\n\n")
@@ -1199,9 +1236,10 @@ func renderReadme(r *BenchmarkReport) string {
 		r.Cost.MeasuredVerifyMicrosPerReq, r.Cost.VerifyCPUSecondsPer1MTok,
 		r.Cost.Tiers[0].VerifyCryptoCPUUSDPer1MTok, r.Cost.VCPUHourlyRateUSD,
 		r.Cost.Tiers[0].TotalUSDPer1MTok, r.Cost.Tiers[1].TotalUSDPer1MTok, r.Cost.Tiers[2].TotalUSDPer1MTok)
-	fmt.Fprintf(&b, "- **2. Performance**: Sequential (`N = %d`): **TTFT p50 %.3f ms (p99 %.3f ms)**, **E2E p50 %.3f ms / p95 %.3f ms / p99 %.3f ms**, **%.1f req/s** (`%.0f tok/s`), **%.1f%% completion**. Concurrent (`%d` clients): **%.1f req/s** (`%.0f tok/s`), **p99 %.3f ms**. Mid-flight crash failover (`%d` drills): **%.1f%% completion** with **p50 %.3f ms / p99 %.3f ms** recovery.\n",
+	fmt.Fprintf(&b, "- **2. Performance**: Sequential (`N = %d`): **Client TTFT (first response byte) p50 %.3f ms (p99 %.3f ms)** (provider-internal receipt TTFT p50 %.3f ms), **E2E p50 %.3f ms / p95 %.3f ms / p99 %.3f ms**, **%.1f req/s** (`%.0f tok/s`), **%.1f%% completion**. Concurrent (`%d` clients): **%.1f req/s** (`%.0f tok/s`), **p99 %.3f ms**. Mid-flight crash failover (`%d` drills): **%.1f%% completion** with **p50 %.3f ms / p99 %.3f ms** recovery.\n",
 		r.Performance.SequentialRequests,
 		r.Performance.TTFT.P50Ms, r.Performance.TTFT.P99Ms,
+		r.Performance.ProviderReportedTTFT.P50Ms,
 		r.Performance.EndToEndLatency.P50Ms, r.Performance.EndToEndLatency.P95Ms, r.Performance.EndToEndLatency.P99Ms,
 		r.Performance.SequentialReqPerSec, r.Performance.SequentialTokPerSec,
 		r.Performance.CompletionRate*100,
