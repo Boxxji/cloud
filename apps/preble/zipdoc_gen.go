@@ -8,7 +8,7 @@ import (
 
 func init() {
 	zip.Describe("github.com/hanzoai/cloud/apps/preble DELETE /v1/preble/replicas/:id", zip.Doc{
-		Description: "Removes a GPU replica and prunes all prefix cache entries referencing it.",
+		Description: "Removes a GPU replica and prunes all prefix cache entries referencing it.\nRestricted to authorized platform operators (SuperAdmin).",
 		Fields: map[string]string{
 			"removeReplicaOut.id":      "ID is the removed GPU replica identifier.",
 			"removeReplicaOut.removed": "Removed is true when the replica and its prefix index memberships were removed.",
@@ -55,7 +55,7 @@ func init() {
 		},
 	})
 	zip.Describe("github.com/hanzoai/cloud/apps/preble POST /v1/preble/replicas", zip.Doc{
-		Description: "Registers a GPU serving replica with validated KV-cache capacity and throughput bounds.",
+		Description: "Registers a GPU serving replica with validated KV-cache capacity and throughput bounds.\nRestricted to authorized platform operators (SuperAdmin).",
 		Fields: map[string]string{
 			"addReplicaIn.decodeTokPerSec":  "DecodeTokPerSec sets aggregate decode throughput in tokens/sec (defaults to 1800).",
 			"addReplicaIn.gpuModel":         "GPUModel describes the accelerator model (defaults to \"H100-80GB\").",

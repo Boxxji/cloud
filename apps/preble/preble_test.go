@@ -507,6 +507,16 @@ func setupTestHTTPApp(t *testing.T) *zip.App {
 
 func doJSON(t *testing.T, app *zip.App, method, target, org string, body any) (int, []byte) {
 	t.Helper()
+	return doJSONWithAdmin(t, app, method, target, org, false, body)
+}
+
+func doJSONAsOperator(t *testing.T, app *zip.App, method, target, org string, body any) (int, []byte) {
+	t.Helper()
+	return doJSONWithAdmin(t, app, method, target, org, true, body)
+}
+
+func doJSONWithAdmin(t *testing.T, app *zip.App, method, target, org string, isAdmin bool, body any) (int, []byte) {
+	t.Helper()
 	var buf bytes.Buffer
 	if body != nil {
 		if err := json.NewEncoder(&buf).Encode(body); err != nil {
@@ -520,6 +530,9 @@ func doJSON(t *testing.T, app *zip.App, method, target, org string, body any) (i
 	if org != "" {
 		req.Header.Set("X-Org-Id", org)
 		req.Header.Set("X-User-Id", "u_"+org)
+	}
+	if isAdmin {
+		req.Header.Set("X-User-IsAdmin", "true")
 	}
 	resp, err := app.Test(req, zip.TestConfig{Timeout: 10 * time.Second, FailOnTimeout: true})
 	if err != nil {
@@ -595,8 +608,22 @@ func TestHTTPWireSecurityIsolationAndQueryHijackImmunity(t *testing.T) {
 		}
 	}
 
-	// 3. Register replica gpu-2 via HTTP POST and verify query-hijack immunity (url:"-").
-	code, body = doJSON(t, app, http.MethodPost, "/v1/preble/replicas?id=hijacked&kvBudgetTokens=16", "org-alpha", map[string]any{
+	// 3a. Non-operator authenticated tenant MUST be rejected with 403 on replica mutations.
+	code, body = doJSON(t, app, http.MethodPost, "/v1/preble/replicas", "org-alpha", map[string]any{
+		"id":             "gpu-2",
+		"gpuModel":       "H200-141GB",
+		"kvBudgetTokens": 131072,
+	})
+	if code != http.StatusForbidden {
+		t.Fatalf("POST /replicas by non-operator: expected 403, got %d (%s)", code, string(body))
+	}
+	code, body = doJSON(t, app, http.MethodDelete, "/v1/preble/replicas/gpu-0", "org-beta", nil)
+	if code != http.StatusForbidden {
+		t.Fatalf("DELETE /replicas/gpu-0 by non-operator: expected 403, got %d (%s)", code, string(body))
+	}
+
+	// 3b. Platform operator registers replica gpu-2 via HTTP POST and verifies query-hijack immunity (url:"-").
+	code, body = doJSONAsOperator(t, app, http.MethodPost, "/v1/preble/replicas?id=hijacked&kvBudgetTokens=16", "admin", map[string]any{
 		"id":             "gpu-2",
 		"gpuModel":       "H200-141GB",
 		"kvBudgetTokens": 131072,
@@ -680,7 +707,7 @@ func TestHTTPWireSecurityIsolationAndQueryHijackImmunity(t *testing.T) {
 		t.Fatalf("expected alpha-2 cache hit on %s, got %+v", decA1.ReplicaID, decA2)
 	}
 
-	// 8. Org-scoped metrics & replica deletion.
+	// 8. Org-scoped metrics & operator-only replica deletion.
 	code, body = doJSON(t, app, http.MethodGet, "/v1/preble/metrics", "org-alpha", nil)
 	if code != http.StatusOK {
 		t.Fatalf("GET /metrics status=%d", code)
@@ -691,8 +718,323 @@ func TestHTTPWireSecurityIsolationAndQueryHijackImmunity(t *testing.T) {
 		t.Fatalf("unexpected alpha metrics: %+v", m)
 	}
 
+	// Non-operator org-alpha still cannot delete gpu-2.
 	code, body = doJSON(t, app, http.MethodDelete, "/v1/preble/replicas/gpu-2", "org-alpha", nil)
+	if code != http.StatusForbidden {
+		t.Fatalf("DELETE /replicas/gpu-2 by non-operator: expected 403, got %d (%s)", code, string(body))
+	}
+
+	// Platform operator deletes gpu-2 cleanly.
+	code, body = doJSONAsOperator(t, app, http.MethodDelete, "/v1/preble/replicas/gpu-2", "admin", nil)
 	if code != http.StatusOK {
-		t.Fatalf("DELETE /replicas/gpu-2 status=%d body=%s", code, string(body))
+		t.Fatalf("DELETE /replicas/gpu-2 by operator status=%d body=%s", code, string(body))
+	}
+}
+
+// Regression test for Codex Finding #1: normal org B must not be able to delete or add
+// shared replicas while org A has active placements.
+func TestReplicaMutationRequiresOperatorAuthorization(t *testing.T) {
+	app := setupTestHTTPApp(t)
+
+	// Org A places an active request onto one of the shared GPUs.
+	code, body := doJSON(t, app, http.MethodPost, "/v1/preble/place", "org-a", map[string]any{
+		"requestId":    "org-a-active",
+		"prompt":       "active multi-turn prompt for org-a on shared gpu",
+		"outputTokens": 64,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("org-a place failed: %d (%s)", code, string(body))
+	}
+	var dec PlacementDecision
+	if err := json.Unmarshal(body, &dec); err != nil {
+		t.Fatalf("decode decision: %v", err)
+	}
+
+	// Org B lists replicas and tries to delete the replica holding Org A's active request.
+	code, body = doJSON(t, app, http.MethodDelete, "/v1/preble/replicas/"+dec.ReplicaID, "org-b", nil)
+	if code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for org-b deleting shared replica %s, got %d (%s)", dec.ReplicaID, code, string(body))
+	}
+
+	// Org B also tries to register a rogue replica.
+	code, body = doJSON(t, app, http.MethodPost, "/v1/preble/replicas", "org-b", map[string]any{
+		"id": "rogue-gpu",
+	})
+	if code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for org-b adding shared replica, got %d (%s)", code, string(body))
+	}
+
+	// Org A's active request MUST still exist and complete cleanly.
+	code, body = doJSON(t, app, http.MethodPost, "/v1/preble/complete", "org-a", map[string]any{
+		"requestId": "org-a-active",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("org-a active placement was disrupted: complete status=%d (%s)", code, string(body))
+	}
+}
+
+// Regression test for Codex Finding #2: active requestIds must be namespaced by (tenant, requestId)
+// so two orgs can concurrently use identical requestIds without collision or existence probing.
+func TestActiveRequestIDsNamespacedByTenant(t *testing.T) {
+	app := setupTestHTTPApp(t)
+
+	// Org A places with predictable requestId "job-1".
+	code, body := doJSON(t, app, http.MethodPost, "/v1/preble/place", "org-a", map[string]any{
+		"requestId":    "job-1",
+		"prompt":       "org-a prompt content",
+		"outputTokens": 32,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("org-a place job-1 failed: %d (%s)", code, string(body))
+	}
+
+	// Org B simultaneously places with the EXACT SAME requestId "job-1" -> MUST succeed!
+	code, body = doJSON(t, app, http.MethodPost, "/v1/preble/place", "org-b", map[string]any{
+		"requestId":    "job-1",
+		"prompt":       "org-b prompt content",
+		"outputTokens": 32,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("org-b place with same requestId 'job-1' failed: %d (%s)", code, string(body))
+	}
+
+	// Org A submitting duplicate "job-1" within its own namespace MUST still be rejected (400).
+	code, body = doJSON(t, app, http.MethodPost, "/v1/preble/place", "org-a", map[string]any{
+		"requestId":    "job-1",
+		"prompt":       "org-a duplicate",
+		"outputTokens": 32,
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on same-tenant duplicate active requestId, got %d (%s)", code, string(body))
+	}
+
+	// Org B completes its "job-1" -> MUST NOT affect Org A's "job-1".
+	code, body = doJSON(t, app, http.MethodPost, "/v1/preble/complete", "org-b", map[string]any{
+		"requestId": "job-1",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("org-b complete job-1 failed: %d (%s)", code, string(body))
+	}
+
+	// Org B completing "job-1" a second time -> 404.
+	code, body = doJSON(t, app, http.MethodPost, "/v1/preble/complete", "org-b", map[string]any{
+		"requestId": "job-1",
+	})
+	if code != http.StatusNotFound {
+		t.Fatalf("expected 404 on second org-b complete, got %d (%s)", code, string(body))
+	}
+
+	// Org A's "job-1" is still active and completes cleanly.
+	code, body = doJSON(t, app, http.MethodPost, "/v1/preble/complete", "org-a", map[string]any{
+		"requestId": "job-1",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("org-a complete job-1 failed after org-b completed its own job-1: %d (%s)", code, string(body))
+	}
+}
+
+// Regression test for Codex Finding #3: when a full cache evicts the last block of the
+// same (tenant, aclScope) during ReserveAndPin, the namespace root must stay registered
+// in idx.roots so newly attached blocks are reachable by Match.
+func TestReserveAndPinReRegistersPrunedNamespaceRoot(t *testing.T) {
+	idx := NewPrefixIndex(16)
+	// Two-block cache: holds exactly 2 blocks total.
+	if err := idx.AddReplica("gpu-0", 32); err != nil {
+		t.Fatalf("AddReplica: %v", err)
+	}
+
+	// Insert 1 unpinned block for tenant A (becomes LRU).
+	blkA1, err := HashTokenBlocks("tenant-a", "default", makeTokens(1, 16), 16)
+	if err != nil {
+		t.Fatalf("HashTokenBlocks A1: %v", err)
+	}
+	pA1, _, _, err := idx.ReserveAndPin("tenant-a", "default", "gpu-0", blkA1)
+	if err != nil {
+		t.Fatalf("ReserveAndPin A1: %v", err)
+	}
+	idx.Unpin("gpu-0", pA1)
+
+	// Insert 1 unpinned block for tenant B (becomes MRU; cache is now full: 2/2 blocks).
+	blkB1, err := HashTokenBlocks("tenant-b", "default", makeTokens(2, 16), 16)
+	if err != nil {
+		t.Fatalf("HashTokenBlocks B1: %v", err)
+	}
+	pB1, _, _, err := idx.ReserveAndPin("tenant-b", "default", "gpu-0", blkB1)
+	if err != nil {
+		t.Fatalf("ReserveAndPin B1: %v", err)
+	}
+	idx.Unpin("gpu-0", pB1)
+
+	// Tenant A inserts a different 1-block prefix A2.
+	// This evicts A1 (the LRU block, which is the ONLY block under tenant-a's root).
+	blkA2, err := HashTokenBlocks("tenant-a", "default", makeTokens(3, 16), 16)
+	if err != nil {
+		t.Fatalf("HashTokenBlocks A2: %v", err)
+	}
+	pA2, matched, evicted, err := idx.ReserveAndPin("tenant-a", "default", "gpu-0", blkA2)
+	if err != nil {
+		t.Fatalf("ReserveAndPin A2: %v", err)
+	}
+	if matched != 0 || evicted != 1 || len(pA2) != 1 {
+		t.Fatalf("unexpected A2 reserve: matched=%d evicted=%d pinned=%d", matched, evicted, len(pA2))
+	}
+	idx.Unpin("gpu-0", pA2)
+
+	// Match MUST find A2 (16 tokens) and B1 (16 tokens) cleanly.
+	mA2 := idx.Match("tenant-a", "default", blkA2)
+	if mA2.MatchedTokens["gpu-0"] != 16 || mA2.MatchedBlocks["gpu-0"] != 1 {
+		t.Fatalf("detached namespace root: Match(A2) returned %d tokens (%d blocks), expected 16 (1 block)",
+			mA2.MatchedTokens["gpu-0"], mA2.MatchedBlocks["gpu-0"])
+	}
+	mB1 := idx.Match("tenant-b", "default", blkB1)
+	if mB1.MatchedTokens["gpu-0"] != 16 {
+		t.Fatalf("Match(B1) returned %d tokens, expected 16", mB1.MatchedTokens["gpu-0"])
+	}
+	if idx.TenantCount() != 2 || idx.NodeCount() != 2 {
+		t.Fatalf("expected TenantCount=2 NodeCount=2, got tenants=%d nodes=%d", idx.TenantCount(), idx.NodeCount())
+	}
+}
+
+// Regression test for Codex Finding #4: simulator must share a replica's aggregate
+// DecodeTokPerSec budget across simultaneous decode streams and reschedule completions
+// as the batch changes.
+func TestSimulationEnforcesAggregateDecodeBudget(t *testing.T) {
+	// 1 default replica (DecodeTokPerSec = 1800) with 64 simultaneous requests arriving
+	// at t=0, each requiring 64 decode tokens = 4,096 aggregate decode tokens.
+	// At 1,800 tok/s aggregate rate, decode alone requires >= 4096/1800 = 2275.56 ms.
+	reqs := make([]TraceRequest, 64)
+	for i := 0; i < 64; i++ {
+		reqs[i] = TraceRequest{
+			RequestID:    fmt.Sprintf("sim-dec-%d", i),
+			ArrivalMs:    0,
+			Tenant:       "org-bench",
+			ACLScope:     "default",
+			TokenIDs:     makeTokens(uint64(100+i), 64),
+			OutputTokens: 64,
+		}
+	}
+	trace := WorkloadTrace{
+		Name: "aggregate-decode-budget",
+		InitialReplicas: []ReplicaConfig{
+			{
+				ID:               "gpu-0",
+				KVBudgetTokens:   65536,
+				PrefillTokPerSec: 40000,
+				DecodeTokPerSec:  1800,
+				MaxConcurrent:    64,
+			},
+		},
+		Requests:  reqs,
+		BlockSize: 16,
+	}
+
+	res, err := RunSimulation(trace, PolicyPrebleE2, SchedulerConfig{})
+	if err != nil {
+		t.Fatalf("RunSimulation: %v", err)
+	}
+	minDecodeMs := (4096.0 / 1800.0) * 1000.0 // 2275.555... ms
+	if res.MakespanMs < minDecodeMs {
+		t.Fatalf("aggregate DecodeTokPerSec violated: 4096 decode tokens finished in %.2f ms, below physical minimum %.2f ms",
+			res.MakespanMs, minDecodeMs)
+	}
+
+	// Single stream must still be capped at per-stream speed (80 tok/s => 64/80*1000 = 800ms decode).
+	singleTrace := WorkloadTrace{
+		Name:            "single-stream-decode",
+		InitialReplicas: trace.InitialReplicas,
+		Requests:        reqs[:1],
+		BlockSize:       16,
+	}
+	singleRes, err := RunSimulation(singleTrace, PolicyPrebleE2, SchedulerConfig{})
+	if err != nil {
+		t.Fatalf("RunSimulation single: %v", err)
+	}
+	if singleRes.MakespanMs < 800.0 || singleRes.MakespanMs > 820.0 {
+		t.Fatalf("expected single-stream makespan ~801.6ms (64/40000s prefill + 64/80s decode), got %.2f ms", singleRes.MakespanMs)
+	}
+}
+
+// Regression test for Codex Finding #5: raw Prompt tokenization must preserve whitespace
+// (indentation, spaces, tabs, newlines) so distinct prompts never collide in KV cache identity.
+func TestTokenizeTextPreservesWhitespaceIdentity(t *testing.T) {
+	// Python indentation example: second() inside vs outside an if block.
+	insideIf := "if cond:\n    first()\n    second()\n"
+	outsideIf := "if cond:\n    first()\nsecond()\n"
+
+	tokIn := TokenizeText(insideIf)
+	tokOut := TokenizeText(outsideIf)
+	if len(tokIn) == 0 || len(tokOut) == 0 {
+		t.Fatal("expected non-empty token sequences")
+	}
+	same := len(tokIn) == len(tokOut)
+	if same {
+		for i := range tokIn {
+			if tokIn[i] != tokOut[i] {
+				same = false
+				break
+			}
+		}
+	}
+	if same {
+		t.Fatalf("whitespace-distinct Python prompts produced identical tokens: %v", tokIn)
+	}
+
+	// Verify end-to-end on Scheduler.Place raw Prompt path: warming insideIf must NOT
+	// fabricate full-prompt KV reuse for outsideIf (blockSize=16 covers the whole prompt).
+	sched, err := NewScheduler(SchedulerConfig{Policy: PolicyPrebleE2, BlockSize: 16})
+	if err != nil {
+		t.Fatalf("NewScheduler: %v", err)
+	}
+	if err := sched.AddReplica(ReplicaConfig{ID: "gpu-0", KVBudgetTokens: 65536}); err != nil {
+		t.Fatalf("AddReplica: %v", err)
+	}
+	dec1, err := sched.Place(PlacementRequest{
+		RequestID:    "py-1",
+		Tenant:       "org-py",
+		Prompt:       insideIf,
+		OutputTokens: 16,
+	})
+	if err != nil {
+		t.Fatalf("Place py-1: %v", err)
+	}
+	_ = sched.Complete("org-py", dec1.RequestID)
+
+	dec2, err := sched.Place(PlacementRequest{
+		RequestID:    "py-2",
+		Tenant:       "org-py",
+		Prompt:       outsideIf,
+		OutputTokens: 16,
+	})
+	if err != nil {
+		t.Fatalf("Place py-2: %v", err)
+	}
+	// They differ in block 0 (at token 10, indentation before second()), so block 0 hash differs => 0 reuse!
+	if dec2.MatchedTokens != 0 {
+		t.Fatalf("expected 0 reused tokens between differently indented Python prompts, got %d/%d",
+			dec2.MatchedTokens, dec2.PromptTokens)
+	}
+
+	// Additional whitespace pairs that must all yield distinct token streams.
+	variants := []string{
+		"abcd efgh",
+		"abcdefgh",
+		"abcd  efgh",
+		"abcd\tefgh",
+		"abcd\nefgh",
+		"abcd\r\nefgh",
+		" abcd efgh",
+		"abcd efgh ",
+	}
+	seen := make(map[string]string, len(variants))
+	for _, v := range variants {
+		blks, err := HashTokenBlocks("org-ws", "", TokenizeText(v), 16)
+		if err != nil {
+			t.Fatalf("HashTokenBlocks(%q): %v", v, err)
+		}
+		key := fmt.Sprintf("%x", blks[len(blks)-1].Hash)
+		if prev, dup := seen[key]; dup {
+			t.Fatalf("whitespace collision between %q and %q", prev, v)
+		}
+		seen[key] = v
 	}
 }

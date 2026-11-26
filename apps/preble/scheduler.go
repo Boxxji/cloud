@@ -249,6 +249,11 @@ type activeReq struct {
 	placedAt       time.Time
 }
 
+type inFlightKey struct {
+	tenant    string
+	requestID string
+}
+
 type tenantStat struct {
 	requests           uint64
 	promptTokens       uint64
@@ -266,7 +271,7 @@ type Scheduler struct {
 	replicas map[string]*replicaState
 	order    []string
 	rrCursor uint64
-	inFlight map[string]*activeReq
+	inFlight map[inFlightKey]*activeReq
 	tStats   map[string]*tenantStat
 }
 
@@ -280,7 +285,7 @@ func NewScheduler(cfg SchedulerConfig) (*Scheduler, error) {
 		cfg:      norm,
 		index:    NewPrefixIndex(norm.BlockSize),
 		replicas: make(map[string]*replicaState),
-		inFlight: make(map[string]*activeReq),
+		inFlight: make(map[inFlightKey]*activeReq),
 		tStats:   make(map[string]*tenantStat),
 	}, nil
 }
@@ -435,7 +440,8 @@ func (s *Scheduler) PlaceAt(now time.Time, req PlacementRequest) (PlacementDecis
 	if reqID == "" {
 		reqID = newRequestID()
 	}
-	if _, dup := s.inFlight[reqID]; dup {
+	flightKey := inFlightKey{tenant: tenant, requestID: reqID}
+	if _, dup := s.inFlight[flightKey]; dup {
 		return PlacementDecision{}, fmt.Errorf("%w: duplicate active requestId %q", ErrInvalidRequest, reqID)
 	}
 
@@ -678,7 +684,7 @@ func (s *Scheduler) PlaceAt(now time.Time, req PlacementRequest) (PlacementDecis
 	r.activeDecodeTokens += req.OutputTokens
 	r.totalPlacements++
 
-	s.inFlight[reqID] = &activeReq{
+	s.inFlight[flightKey] = &activeReq{
 		id:             reqID,
 		tenant:         tenant,
 		aclScope:       aclScope,
@@ -751,11 +757,12 @@ func (s *Scheduler) CompleteAt(now time.Time, tenant, requestID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	ar, ok := s.inFlight[requestID]
-	if !ok || ar.tenant != tenant {
+	flightKey := inFlightKey{tenant: tenant, requestID: requestID}
+	ar, ok := s.inFlight[flightKey]
+	if !ok {
 		return ErrRequestNotFound
 	}
-	delete(s.inFlight, requestID)
+	delete(s.inFlight, flightKey)
 
 	s.index.Unpin(ar.replicaID, ar.pinned)
 	if r, exists := s.replicas[ar.replicaID]; exists {

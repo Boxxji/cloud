@@ -32,6 +32,12 @@ type Deps struct {
 	// Acting returns the validated org a call acts for, or a zip.ErrUnauthorized / zip.ErrForbidden.
 	Acting func(ctx context.Context) (org string, err error)
 
+	// Operator enforces that the caller is an authorized platform operator permitted to
+	// mutate shared cluster GPU replicas (POST /replicas, DELETE /replicas/:id).
+	// When nil, NewService defaults to a fail-closed gate requiring Acting(ctx) and
+	// a validated platform SuperAdmin (zip.CallerOf(ctx).Admin).
+	Operator func(ctx context.Context) error
+
 	// Config optionally overrides default Preble E2 scheduler parameters.
 	Config SchedulerConfig
 
@@ -41,16 +47,29 @@ type Deps struct {
 
 // Service owns the Preble E2 scheduler and host identity bindings.
 type Service struct {
-	log    luxlog.Logger
-	org    func(context.Context) (string, bool)
-	acting func(context.Context) (string, error)
-	sched  *Scheduler
+	log      luxlog.Logger
+	org      func(context.Context) (string, bool)
+	acting   func(context.Context) (string, error)
+	operator func(context.Context) error
+	sched    *Scheduler
 }
 
 // NewService constructs a standalone Preble Service from deps.
 func NewService(deps Deps) (*Service, error) {
 	if deps.Log == nil || deps.Org == nil || deps.Acting == nil {
 		return nil, errors.New("preble: Deps requires Log, Org, and Acting")
+	}
+	operator := deps.Operator
+	if operator == nil {
+		operator = func(ctx context.Context) error {
+			if _, err := deps.Acting(ctx); err != nil {
+				return err
+			}
+			if !zip.CallerOf(ctx).Admin {
+				return zip.ErrForbidden("platform operator authority required to mutate shared GPU replicas")
+			}
+			return nil
+		}
 	}
 	sched, err := NewScheduler(deps.Config)
 	if err != nil {
@@ -62,10 +81,11 @@ func NewService(deps Deps) (*Service, error) {
 		}
 	}
 	return &Service{
-		log:    deps.Log,
-		org:    deps.Org,
-		acting: deps.Acting,
-		sched:  sched,
+		log:      deps.Log,
+		org:      deps.Org,
+		acting:   deps.Acting,
+		operator: operator,
+		sched:    sched,
 	}, nil
 }
 
@@ -220,8 +240,9 @@ func (o ops) listReplicas(ctx context.Context, _ *struct{}) (*replicaListOut, er
 }
 
 // addReplica registers a GPU serving replica with validated KV-cache capacity and throughput bounds.
+// Restricted to authorized platform operators (SuperAdmin).
 func (o ops) addReplica(ctx context.Context, in *addReplicaIn) (*ReplicaStatus, error) {
-	if _, err := o.s.acting(ctx); err != nil {
+	if err := o.s.operator(ctx); err != nil {
 		return nil, err
 	}
 	if len(in.ID) > maxHTTPFieldLen || len(in.GPUModel) > maxHTTPFieldLen {
@@ -256,8 +277,9 @@ func (o ops) addReplica(ctx context.Context, in *addReplicaIn) (*ReplicaStatus, 
 }
 
 // removeReplica removes a GPU replica and prunes all prefix cache entries referencing it.
+// Restricted to authorized platform operators (SuperAdmin).
 func (o ops) removeReplica(ctx context.Context, in *replicaRef) (*removeReplicaOut, error) {
-	if _, err := o.s.acting(ctx); err != nil {
+	if err := o.s.operator(ctx); err != nil {
 		return nil, err
 	}
 	if err := o.s.sched.RemoveReplica(in.ID); err != nil {

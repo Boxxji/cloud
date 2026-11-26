@@ -69,18 +69,27 @@ type simEventKind int
 const (
 	simEventScaleOut simEventKind = iota
 	simEventCompletion
+	simEventDecodeStart
 	simEventArrival
 )
 
+const (
+	maxSingleStreamDecodeTokPerSec = 80.0
+	decodeTokenEpsilon             = 1e-6
+)
+
 type simEvent struct {
-	atMs      float64
-	kind      simEventKind
-	seq       int
-	scaleOut  *ScaleOutEvent
-	req       *TraceRequest
-	tenant    string
-	reqID     string
-	replicaID string
+	atMs           float64
+	kind           simEventKind
+	seq            int
+	scaleOut       *ScaleOutEvent
+	req            *TraceRequest
+	tenant         string
+	reqID          string
+	replicaID      string
+	prefillStartMs float64
+	outputTokens   int
+	gen            uint64
 }
 
 type simEventHeap []*simEvent
@@ -90,7 +99,8 @@ func (h simEventHeap) Less(i, j int) bool {
 	if h[i].atMs != h[j].atMs {
 		return h[i].atMs < h[j].atMs
 	}
-	// At identical timestamps: scale-out first, then completions (freeing slots), then arrivals.
+	// At identical timestamps: scale-out first, then completions (freeing slots & decode
+	// bandwidth), then decode starts, then new arrivals.
 	if h[i].kind != h[j].kind {
 		return h[i].kind < h[j].kind
 	}
@@ -112,12 +122,74 @@ type timeInterval struct {
 	end   float64
 }
 
+type decodingStream struct {
+	tenant          string
+	reqID           string
+	prefillStartMs  float64
+	remainingTokens float64
+}
+
 type simReplicaTracker struct {
-	id         string
-	cfg        ReplicaConfig
-	joinedMs   float64
-	intervals  []timeInterval
-	placements uint64
+	id                 string
+	cfg                ReplicaConfig
+	joinedMs           float64
+	intervals          []timeInterval
+	placements         uint64
+	decoding           []*decodingStream
+	lastDecodeUpdateMs float64
+	decodeGen          uint64
+}
+
+// perStreamDecodeRate returns the per-request decode throughput (tok/s) when active
+// concurrent decode streams share a replica's aggregate DecodeTokPerSec budget.
+// Each stream is bounded individually by memory-bandwidth speed (~80 tok/s) and
+// collectively by aggregateDecodeTokPerSec / active.
+func perStreamDecodeRate(active int, aggregateDecodeTokPerSec float64) float64 {
+	if active <= 0 || aggregateDecodeTokPerSec <= 0 {
+		return 0
+	}
+	return math.Min(maxSingleStreamDecodeTokPerSec, aggregateDecodeTokPerSec/float64(active))
+}
+
+func (rt *simReplicaTracker) advanceDecode(nowMs float64) {
+	if len(rt.decoding) > 0 && nowMs > rt.lastDecodeUpdateMs {
+		dtSec := (nowMs - rt.lastDecodeUpdateMs) / 1000.0
+		rate := perStreamDecodeRate(len(rt.decoding), rt.cfg.DecodeTokPerSec)
+		consumed := rate * dtSec
+		for _, s := range rt.decoding {
+			s.remainingTokens -= consumed
+		}
+	}
+	rt.lastDecodeUpdateMs = nowMs
+}
+
+func (rt *simReplicaTracker) scheduleNextCompletion(nowMs float64, pq *simEventHeap, seq *int) {
+	rt.decodeGen++
+	if len(rt.decoding) == 0 {
+		return
+	}
+	rate := perStreamDecodeRate(len(rt.decoding), rt.cfg.DecodeTokPerSec)
+	if rate <= 0 {
+		return
+	}
+	minRem := rt.decoding[0].remainingTokens
+	for _, s := range rt.decoding[1:] {
+		if s.remainingTokens < minRem {
+			minRem = s.remainingTokens
+		}
+	}
+	if minRem < 0 {
+		minRem = 0
+	}
+	nextMs := nowMs + (minRem/rate)*1000.0
+	heap.Push(pq, &simEvent{
+		atMs:      nextMs,
+		kind:      simEventCompletion,
+		seq:       *seq,
+		replicaID: rt.id,
+		gen:       rt.decodeGen,
+	})
+	*seq++
 }
 
 // RunSimulation executes policy against trace in a deterministic discrete-event GPU
@@ -190,6 +262,34 @@ func RunSimulation(trace WorkloadTrace, policy Policy, baseCfg SchedulerConfig) 
 	var peakNodes int
 	var makespanMs float64
 
+	completeFinished := func(rt *simReplicaTracker, nowMs float64, now time.Time, forceMin bool) {
+		threshold := decodeTokenEpsilon
+		if forceMin && len(rt.decoding) > 0 {
+			minRem := rt.decoding[0].remainingTokens
+			for _, s := range rt.decoding[1:] {
+				if s.remainingTokens < minRem {
+					minRem = s.remainingTokens
+				}
+			}
+			if minRem > threshold && minRem < 1e-3 {
+				threshold = minRem + 1e-9
+			}
+		}
+		remaining := rt.decoding[:0]
+		for _, s := range rt.decoding {
+			if s.remainingTokens <= threshold {
+				_ = sched.CompleteAt(now, s.tenant, s.reqID)
+				rt.intervals = append(rt.intervals, timeInterval{start: s.prefillStartMs, end: nowMs})
+				if nowMs > makespanMs {
+					makespanMs = nowMs
+				}
+			} else {
+				remaining = append(remaining, s)
+			}
+		}
+		rt.decoding = remaining
+	}
+
 	for pq.Len() > 0 {
 		ev := heap.Pop(pq).(*simEvent)
 		now := msToTime(ev.atMs)
@@ -201,13 +301,43 @@ func RunSimulation(trace WorkloadTrace, policy Policy, baseCfg SchedulerConfig) 
 			}
 			norm, _ := ev.scaleOut.Replica.withDefaults()
 			trackers[norm.ID] = &simReplicaTracker{
-				id:       norm.ID,
-				cfg:      norm,
-				joinedMs: ev.atMs,
+				id:                 norm.ID,
+				cfg:                norm,
+				joinedMs:           ev.atMs,
+				lastDecodeUpdateMs: ev.atMs,
 			}
 
 		case simEventCompletion:
-			_ = sched.CompleteAt(now, ev.tenant, ev.reqID)
+			rt := trackers[ev.replicaID]
+			if rt == nil || ev.gen != rt.decodeGen {
+				continue
+			}
+			rt.advanceDecode(ev.atMs)
+			completeFinished(rt, ev.atMs, now, true)
+			rt.scheduleNextCompletion(ev.atMs, pq, &seq)
+
+		case simEventDecodeStart:
+			rt := trackers[ev.replicaID]
+			if rt == nil {
+				continue
+			}
+			if ev.outputTokens <= 0 {
+				_ = sched.CompleteAt(now, ev.tenant, ev.reqID)
+				rt.intervals = append(rt.intervals, timeInterval{start: ev.prefillStartMs, end: ev.atMs})
+				if ev.atMs > makespanMs {
+					makespanMs = ev.atMs
+				}
+				continue
+			}
+			rt.advanceDecode(ev.atMs)
+			completeFinished(rt, ev.atMs, now, false)
+			rt.decoding = append(rt.decoding, &decodingStream{
+				tenant:          ev.tenant,
+				reqID:           ev.reqID,
+				prefillStartMs:  ev.prefillStartMs,
+				remainingTokens: float64(ev.outputTokens),
+			})
+			rt.scheduleNextCompletion(ev.atMs, pq, &seq)
 
 		case simEventArrival:
 			tr := ev.req
@@ -240,27 +370,17 @@ func RunSimulation(trace WorkloadTrace, policy Policy, baseCfg SchedulerConfig) 
 			rt := trackers[dec.ReplicaID]
 			rt.placements++
 
-			// Model per-request decode phase duration after first token is emitted.
-			// Single-stream decode runs around ~60-90 tok/s per request (bounded by replica DecodeTokPerSec).
-			perStreamDecode := math.Min(80.0, rt.cfg.DecodeTokPerSec)
-			decodeMs := 0.0
-			if tr.OutputTokens > 0 && perStreamDecode > 0 {
-				decodeMs = (float64(tr.OutputTokens) / perStreamDecode) * 1000.0
-			}
 			prefillStartMs := ev.atMs + dec.EstimatedColdMs + dec.EstimatedQueueMs
-			finishMs := ev.atMs + ttftMs + decodeMs
-			if finishMs > makespanMs {
-				makespanMs = finishMs
-			}
-			rt.intervals = append(rt.intervals, timeInterval{start: prefillStartMs, end: finishMs})
-
+			decodeStartMs := ev.atMs + ttftMs
 			heap.Push(pq, &simEvent{
-				atMs:      finishMs,
-				kind:      simEventCompletion,
-				seq:       seq,
-				tenant:    tr.Tenant,
-				reqID:     dec.RequestID,
-				replicaID: dec.ReplicaID,
+				atMs:           decodeStartMs,
+				kind:           simEventDecodeStart,
+				seq:            seq,
+				tenant:         tr.Tenant,
+				reqID:          dec.RequestID,
+				replicaID:      dec.ReplicaID,
+				prefillStartMs: prefillStartMs,
+				outputTokens:   tr.OutputTokens,
 			})
 			seq++
 		}

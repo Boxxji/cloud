@@ -9,8 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -74,49 +74,100 @@ type TokenBlock struct {
 	Tokens int
 }
 
+func isWordRune(r rune) bool {
+	return !unicode.IsSpace(r) && !unicode.IsPunct(r) && !unicode.IsSymbol(r)
+}
+
 // TokenizeText deterministically converts UTF-8 prompt text into uint64 token IDs
-// using whitespace/punctuation subword segmentation (~4 chars per token on code/JSON).
-// Used when callers supply raw prompt text instead of pre-tokenized token IDs.
+// using lossless whitespace- and punctuation-preserving subword segmentation (~4 chars
+// per token on code/JSON). Every byte of text (including spaces, tabs, indentation, and
+// newlines) is preserved in the emitted token sequence so distinct raw prompts never
+// collide in KV prefix cache identity.
 func TokenizeText(text string) []uint64 {
 	if text == "" {
 		return nil
 	}
 	var tokens []uint64
-	var cur strings.Builder
-	flush := func() {
-		if cur.Len() == 0 {
-			return
-		}
-		s := cur.String()
-		cur.Reset()
-		// Split long runs into ~4-byte subword chunks to approximate BPE token counts.
-		for i := 0; i < len(s); i += 4 {
-			end := i + 4
-			if end > len(s) {
-				end = len(s)
+	emit := func(piece string) {
+		h := fnv.New64a()
+		_, _ = h.Write([]byte(piece))
+		tokens = append(tokens, h.Sum64())
+	}
+
+	n := len(text)
+	for i := 0; i < n; {
+		r, sz := utf8.DecodeRuneInString(text[i:])
+
+		// Attach a single leading ASCII space directly before a word rune (matching
+		// BPE leading-space tokens such as " world") while preserving exact bytes.
+		if r == ' ' && i+sz < n {
+			nextR, _ := utf8.DecodeRuneInString(text[i+sz:])
+			if isWordRune(nextR) {
+				start := i
+				i += sz
+				runes := 0
+				for i < n && runes < 4 {
+					wr, wsz := utf8.DecodeRuneInString(text[i:])
+					if !isWordRune(wr) {
+						break
+					}
+					i += wsz
+					runes++
+				}
+				emit(text[start:i])
+				continue
 			}
-			h := fnv.New64a()
-			_, _ = h.Write([]byte(s[i:end]))
-			tokens = append(tokens, h.Sum64())
 		}
-	}
-	for _, r := range text {
+
+		// Preserve all whitespace runs explicitly: emit CRLF/LF/CR separately and chunk
+		// horizontal whitespace (spaces/tabs/indentation) in up to 4-rune pieces.
 		if unicode.IsSpace(r) {
-			flush()
+			if r == '\r' && i+sz < n && text[i+sz] == '\n' {
+				emit(text[i : i+sz+1])
+				i += sz + 1
+				continue
+			}
+			if r == '\n' || r == '\r' {
+				emit(text[i : i+sz])
+				i += sz
+				continue
+			}
+			start := i
+			i += sz
+			runes := 1
+			for i < n && runes < 4 {
+				sr, ssz := utf8.DecodeRuneInString(text[i:])
+				if !unicode.IsSpace(sr) || sr == '\n' || sr == '\r' {
+					break
+				}
+				i += ssz
+				runes++
+			}
+			emit(text[start:i])
 			continue
 		}
+
+		// Emit punctuation and symbol runes individually.
 		if unicode.IsPunct(r) || unicode.IsSymbol(r) {
-			flush()
-			h := fnv.New64a()
-			var buf [4]byte
-			n := copy(buf[:], string(r))
-			_, _ = h.Write(buf[:n])
-			tokens = append(tokens, h.Sum64())
+			emit(text[i : i+sz])
+			i += sz
 			continue
 		}
-		cur.WriteRune(r)
+
+		// Chunk contiguous word runes into <=4-rune subword pieces.
+		start := i
+		i += sz
+		runes := 1
+		for i < n && runes < 4 {
+			wr, wsz := utf8.DecodeRuneInString(text[i:])
+			if !isWordRune(wr) {
+				break
+			}
+			i += wsz
+			runes++
+		}
+		emit(text[start:i])
 	}
-	flush()
 	return tokens
 }
 
@@ -495,6 +546,12 @@ func (idx *PrefixIndex) ReserveAndPin(tenant, aclScope, replicaID string, blocks
 				break
 			}
 			evictedBlocks++
+			// If eviction pruned the last cached block of this same (tenant, aclScope),
+			// pruneUpward removed ns from idx.roots; re-register root so newly attached
+			// blocks stay reachable by subsequent Match calls.
+			if _, ok := idx.roots[ns]; !ok {
+				idx.roots[ns] = root
+			}
 		}
 
 		// Attach or fetch node in the tenant's prefix tree.
@@ -542,9 +599,12 @@ func (idx *PrefixIndex) ReserveAndPin(tenant, aclScope, replicaID string, blocks
 		cache.lru.MoveToFront(touchedElems[i])
 	}
 
-	// Clean up empty root if nothing was cached (e.g., 100% pinned bypass).
+	// Clean up empty root if nothing was cached (e.g., 100% pinned bypass), otherwise
+	// ensure the live namespace root remains registered.
 	if len(root.children) == 0 {
 		delete(idx.roots, ns)
+	} else {
+		idx.roots[ns] = root
 	}
 	return pinned, matchedTokens, evictedBlocks, nil
 }
