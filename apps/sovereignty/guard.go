@@ -47,6 +47,7 @@ func NewHostBlocker() *HostBlocker {
 	}
 	return &HostBlocker{
 		hanzoHosts: map[string]struct{}{
+			"hanzo.ai":          {},
 			"api.hanzo.ai":      {},
 			"gateway.hanzo.ai":  {},
 			"registry.hanzo.ai": {},
@@ -55,6 +56,22 @@ func NewHostBlocker() *HostBlocker {
 		hanzoSuffixes: []string{".hanzo.ai"},
 		base:          tr,
 	}
+}
+
+// normalizeHost lowercases host, separates optional port, and strips trailing
+// DNS root dots from the hostname so absolute FQDNs (e.g. "api.hanzo.ai.")
+// normalize identically to "api.hanzo.ai".
+func normalizeHost(host string) (normHostPort string, hostname string) {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if h == "" {
+		return "", ""
+	}
+	if parsedHost, port, err := net.SplitHostPort(h); err == nil {
+		cleanHost := strings.TrimRight(parsedHost, ".")
+		return net.JoinHostPort(cleanHost, port), cleanHost
+	}
+	cleanHost := strings.TrimRight(h, ".")
+	return cleanHost, cleanHost
 }
 
 // CloseIdleConnections releases pooled HTTP connections on the underlying transport.
@@ -71,8 +88,12 @@ func (hb *HostBlocker) RegisterHanzoEndpoint(rawURL string) {
 	if err != nil || u.Host == "" {
 		return
 	}
+	normHP, _ := normalizeHost(u.Host)
+	if normHP == "" {
+		return
+	}
 	hb.mu.Lock()
-	hb.hanzoHosts[strings.ToLower(u.Host)] = struct{}{}
+	hb.hanzoHosts[normHP] = struct{}{}
 	hb.mu.Unlock()
 }
 
@@ -86,22 +107,19 @@ func (hb *HostBlocker) KillSwitchActive() bool {
 	return hb.killSwitchActive.Load()
 }
 
-// IsHanzoHost returns true if host matches api.hanzo.ai, *.hanzo.ai, or any
-// registered Hanzo loopback endpoint.
+// IsHanzoHost returns true if host matches hanzo.ai, api.hanzo.ai, *.hanzo.ai
+// (including trailing-dot absolute DNS spellings), or any registered Hanzo
+// loopback endpoint.
 func (hb *HostBlocker) IsHanzoHost(host string) bool {
-	h := strings.ToLower(strings.TrimSpace(host))
-	if h == "" {
+	normHP, hostname := normalizeHost(host)
+	if normHP == "" {
 		return false
 	}
 	hb.mu.RLock()
 	defer hb.mu.RUnlock()
 
-	if _, ok := hb.hanzoHosts[h]; ok {
+	if _, ok := hb.hanzoHosts[normHP]; ok {
 		return true
-	}
-	hostname := h
-	if parsedHost, _, err := net.SplitHostPort(h); err == nil {
-		hostname = parsedHost
 	}
 	if _, ok := hb.hanzoHosts[hostname]; ok {
 		return true

@@ -221,6 +221,7 @@ type NetworkForkBundle struct {
 	OperatorAddress   string                  `json:"operatorAddress"`
 	Providers         []ProviderAdvertisement `json:"providers"`
 	Models            []ModelManifest         `json:"models"`
+	ModelBlobs        map[string][]byte       `json:"modelBlobs,omitempty"`
 	SettlementLedger  []SettlementReceipt     `json:"settlementLedger"`
 	Balances          map[string]uint64       `json:"balances"`
 	Governance        []GovernanceDecision    `json:"governance"`

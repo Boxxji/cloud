@@ -30,4 +30,37 @@ func TestBenchmarkSmoke(t *testing.T) {
 			t.Errorf("negative regime %s failed validation: %+v", r.Name, r)
 		}
 	}
+	if rep.Performance.MeasuredTokensPerJob != 128 || rep.Cost.MeasuredTokensPerJob != 128 {
+		t.Fatalf("expected MeasuredTokensPerJob=128, got perf=%d cost=%d", rep.Performance.MeasuredTokensPerJob, rep.Cost.MeasuredTokensPerJob)
+	}
 }
+
+func TestFlipFirstHexByteBitAlwaysMutates(t *testing.T) {
+	for _, sample := range []string{"ff010203", "00010203", "aabbccdd"} {
+		out, err := flipFirstHexByteBit(sample)
+		if err != nil {
+			t.Fatalf("flipFirstHexByteBit(%s): %v", sample, err)
+		}
+		if out == sample {
+			t.Fatalf("flipFirstHexByteBit(%s) returned unchanged ciphertext", sample)
+		}
+	}
+}
+
+func TestComputeCostModelUsesMeasuredTokenCount(t *testing.T) {
+	perf := PerformanceSection{
+		OfflineReceiptVerify:  LatencyStats{MeanUs: 1000.0},
+		SovereignDataRecovery: LatencyStats{MeanUs: 1000.0},
+		PeerAndModelDiscovery: LatencyStats{MeanUs: 1033.53},
+		MeasuredTokensPerJob:  128,
+	}
+	cost := computeCostModel(perf)
+	// 3033.53 us/job * (1_000_000 / 128 jobs) / 1e6 = 23.699453 sec per 1M measured tokens.
+	if cost.MeasuredLocalCPUsPer1MTokens < 23.0 || cost.MeasuredLocalCPUsPer1MTokens > 24.5 {
+		t.Fatalf("expected MeasuredLocalCPUsPer1MTokens ~23.699453 for 128-token jobs, got %f", cost.MeasuredLocalCPUsPer1MTokens)
+	}
+	if cost.TokensPerJob != 10_000 || cost.MeasuredTokensPerJob != 128 {
+		t.Fatalf("unexpected token basis: modeled=%d measured=%d", cost.TokensPerJob, cost.MeasuredTokensPerJob)
+	}
+}
+

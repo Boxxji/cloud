@@ -4,6 +4,7 @@ package sovereignty
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -161,7 +162,7 @@ func TestModelIntegrityAndUnauthorizedDataRecoveryRejected(t *testing.T) {
 	}
 
 	// 3. Payment replay attack MUST be rejected with HTTP 409 / ErrReplayDetected.
-	_, _ = doJSONRequest(client, http.MethodPost, community.Facilitator.URL()+"/v1/payments/mint", mintReq{
+	_, _ = doJSONRequest(client, http.MethodPost, community.Facilitator.URL()+"/v1/payments/mint", MintRequest{
 		Address: tenantKP.Address(),
 		Amount:  10_000,
 	}, nil)
@@ -199,7 +200,12 @@ func TestModelIntegrityAndUnauthorizedDataRecoveryRejected(t *testing.T) {
 		t.Fatalf("expected ErrUnauthorizedDataAccess for missing key, got %v", err)
 	}
 	tamperedEnv := env
-	tamperedEnv.CiphertextHex = "00" + env.CiphertextHex[2:]
+	ctBytes, err := hex.DecodeString(env.CiphertextHex)
+	if err != nil || len(ctBytes) == 0 {
+		t.Fatalf("decode ciphertext: %v", err)
+	}
+	ctBytes[0] ^= 0x01
+	tamperedEnv.CiphertextHex = hex.EncodeToString(ctBytes)
 	if _, err := DecryptUserData(domain, userKey, tamperedEnv); !errors.Is(err, ErrUnauthorizedDataAccess) {
 		t.Fatalf("expected ErrUnauthorizedDataAccess for tampered ciphertext, got %v", err)
 	}
@@ -293,7 +299,7 @@ func TestConcurrentMultiTenantBlackoutExitRace(t *testing.T) {
 				return
 			}
 			// Mint balance on community facilitator.
-			if _, err := doJSONRequest(client, http.MethodPost, community.Facilitator.URL()+"/v1/payments/mint", mintReq{
+			if _, err := doJSONRequest(client, http.MethodPost, community.Facilitator.URL()+"/v1/payments/mint", MintRequest{
 				Address: tenantKP.Address(),
 				Amount:  100_000,
 			}, nil); err != nil {
@@ -504,3 +510,269 @@ func TestZIPHTTPAndSovereignForkExport(t *testing.T) {
 		t.Fatalf("expected HTTP 422 on tampered fork bundle, got %d", status)
 	}
 }
+
+type spyRoundTripper struct {
+	called int
+}
+
+func (s *spyRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	s.called++
+	return nil, errors.New("unexpected upstream transport call")
+}
+
+func TestHostBlockerNormalizesAbsoluteDNSNames(t *testing.T) {
+	hb := NewHostBlocker()
+	spy := &spyRoundTripper{}
+	hb.base = spy
+	hb.ActivateKillSwitch()
+
+	for _, rawURL := range []string{
+		"https://api.hanzo.ai./v1/health",
+		"https://api.hanzo.ai.:443/v1/health",
+		"https://API.HANZO.AI./v1/schedule",
+		"https://sub.hanzo.ai./v1/models",
+		"https://hanzo.ai./",
+	} {
+		req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := hb.RoundTrip(req); !errors.Is(err, ErrHanzoHostBlocked) {
+			t.Fatalf("expected ErrHanzoHostBlocked for %s, got %v", rawURL, err)
+		}
+	}
+	if spy.called != 0 {
+		t.Fatalf("expected 0 underlying transport calls for dotted Hanzo hostnames, got %d", spy.called)
+	}
+	m := hb.Metrics()
+	if m.CommunityCallsAfterKill != 0 || m.HanzoBlockedAttempts != 5 {
+		t.Fatalf("unexpected metrics after dotted blackout probes: %+v", m)
+	}
+}
+
+func TestVaultRejectsCrossOwnerSnapshotOverwrite(t *testing.T) {
+	domain := DefaultDomain()
+	vault := NewSovereignVaultServer("vault-owner-guard", PlaneCommunity, domain)
+	defer vault.Close()
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	ownerA, _ := GenerateKeyPair()
+	ownerB, _ := GenerateKeyPair()
+	keyA, _ := GenerateUserDataKey()
+	keyB, _ := GenerateUserDataKey()
+	plainA := []byte("owner-A-confidential-state")
+	plainB := []byte("owner-B-replacement-attempt")
+
+	envA, err := EncryptUserData(domain, ownerA, keyA, "shared-snap-id", plainA, []string{vault.URL()}, []string{"op"}, time.Now().UTC().Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, err := doJSONRequest(client, http.MethodPost, vault.URL()+"/v1/vault/snapshots", envA, nil); err != nil || status != http.StatusOK {
+		t.Fatalf("owner A put snapshot failed: status=%d err=%v", status, err)
+	}
+
+	// Owner B attempts to overwrite Owner A's snapshot ID with a validly signed envelope of its own.
+	envB, err := EncryptUserData(domain, ownerB, keyB, "shared-snap-id", plainB, []string{vault.URL()}, []string{"op"}, time.Now().UTC().Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := doJSONRequest(client, http.MethodPost, vault.URL()+"/v1/vault/snapshots", envB, nil)
+	if err == nil || status != http.StatusForbidden {
+		t.Fatalf("expected HTTP 403 rejecting cross-owner snapshot overwrite, got status=%d err=%v", status, err)
+	}
+
+	// Owner A's original ciphertext must remain intact and decryptable with keyA.
+	var fetched EncryptedDataEnvelope
+	if _, err := doJSONRequest(client, http.MethodGet, vault.URL()+"/v1/vault/snapshots/shared-snap-id", nil, &fetched); err != nil {
+		t.Fatal(err)
+	}
+	dec, err := DecryptUserData(domain, keyA, fetched)
+	if err != nil || !bytes.Equal(dec, plainA) {
+		t.Fatalf("owner A snapshot corrupted after rejected cross-owner overwrite: err=%v", err)
+	}
+}
+
+func TestForkBundleHydratesModelArtifactsAfterOriginShutdown(t *testing.T) {
+	domain := DefaultDomain()
+	_, fork, err := RunNetworkExitDrill(domain)
+	if err != nil {
+		t.Fatalf("RunNetworkExitDrill: %v", err)
+	}
+	if len(fork.Models) == 0 || len(fork.ModelBlobs) == 0 {
+		t.Fatalf("expected fork bundle to include model manifests and verified blobs")
+	}
+
+	// Both origin mirrors (Hanzo and Community B) are already closed by RunNetworkExitDrill.
+	// Hydrate a brand-new Operator D plane solely from the returned fork bundle and download
+	// the model artifact from Operator D's own mirror!
+	client := &http.Client{Timeout: 5 * time.Second}
+	opD, err := NewCommunityControlPlane("community-op-d-external-fork", domain, client, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opD.Close()
+	if err := opD.HydrateFromFork(*fork); err != nil {
+		t.Fatalf("HydrateFromFork on fresh Operator D failed: %v", err)
+	}
+	m := fork.Models[0]
+	blob, err := DownloadAndVerifyModelBlob(client, opD.Mirror.URL(), m.DigestSHA256)
+	if err != nil {
+		t.Fatalf("post-fork model artifact download from Operator D mirror failed: %v", err)
+	}
+	if int64(len(blob)) != m.SizeBytes {
+		t.Fatalf("downloaded blob size=%d want %d", len(blob), m.SizeBytes)
+	}
+}
+
+func TestControlPlaneServersExposeTypedOpenAPIAndMCP(t *testing.T) {
+	domain := DefaultDomain()
+	guard := NewHostBlocker()
+	defer guard.CloseIdleConnections()
+	client := guard.NewHTTPClient(5 * time.Second)
+
+	community, err := NewCommunityControlPlane("typed-ops-op", domain, client, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer community.Close()
+	provKP, _ := GenerateKeyPair()
+	prov := NewProviderNodeServer("typed-ops-prov", provKP, domain, client)
+	defer prov.Close()
+
+	checkSurface := func(name, baseURL string, wantPaths []string, minTools int) {
+		t.Helper()
+		resp, err := http.Get(baseURL + "/.well-known/openapi.json")
+		if err != nil {
+			t.Fatalf("%s openapi GET: %v", name, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("%s openapi status=%d body=%s", name, resp.StatusCode, string(raw))
+		}
+		var spec struct {
+			Paths map[string]any `json:"paths"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&spec); err != nil {
+			t.Fatalf("%s decode openapi: %v", name, err)
+		}
+		for _, p := range wantPaths {
+			if _, ok := spec.Paths[p]; !ok {
+				t.Errorf("%s OpenAPI missing typed path %s (have=%v)", name, p, spec.Paths)
+			}
+		}
+
+		mcpResp, err := http.Post(baseURL+"/mcp", "application/json", bytes.NewBufferString(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+		if err != nil {
+			t.Fatalf("%s POST /mcp: %v", name, err)
+		}
+		defer mcpResp.Body.Close()
+		raw, _ := io.ReadAll(mcpResp.Body)
+		if mcpResp.StatusCode != http.StatusOK {
+			t.Fatalf("%s /mcp status=%d body=%s", name, mcpResp.StatusCode, string(raw))
+		}
+		var mcpOut struct {
+			Result struct {
+				Tools []map[string]any `json:"tools"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(raw, &mcpOut); err != nil || len(mcpOut.Result.Tools) < minTools {
+			t.Fatalf("%s expected >=%d MCP tools, got %d (err=%v)", name, minTools, len(mcpOut.Result.Tools), err)
+		}
+	}
+
+	checkSurface("bootstrap", community.BootstrapNodes[0].URL(), []string{
+		"/v1/health", "/v1/peers/register", "/v1/peers", "/v1/models", "/v1/governance/vote",
+	}, 7)
+	checkSurface("provider", prov.URL(), []string{"/v1/health", "/v1/infer"}, 2)
+	checkSurface("scheduler", community.Scheduler.URL(), []string{"/v1/health", "/v1/schedule"}, 2)
+	checkSurface("facilitator", community.Facilitator.URL(), []string{
+		"/v1/health", "/v1/payments/mint", "/v1/payments/settle", "/v1/payments/ledger",
+	}, 5)
+	checkSurface("vault", community.Vault.URL(), []string{
+		"/v1/health", "/v1/vault/snapshots", "/v1/vault/export",
+	}, 4)
+}
+
+func TestGovernanceVoteRejectsConflictingProposalContents(t *testing.T) {
+	domain := DefaultDomain()
+	boot := NewBootstrapServer("gov-conflict-boot", PlaneCommunity, domain, 2)
+	defer boot.Close()
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	voter1, _ := GenerateKeyPair()
+	voter2, _ := GenerateKeyPair()
+
+	v1 := GovernanceVote{
+		ProposalID: "prop-conflict-1",
+		Action:     "add_bootstrap_peer",
+		Payload:    "peer-good.mesh.local",
+		Approve:    true,
+		VotedAt:    time.Now().UTC().Unix(),
+	}
+	if err := SignGovernanceVote(domain, voter1, &v1); err != nil {
+		t.Fatal(err)
+	}
+	var dec GovernanceDecision
+	if status, err := doJSONRequest(client, http.MethodPost, boot.URL()+"/v1/governance/vote", v1, &dec); err != nil || status != http.StatusOK {
+		t.Fatalf("vote 1 failed: status=%d err=%v", status, err)
+	}
+	if dec.Ratified || dec.Approvals != 1 {
+		t.Fatalf("unexpected state after vote 1: %+v", dec)
+	}
+
+	// Voter 2 signs a DIFFERENT Action/Payload under the same ProposalID.
+	v2 := GovernanceVote{
+		ProposalID: "prop-conflict-1",
+		Action:     "remove_bootstrap_peer",
+		Payload:    "peer-evil.mesh.local",
+		Approve:    true,
+		VotedAt:    time.Now().UTC().Unix(),
+	}
+	if err := SignGovernanceVote(domain, voter2, &v2); err != nil {
+		t.Fatal(err)
+	}
+	status, err := doJSONRequest(client, http.MethodPost, boot.URL()+"/v1/governance/vote", v2, nil)
+	if err == nil || status != http.StatusConflict {
+		t.Fatalf("expected HTTP 409 rejecting conflicting proposal vote, got status=%d err=%v", status, err)
+	}
+
+	// Proposal must NOT be ratified with conflicting votes.
+	var stored GovernanceDecision
+	if _, err := doJSONRequest(client, http.MethodGet, boot.URL()+"/v1/governance/prop-conflict-1", nil, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Ratified || stored.Approvals != 1 || len(stored.Votes) != 1 {
+		t.Fatalf("conflicting vote corrupted governance decision: %+v", stored)
+	}
+}
+
+func TestVerifyForkBundleOfflineAuthenticatesVaultEnvelopes(t *testing.T) {
+	domain := DefaultDomain()
+	_, fork, err := RunNetworkExitDrill(domain)
+	if err != nil {
+		t.Fatalf("RunNetworkExitDrill: %v", err)
+	}
+	if len(fork.EncryptedVault) == 0 {
+		t.Fatalf("expected non-empty EncryptedVault in fork bundle")
+	}
+
+	// Exporting operator tampers with a user's vault ciphertext and re-signs the outer bundle.
+	rogueOpKP, _ := GenerateKeyPair()
+	forged := *fork
+	forged.EncryptedVault = append([]EncryptedDataEnvelope(nil), fork.EncryptedVault...)
+	ctBytes, err := hex.DecodeString(forged.EncryptedVault[0].CiphertextHex)
+	if err != nil || len(ctBytes) == 0 {
+		t.Fatal(err)
+	}
+	ctBytes[0] ^= 0x01
+	forged.EncryptedVault[0].CiphertextHex = hex.EncodeToString(ctBytes)
+	if err := SignForkBundle(domain, rogueOpKP, &forged); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := VerifyForkBundleOffline(domain, forged); !errors.Is(err, ErrForkBundleCorrupted) {
+		t.Fatalf("expected VerifyForkBundleOffline to reject operator-tampered vault envelope, got %v", err)
+	}
+}
+

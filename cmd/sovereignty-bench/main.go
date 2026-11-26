@@ -7,6 +7,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -18,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/hanzoai/cloud/apps/sovereignty"
@@ -37,6 +39,7 @@ type LatencyStats struct {
 
 type CostBreakdown struct {
 	TokensPerJob                 int     `json:"tokensPerJob"`
+	MeasuredTokensPerJob         int     `json:"measuredTokensPerJob"`
 	ETHPriceUSD                  float64 `json:"ethPriceUsd"`
 	L1DirectUSDPer1MTokens       float64 `json:"l1DirectUsdPer1MTokens"`
 	L1DirectUSDPerJob            float64 `json:"l1DirectUsdPerJob"`
@@ -80,6 +83,7 @@ type PerformanceSection struct {
 	CommunityPaymentSettle LatencyStats `json:"communityPaymentSettle"`
 	SovereignDataRecovery  LatencyStats `json:"sovereignDataRecovery"`
 	FullPostBlackoutE2E    LatencyStats `json:"fullPostBlackoutE2e"`
+	MeasuredTokensPerJob   int          `json:"measuredTokensPerJob"`
 	TokensPerSec           float64      `json:"tokensPerSec"`
 	CompletionRate         float64      `json:"completionRate"`
 	HanzoCallsAfterKill    int64        `json:"hanzoCallsAfterKill"`
@@ -518,6 +522,7 @@ func measurePostBlackoutPerformance(domain sovereignty.EIP712Domain, iters int, 
 		CommunityPaymentSettle: computeStats(settleUs, sumUsDuration(settleUs)),
 		SovereignDataRecovery:  computeStats(recoverUs, sumUsDuration(recoverUs)),
 		FullPostBlackoutE2E:    computeStats(e2eUs, wallDur),
+		MeasuredTokensPerJob:   tokensPerIter,
 		TokensPerSec:           float64(totalTokens) / wallDur.Seconds(),
 		CompletionRate:         float64(completed) / float64(iters),
 		HanzoCallsAfterKill:    guard.Metrics().HanzoCallsAfterKill,
@@ -578,8 +583,8 @@ func measureTrustMatrix(domain sovereignty.EIP712Domain, validFork *sovereignty.
 		Detail: "tampered inference output rejected offline via deterministic SHA-256 recomputation",
 	})
 
-	// 3. Payment replay double-spend rejected with HTTP 409.
-	_ = postJSON(client, community.Facilitator.URL()+"/v1/payments/mint", map[string]any{"address": tenantKP.Address(), "amount": uint64(5000)}, nil)
+	// 3. Payment replay double-spend rejected with HTTP 409 after a verified initial settlement.
+	mintStatus, mintErr := postJSONStatus(client, community.Facilitator.URL()+"/v1/payments/mint", map[string]any{"address": tenantKP.Address(), "amount": uint64(5000)}, nil)
 	pay := sovereignty.PaymentAuthorization{
 		PaymentID:    "trust-pay-replay",
 		JobID:        req.JobID,
@@ -589,13 +594,20 @@ func measureTrustMatrix(domain sovereignty.EIP712Domain, validFork *sovereignty.
 		ValidBefore:  time.Now().UTC().Add(5 * time.Minute).Unix(),
 		ChainID:      domain.ChainID,
 	}
-	_ = sovereignty.SignPaymentAuthorization(domain, tenantKP, &pay)
-	_ = postJSON(client, community.Facilitator.URL()+"/v1/payments/settle", pay, nil)
-	replayErr := postJSON(client, community.Facilitator.URL()+"/v1/payments/settle", pay, nil)
+	signErr := sovereignty.SignPaymentAuthorization(domain, tenantKP, &pay)
+	var firstReceipt sovereignty.SettlementReceipt
+	firstStatus, firstErr := postJSONStatus(client, community.Facilitator.URL()+"/v1/payments/settle", pay, &firstReceipt)
+	replayStatus, replayErr := postJSONStatus(client, community.Facilitator.URL()+"/v1/payments/settle", pay, nil)
+	replayPass := mintErr == nil && mintStatus == http.StatusOK &&
+		signErr == nil &&
+		firstErr == nil && firstStatus == http.StatusOK &&
+		firstReceipt.PaymentID == pay.PaymentID &&
+		replayErr != nil && replayStatus == http.StatusConflict &&
+		strings.Contains(replayErr.Error(), sovereignty.ErrReplayDetected.Error())
 	checks = append(checks, TrustCheck{
 		Name:   "payment_replay_double_spend_rejected",
-		Passed: replayErr != nil,
-		Detail: "duplicate EIP-712 PaymentID rejected with HTTP 409 ErrReplayDetected",
+		Passed: replayPass,
+		Detail: "initial settlement succeeded (HTTP 200) and duplicate EIP-712 PaymentID rejected with HTTP 409 ErrReplayDetected",
 	})
 
 	// 4. Unauthorized third-party key rejected.
@@ -609,13 +621,14 @@ func measureTrustMatrix(domain sovereignty.EIP712Domain, validFork *sovereignty.
 		Detail: "non-owner 32-byte key rejected by AES-256-GCM authentication",
 	})
 
-	// 5. Tampered encrypted vault ciphertext rejected.
+	// 5. Tampered encrypted vault ciphertext rejected (guaranteed bit-flip).
 	tamperedEnv := env
-	tamperedEnv.CiphertextHex = "ff" + env.CiphertextHex[2:]
+	flippedHex, flipErr := flipFirstHexByteBit(env.CiphertextHex)
+	tamperedEnv.CiphertextHex = flippedHex
 	_, err5 := sovereignty.DecryptUserData(domain, realKey, tamperedEnv)
 	checks = append(checks, TrustCheck{
 		Name:   "tampered_encrypted_vault_ciphertext_rejected",
-		Passed: errors.Is(err5, sovereignty.ErrUnauthorizedDataAccess),
+		Passed: flipErr == nil && errors.Is(err5, sovereignty.ErrUnauthorizedDataAccess),
 		Detail: "ciphertext bit-flip rejected before plaintext release",
 	})
 
@@ -653,30 +666,38 @@ func measureTrustMatrix(domain sovereignty.EIP712Domain, validFork *sovereignty.
 
 func computeCostModel(perf PerformanceSection) CostBreakdown {
 	const (
-		tokensPerJob    = 10_000
-		jobsPer1MTokens = 100.0
-		ethPriceUSD     = 3000.0
-		l1Gwei          = 20.0
-		l2EffGwei       = 0.05
-		directSettleGas = 65_000.0
-		batchAnchorGas  = 90_000.0 // 100 off-chain settlements anchored per L2 batch
-		vcpuHourlyUSD   = 0.04
+		modeledTokensPerJob = 10_000
+		modeledJobsPer1M    = 100.0
+		ethPriceUSD         = 3000.0
+		l1Gwei              = 20.0
+		l2EffGwei           = 0.05
+		directSettleGas     = 65_000.0
+		batchAnchorGas      = 90_000.0 // 100 off-chain settlements anchored per L2 batch
+		vcpuHourlyUSD       = 0.04
 	)
+	measuredTokensPerJob := perf.MeasuredTokensPerJob
+	if measuredTokensPerJob <= 0 {
+		measuredTokensPerJob = 128
+	}
+	measuredJobsPer1M := 1_000_000.0 / float64(measuredTokensPerJob)
+
 	l1PerJob := directSettleGas * l1Gwei * 1e-9 * ethPriceUSD
 	l2PerJob := directSettleGas * l2EffGwei * 1e-9 * ethPriceUSD
 	batchedL2Per1M := batchAnchorGas * l2EffGwei * 1e-9 * ethPriceUSD
 
-	// Local verify + decrypt + discovery CPU seconds per 1M useful tokens (100 jobs).
+	// Normalize measured local CPU work using the actual measured token count per job,
+	// keeping the modeled 10,000-token L1/L2 gas scenario explicitly separate.
 	localUsPerJob := perf.OfflineReceiptVerify.MeanUs + perf.SovereignDataRecovery.MeanUs + perf.PeerAndModelDiscovery.MeanUs
-	localSecPer1M := (localUsPerJob * jobsPer1MTokens) / 1e6
+	localSecPer1M := (localUsPerJob * measuredJobsPer1M) / 1e6
 	localUSDPer1M := (localSecPer1M / 3600.0) * vcpuHourlyUSD
 
 	return CostBreakdown{
-		TokensPerJob:                 tokensPerJob,
+		TokensPerJob:                 modeledTokensPerJob,
+		MeasuredTokensPerJob:         measuredTokensPerJob,
 		ETHPriceUSD:                  ethPriceUSD,
-		L1DirectUSDPer1MTokens:       round6(l1PerJob * jobsPer1MTokens),
+		L1DirectUSDPer1MTokens:       round6(l1PerJob * modeledJobsPer1M),
 		L1DirectUSDPerJob:            round6(l1PerJob),
-		L2DirectUSDPer1MTokens:       round6(l2PerJob * jobsPer1MTokens),
+		L2DirectUSDPer1MTokens:       round6(l2PerJob * modeledJobsPer1M),
 		L2DirectUSDPerJob:            round6(l2PerJob),
 		CommunityBatchedL2USDPer1M:   round6(batchedL2Per1M),
 		LocalVerifyAndDecryptUSD1M:   round6(localUSDPer1M),
@@ -733,27 +754,46 @@ func sumUsDuration(samplesUs []float64) time.Duration {
 	return time.Duration(sum * float64(time.Microsecond))
 }
 
-func postJSON(client *http.Client, url string, in any, out any) error {
+func postJSONStatus(client *http.Client, url string, in any, out any) (int, error) {
 	raw, err := json.Marshal(in)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	resp, err := client.Post(url, "application/json", bytes.NewReader(raw))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return resp.StatusCode, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("POST %s HTTP %d: %s", url, resp.StatusCode, string(body))
+		return resp.StatusCode, fmt.Errorf("POST %s HTTP %d: %s", url, resp.StatusCode, string(body))
 	}
 	if out != nil && len(body) > 0 {
-		return json.Unmarshal(body, out)
+		if err := json.Unmarshal(body, out); err != nil {
+			return resp.StatusCode, err
+		}
 	}
-	return nil
+	return resp.StatusCode, nil
+}
+
+func postJSON(client *http.Client, url string, in any, out any) error {
+	_, err := postJSONStatus(client, url, in, out)
+	return err
+}
+
+func flipFirstHexByteBit(hexStr string) (string, error) {
+	raw, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return "", err
+	}
+	if len(raw) == 0 {
+		return "", errors.New("empty ciphertext")
+	}
+	raw[0] ^= 0x01
+	return hex.EncodeToString(raw), nil
 }
 
 func getJSON(client *http.Client, url string, out any) error {

@@ -165,7 +165,7 @@ func RunNetworkExitDrill(domain EIP712Domain) (*NetworkExitReport, *NetworkForkB
 			return nil, nil, fmt.Errorf("stage 1 hanzo register providerA: %w", err)
 		}
 		// Fund tenant on both Hanzo facilitator and independent Community facilitator.
-		mintPayload := mintReq{Address: tenantKP.Address(), Amount: 10_000_000}
+		mintPayload := MintRequest{Address: tenantKP.Address(), Amount: 10_000_000}
 		if _, err := doJSONRequest(client, http.MethodPost, hanzoPlane.Facilitator.URL()+"/v1/payments/mint", mintPayload, nil); err != nil {
 			return nil, nil, fmt.Errorf("stage 1 hanzo mint: %w", err)
 		}
@@ -480,23 +480,62 @@ func RunNetworkExitDrill(domain EIP712Domain) (*NetworkExitReport, *NetworkForkB
 	hydrateErr := operatorC.HydrateFromFork(forkBundle)
 	var forkVaultEnv EncryptedDataEnvelope
 	var forkDecryptMatch bool
+	var forkModelOK bool
+	var forkWorkloadOK bool
 	if hydrateErr == nil {
 		if _, getErr := doJSONRequest(client, http.MethodGet, operatorC.Vault.URL()+"/v1/vault/snapshots/"+snapshotID, nil, &forkVaultEnv); getErr == nil {
 			if dec, dErr := DecryptUserData(domain, userDataKey, forkVaultEnv); dErr == nil {
 				forkDecryptMatch = bytes.Equal(dec, workspacePlaintext)
 			}
 		}
+		// Verify model artifact survives fork migration on Operator C's mirror
+		// and serves a real end-to-end inference workload with offline verification.
+		if forkManifest, mErr := DiscoverModelManifest(client, domain, operatorC.BootstrapURLs(), modelID); mErr == nil {
+			if forkBlob, bErr := DownloadAndVerifyModelBlob(client, operatorC.Mirror.URL(), forkManifest.DigestSHA256); bErr == nil && bytes.Equal(forkBlob, verifiedModelBlob) {
+				forkModelOK = true
+				if provCKP, kErr := GenerateKeyPair(); kErr == nil {
+					providerC := NewProviderNodeServer("provider-op-c-fork", provCKP, domain, client)
+					defer providerC.Close()
+					if fErr := providerC.FetchAndVerifyModel(operatorC.Mirror.URL(), forkManifest.DigestSHA256); fErr == nil {
+						if adC, aErr := providerC.BuildSignedAdvertisement([]string{modelID}, 450, 1000, time.Now().UTC()); aErr == nil {
+							if _, rErr := doJSONRequest(client, http.MethodPost, operatorC.BootstrapNodes[0].URL()+"/v1/peers/register", adC, nil); rErr == nil {
+								forkReq := InferenceRequest{
+									JobID:             "job-sovereign-fork-op-c-001",
+									TenantAddress:     tenantKP.Address(),
+									ModelID:           modelID,
+									ModelDigestSHA256: forkManifest.DigestSHA256,
+									Prompt:            "Verify post-fork model artifact and inference execution on Operator C",
+									Seed:              20261352,
+									MaxTokens:         64,
+									Nonce:             3,
+									Timestamp:         time.Now().UTC().Unix(),
+								}
+								var forkReceipt InferenceExecutionReceipt
+								if _, sErr := doJSONRequest(client, http.MethodPost, operatorC.Scheduler.URL()+"/v1/schedule", scheduleDispatchRequest{
+									Request:           forkReq,
+									PreferredProvider: providerC.ProviderID,
+								}, &forkReceipt); sErr == nil {
+									if vErr := VerifyExecutionReceiptOffline(domain, forkReq, forkBlob, forkReceipt); vErr == nil {
+										forkWorkloadOK = forkReceipt.ProviderID == providerC.ProviderID && forkReceipt.TokensGenerated == forkReq.MaxTokens
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 	forkPeers, _ := DiscoverPeersFromBootstraps(client, domain, operatorC.BootstrapURLs(), modelID)
-	report.ForkBundleVerified = forkVerifyErr == nil && hydrateErr == nil && forkDecryptMatch
+	report.ForkBundleVerified = forkVerifyErr == nil && hydrateErr == nil && forkDecryptMatch && forkModelOK && forkWorkloadOK
 	report.ForkBundleBytes = len(forkRaw)
 	report.ForkHydratedProviders = len(forkPeers)
 	report.ForkHydratedVaultItems = len(operatorC.Vault.SnapshotState())
 
 	s8Pass := authorizedMatch && unauthBlocked && govDec.Ratified && report.ForkBundleVerified
 	recordPostKillStage(8, "authorized_data_recovery_and_fork_migration", s8Start, s8Hanzo, s8Pass,
-		fmt.Sprintf("decrypted %dB workspace, rejected unauthorized key, ratified governance (%d/%d), forked to Operator C (%dB bundle)",
-			len(recoveredBytes), govDec.Approvals, govDec.QuorumRequired, len(forkRaw)))
+		fmt.Sprintf("decrypted %dB workspace, rejected unauthorized key, ratified governance (%d/%d), forked to Operator C (%dB bundle, mirror+workload verified=%v)",
+			len(recoveredBytes), govDec.Approvals, govDec.QuorumRequired, len(forkRaw), forkModelOK && forkWorkloadOK))
 
 	// Finalize report metrics.
 	report.GuardMetrics = guard.Metrics()

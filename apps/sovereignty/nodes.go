@@ -4,6 +4,7 @@ package sovereignty
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,18 +15,19 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/zap-proto/zip"
 )
 
 // --- Shared HTTP JSON Helpers ---
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
-}
-
-func writeErrJSON(w http.ResponseWriter, status int, err error) {
-	writeJSON(w, status, map[string]string{"error": err.Error()})
+func startZipTestServer(app *zip.App, err error) *httptest.Server {
+	if err != nil {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}))
+	}
+	return httptest.NewServer(zipHTTPHandler(app))
 }
 
 func doJSONRequest(client *http.Client, method, url string, in any, out any) (int, error) {
@@ -55,10 +57,16 @@ func doJSONRequest(client *http.Client, method, url string, in any, out any) (in
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var errPayload struct {
-			Error string `json:"error"`
+			Error   string `json:"error"`
+			Message string `json:"message"`
 		}
-		if json.Unmarshal(respBytes, &errPayload) == nil && errPayload.Error != "" {
-			return resp.StatusCode, fmt.Errorf("HTTP %d: %s", resp.StatusCode, errPayload.Error)
+		if json.Unmarshal(respBytes, &errPayload) == nil {
+			if errPayload.Error != "" {
+				return resp.StatusCode, fmt.Errorf("HTTP %d: %s", resp.StatusCode, errPayload.Error)
+			}
+			if errPayload.Message != "" {
+				return resp.StatusCode, fmt.Errorf("HTTP %d: %s", resp.StatusCode, errPayload.Message)
+			}
 		}
 		return resp.StatusCode, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBytes)))
 	}
@@ -70,10 +78,100 @@ func doJSONRequest(client *http.Client, method, url string, in any, out any) (in
 	return resp.StatusCode, nil
 }
 
+// --- Typed Control-Plane API Request/Response Models ---
+
+// NodeHealthOut is the typed health response for sovereignty infrastructure nodes.
+type NodeHealthOut struct {
+	ID      string           `json:"id"`
+	Plane   ControlPlaneKind `json:"plane"`
+	Status  string           `json:"status"`
+	Version string           `json:"version,omitempty"`
+}
+
+// ListPeersIn carries optional query filters for GET /v1/peers.
+type ListPeersIn struct {
+	Model string `json:"model,omitempty"`
+}
+
+// ListPeersOut is the typed response for GET /v1/peers.
+type ListPeersOut struct {
+	Providers []ProviderAdvertisement `json:"providers"`
+}
+
+// ListModelsOut is the typed response for GET /v1/models.
+type ListModelsOut struct {
+	Models []ModelManifest `json:"models"`
+}
+
+// IDParamIn binds a path `:id` parameter.
+type IDParamIn struct {
+	ID string `json:"id"`
+}
+
+// ProviderHealthOut is the typed health response for ProviderNodeServer.
+type ProviderHealthOut struct {
+	ProviderID string `json:"providerId"`
+	Address    string `json:"address"`
+	Status     string `json:"status"`
+}
+
+// FacilitatorHealthOut is the typed health response for FacilitatorServer.
+type FacilitatorHealthOut struct {
+	ID      string           `json:"id"`
+	Plane   ControlPlaneKind `json:"plane"`
+	Address string           `json:"address"`
+	Status  string           `json:"status"`
+}
+
+// MintRequest is the typed request for POST /v1/payments/mint.
+type MintRequest struct {
+	Address string `json:"address"`
+	Amount  uint64 `json:"amount"`
+}
+
+// AddressParamIn binds a path `:address` parameter.
+type AddressParamIn struct {
+	Address string `json:"address"`
+}
+
+// BalanceOut is the typed response for mint and balance queries.
+type BalanceOut struct {
+	Address string `json:"address"`
+	Balance uint64 `json:"balance"`
+}
+
+// LedgerOut is the typed response for GET /v1/payments/ledger.
+type LedgerOut struct {
+	Entries           []SettlementReceipt `json:"entries"`
+	ConservationDrift int64               `json:"conservationDrift"`
+}
+
+// StoreSnapshotOut is the typed response for POST /v1/vault/snapshots.
+type StoreSnapshotOut struct {
+	SnapshotID string `json:"snapshotId"`
+	Stored     bool   `json:"stored"`
+}
+
+// VaultExportOut is the typed response for GET /v1/vault/export.
+type VaultExportOut struct {
+	Envelopes []EncryptedDataEnvelope `json:"envelopes"`
+}
+
+// HanzoGatewayHealthOut is the typed response for the Hanzo convenience gateway health endpoint.
+type HanzoGatewayHealthOut struct {
+	Service     string           `json:"service"`
+	Plane       ControlPlaneKind `json:"plane"`
+	Registry    string           `json:"registry"`
+	Mirror      string           `json:"mirror"`
+	Scheduler   string           `json:"scheduler"`
+	Facilitator string           `json:"facilitator"`
+	Vault       string           `json:"vault"`
+}
+
 // --- Core Stateful Services Exposed Over Real HTTP Servers ---
 
 // BootstrapServer is a decentralized peer discovery, model manifest, and
-// community governance node serving real HTTP over loopback.
+// community governance node serving real HTTP over loopback via typed zip operations.
 type BootstrapServer struct {
 	ID         string
 	Plane      ControlPlaneKind
@@ -101,15 +199,8 @@ func NewBootstrapServer(id string, plane ControlPlaneKind, domain EIP712Domain, 
 		governance: make(map[string]*GovernanceDecision),
 		quorum:     governanceQuorum,
 	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/health", b.handleHealth)
-	mux.HandleFunc("/v1/peers/register", b.handleRegisterPeer)
-	mux.HandleFunc("/v1/peers", b.handleListPeers)
-	mux.HandleFunc("/v1/models", b.handleModels)
-	mux.HandleFunc("/v1/models/", b.handleGetModel)
-	mux.HandleFunc("/v1/governance/vote", b.handleGovernanceVote)
-	mux.HandleFunc("/v1/governance/", b.handleGetGovernance)
-	b.Server = httptest.NewServer(mux)
+	app, err := NewBootstrapApp(b, nil)
+	b.Server = startZipTestServer(app, err)
 	return b
 }
 
@@ -122,41 +213,37 @@ func (b *BootstrapServer) Close() {
 	b.Server.Close()
 }
 
-func (b *BootstrapServer) handleHealth(w http.ResponseWriter, r *http.Request) {
+func (b *BootstrapServer) opHealth(_ context.Context, _ *emptyIn) (*NodeHealthOut, error) {
 	if b.offline.Load() {
-		writeErrJSON(w, http.StatusServiceUnavailable, ErrHanzoPlaneOffline)
-		return
+		return nil, zip.Errorf(http.StatusServiceUnavailable, "%s", ErrHanzoPlaneOffline.Error())
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"id":      b.ID,
-		"plane":   b.Plane,
-		"status":  "ok",
-		"version": ProtocolVersion,
-	})
+	return &NodeHealthOut{
+		ID:      b.ID,
+		Plane:   b.Plane,
+		Status:  "ok",
+		Version: ProtocolVersion,
+	}, nil
 }
 
-func (b *BootstrapServer) handleRegisterPeer(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeErrJSON(w, http.StatusMethodNotAllowed, ErrInvalidRequest)
-		return
+func (b *BootstrapServer) opRegisterPeer(_ context.Context, ad *ProviderAdvertisement) (*ProviderAdvertisement, error) {
+	if ad == nil {
+		return nil, zip.Errorf(http.StatusBadRequest, "%s", ErrInvalidRequest.Error())
 	}
-	var ad ProviderAdvertisement
-	if err := json.NewDecoder(r.Body).Decode(&ad); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := VerifyProviderAdvertisement(b.Domain, ad); err != nil {
-		writeErrJSON(w, http.StatusUnauthorized, err)
-		return
+	if err := VerifyProviderAdvertisement(b.Domain, *ad); err != nil {
+		return nil, zip.Errorf(http.StatusUnauthorized, "%s", err.Error())
 	}
 	b.mu.Lock()
-	b.providers[ad.ProviderID] = ad
+	b.providers[ad.ProviderID] = *ad
 	b.mu.Unlock()
-	writeJSON(w, http.StatusOK, ad)
+	cp := *ad
+	return &cp, nil
 }
 
-func (b *BootstrapServer) handleListPeers(w http.ResponseWriter, r *http.Request) {
-	modelFilter := strings.TrimSpace(r.URL.Query().Get("model"))
+func (b *BootstrapServer) opListPeers(_ context.Context, in *ListPeersIn) (*ListPeersOut, error) {
+	modelFilter := ""
+	if in != nil {
+		modelFilter = strings.TrimSpace(in.Model)
+	}
 	b.mu.RLock()
 	out := make([]ProviderAdvertisement, 0, len(b.providers))
 	for _, ad := range b.providers {
@@ -166,64 +253,54 @@ func (b *BootstrapServer) handleListPeers(w http.ResponseWriter, r *http.Request
 	}
 	b.mu.RUnlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].ProviderID < out[j].ProviderID })
-	writeJSON(w, http.StatusOK, map[string]any{"providers": out})
+	return &ListPeersOut{Providers: out}, nil
 }
 
-func (b *BootstrapServer) handleModels(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodPost:
-		var m ModelManifest
-		if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err)
-			return
-		}
-		if err := VerifyModelManifest(b.Domain, m); err != nil {
-			writeErrJSON(w, http.StatusUnauthorized, err)
-			return
-		}
-		b.mu.Lock()
-		b.models[m.ModelID] = m
-		b.mu.Unlock()
-		writeJSON(w, http.StatusOK, m)
-	case http.MethodGet:
-		b.mu.RLock()
-		list := make([]ModelManifest, 0, len(b.models))
-		for _, m := range b.models {
-			list = append(list, m)
-		}
-		b.mu.RUnlock()
-		sort.Slice(list, func(i, j int) bool { return list[i].ModelID < list[j].ModelID })
-		writeJSON(w, http.StatusOK, map[string]any{"models": list})
-	default:
-		writeErrJSON(w, http.StatusMethodNotAllowed, ErrInvalidRequest)
+func (b *BootstrapServer) opRegisterModel(_ context.Context, m *ModelManifest) (*ModelManifest, error) {
+	if m == nil {
+		return nil, zip.Errorf(http.StatusBadRequest, "%s", ErrInvalidRequest.Error())
 	}
+	if err := VerifyModelManifest(b.Domain, *m); err != nil {
+		return nil, zip.Errorf(http.StatusUnauthorized, "%s", err.Error())
+	}
+	b.mu.Lock()
+	b.models[m.ModelID] = *m
+	b.mu.Unlock()
+	cp := *m
+	return &cp, nil
 }
 
-func (b *BootstrapServer) handleGetModel(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/v1/models/")
+func (b *BootstrapServer) opListModels(_ context.Context, _ *emptyIn) (*ListModelsOut, error) {
+	b.mu.RLock()
+	list := make([]ModelManifest, 0, len(b.models))
+	for _, m := range b.models {
+		list = append(list, m)
+	}
+	b.mu.RUnlock()
+	sort.Slice(list, func(i, j int) bool { return list[i].ModelID < list[j].ModelID })
+	return &ListModelsOut{Models: list}, nil
+}
+
+func (b *BootstrapServer) opGetModel(_ context.Context, in *IDParamIn) (*ModelManifest, error) {
+	id := ""
+	if in != nil {
+		id = strings.TrimSpace(in.ID)
+	}
 	b.mu.RLock()
 	m, ok := b.models[id]
 	b.mu.RUnlock()
 	if !ok {
-		writeErrJSON(w, http.StatusNotFound, ErrNotFound)
-		return
+		return nil, zip.Errorf(http.StatusNotFound, "%s", ErrNotFound.Error())
 	}
-	writeJSON(w, http.StatusOK, m)
+	return &m, nil
 }
 
-func (b *BootstrapServer) handleGovernanceVote(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeErrJSON(w, http.StatusMethodNotAllowed, ErrInvalidRequest)
-		return
+func (b *BootstrapServer) opGovernanceVote(_ context.Context, vote *GovernanceVote) (*GovernanceDecision, error) {
+	if vote == nil {
+		return nil, zip.Errorf(http.StatusBadRequest, "%s", ErrInvalidRequest.Error())
 	}
-	var vote GovernanceVote
-	if err := json.NewDecoder(r.Body).Decode(&vote); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := VerifyGovernanceVote(b.Domain, vote); err != nil {
-		writeErrJSON(w, http.StatusUnauthorized, err)
-		return
+	if err := VerifyGovernanceVote(b.Domain, *vote); err != nil {
+		return nil, zip.Errorf(http.StatusUnauthorized, "%s", err.Error())
 	}
 	b.mu.Lock()
 	dec, ok := b.governance[vote.ProposalID]
@@ -235,6 +312,9 @@ func (b *BootstrapServer) handleGovernanceVote(w http.ResponseWriter, r *http.Re
 			QuorumRequired: b.quorum,
 		}
 		b.governance[vote.ProposalID] = dec
+	} else if dec.Action != vote.Action || dec.Payload != vote.Payload {
+		b.mu.Unlock()
+		return nil, zip.Errorf(http.StatusConflict, "%s: vote action/payload conflicts with stored proposal %s", ErrInvalidRequest, vote.ProposalID)
 	}
 	duplicate := false
 	for _, existing := range dec.Votes {
@@ -244,7 +324,7 @@ func (b *BootstrapServer) handleGovernanceVote(w http.ResponseWriter, r *http.Re
 		}
 	}
 	if !duplicate {
-		dec.Votes = append(dec.Votes, vote)
+		dec.Votes = append(dec.Votes, *vote)
 		if vote.Approve {
 			dec.Approvals++
 		}
@@ -253,22 +333,24 @@ func (b *BootstrapServer) handleGovernanceVote(w http.ResponseWriter, r *http.Re
 	snapshot := *dec
 	snapshot.Votes = append([]GovernanceVote(nil), dec.Votes...)
 	b.mu.Unlock()
-	writeJSON(w, http.StatusOK, snapshot)
+	return &snapshot, nil
 }
 
-func (b *BootstrapServer) handleGetGovernance(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/v1/governance/")
+func (b *BootstrapServer) opGetGovernance(_ context.Context, in *IDParamIn) (*GovernanceDecision, error) {
+	id := ""
+	if in != nil {
+		id = strings.TrimSpace(in.ID)
+	}
 	b.mu.RLock()
 	dec, ok := b.governance[id]
 	if !ok {
 		b.mu.RUnlock()
-		writeErrJSON(w, http.StatusNotFound, ErrNotFound)
-		return
+		return nil, zip.Errorf(http.StatusNotFound, "%s", ErrNotFound.Error())
 	}
 	snapshot := *dec
 	snapshot.Votes = append([]GovernanceVote(nil), dec.Votes...)
 	b.mu.RUnlock()
-	writeJSON(w, http.StatusOK, snapshot)
+	return &snapshot, nil
 }
 
 // SnapshotState exports all signed providers, manifests, and governance decisions.
@@ -334,12 +416,8 @@ func NewArtifactMirrorServer(id string, plane ControlPlaneKind) *ArtifactMirrorS
 		blobs:         make(map[string][]byte),
 		tamperDigests: make(map[string]bool),
 	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"id": a.ID, "plane": a.Plane, "status": "ok"})
-	})
-	mux.HandleFunc("/v1/blobs/", a.handleBlob)
-	a.Server = httptest.NewServer(mux)
+	app, err := NewMirrorApp(a, nil)
+	a.Server = startZipTestServer(app, err)
 	return a
 }
 
@@ -357,43 +435,69 @@ func (a *ArtifactMirrorServer) InjectTamperedBlob(digest string, enable bool) {
 	a.mu.Unlock()
 }
 
-func (a *ArtifactMirrorServer) handleBlob(w http.ResponseWriter, r *http.Request) {
-	digest := strings.ToLower(strings.TrimPrefix(r.URL.Path, "/v1/blobs/"))
-	switch r.Method {
-	case http.MethodPut:
-		data, err := io.ReadAll(r.Body)
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err)
-			return
-		}
-		actual := SHA256Hex(data)
-		if !strings.EqualFold(actual, digest) {
-			writeErrJSON(w, http.StatusBadRequest, fmt.Errorf("%w: got %s want %s", ErrModelDigestMismatch, actual, digest))
-			return
-		}
-		a.mu.Lock()
-		a.blobs[digest] = append([]byte(nil), data...)
-		a.mu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]any{"digestSha256": digest, "sizeBytes": len(data)})
-	case http.MethodGet:
-		a.mu.RLock()
-		blob, ok := a.blobs[digest]
-		tamper := a.tamperDigests[digest]
-		a.mu.RUnlock()
-		if !ok {
-			writeErrJSON(w, http.StatusNotFound, ErrNotFound)
-			return
-		}
-		out := append([]byte(nil), blob...)
-		if tamper && len(out) > 0 {
-			out[0] ^= 0xff
-		}
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(out)
-	default:
-		writeErrJSON(w, http.StatusMethodNotAllowed, ErrInvalidRequest)
+// SnapshotBlobs returns a deep copy of all content-addressed model weight blobs
+// stored on this mirror so fork bundles remain self-contained after origin shutdown.
+func (a *ArtifactMirrorServer) SnapshotBlobs() map[string][]byte {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	out := make(map[string][]byte, len(a.blobs))
+	for k, v := range a.blobs {
+		out[k] = append([]byte(nil), v...)
 	}
+	return out
+}
+
+// HydrateBlobs verifies SHA-256 digests and installs model artifacts onto this mirror.
+func (a *ArtifactMirrorServer) HydrateBlobs(blobs map[string][]byte) error {
+	verified := make(map[string][]byte, len(blobs))
+	for digest, data := range blobs {
+		norm := strings.ToLower(strings.TrimSpace(digest))
+		actual := SHA256Hex(data)
+		if norm == "" || !strings.EqualFold(actual, norm) {
+			return fmt.Errorf("%w: hydrate blob %s got %s", ErrModelDigestMismatch, digest, actual)
+		}
+		verified[norm] = append([]byte(nil), data...)
+	}
+	a.mu.Lock()
+	for k, v := range verified {
+		a.blobs[k] = v
+	}
+	a.mu.Unlock()
+	return nil
+}
+
+func (a *ArtifactMirrorServer) opHealth(_ context.Context, _ *emptyIn) (*NodeHealthOut, error) {
+	return &NodeHealthOut{ID: a.ID, Plane: a.Plane, Status: "ok"}, nil
+}
+
+func (a *ArtifactMirrorServer) zipPutBlob(c *zip.Ctx) error {
+	digest := strings.ToLower(strings.TrimSpace(c.Param("digest")))
+	data := c.Body()
+	actual := SHA256Hex(data)
+	if !strings.EqualFold(actual, digest) {
+		return zip.Errorf(http.StatusBadRequest, "%s: got %s want %s", ErrModelDigestMismatch, actual, digest)
+	}
+	a.mu.Lock()
+	a.blobs[digest] = append([]byte(nil), data...)
+	a.mu.Unlock()
+	return c.JSON(http.StatusOK, map[string]any{"digestSha256": digest, "sizeBytes": len(data)})
+}
+
+func (a *ArtifactMirrorServer) zipGetBlob(c *zip.Ctx) error {
+	digest := strings.ToLower(strings.TrimSpace(c.Param("digest")))
+	a.mu.RLock()
+	blob, ok := a.blobs[digest]
+	tamper := a.tamperDigests[digest]
+	a.mu.RUnlock()
+	if !ok {
+		return zip.Errorf(http.StatusNotFound, "%s", ErrNotFound.Error())
+	}
+	out := append([]byte(nil), blob...)
+	if tamper && len(out) > 0 {
+		out[0] ^= 0xff
+	}
+	c.SetHeader("Content-Type", "application/octet-stream")
+	return c.Bytes(http.StatusOK, out)
 }
 
 // ProviderNodeServer is an independent compute worker node running its own HTTP
@@ -418,16 +522,8 @@ func NewProviderNodeServer(providerID string, kp *KeyPair, domain EIP712Domain, 
 		HTTPClient: client,
 		modelCache: make(map[string][]byte),
 	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"providerId": p.ProviderID,
-			"address":    p.KeyPair.Address(),
-			"status":     "ok",
-		})
-	})
-	mux.HandleFunc("/v1/infer", p.handleInfer)
-	p.Server = httptest.NewServer(mux)
+	app, err := NewProviderApp(p, nil)
+	p.Server = startZipTestServer(app, err)
 	return p
 }
 
@@ -475,23 +571,24 @@ func (p *ProviderNodeServer) BuildSignedAdvertisement(modelIDs []string, pricePe
 	return ad, nil
 }
 
-func (p *ProviderNodeServer) handleInfer(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeErrJSON(w, http.StatusMethodNotAllowed, ErrInvalidRequest)
-		return
-	}
-	var req InferenceRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err)
-		return
+func (p *ProviderNodeServer) opHealth(_ context.Context, _ *emptyIn) (*ProviderHealthOut, error) {
+	return &ProviderHealthOut{
+		ProviderID: p.ProviderID,
+		Address:    p.KeyPair.Address(),
+		Status:     "ok",
+	}, nil
+}
+
+func (p *ProviderNodeServer) opInfer(_ context.Context, req *InferenceRequest) (*InferenceExecutionReceipt, error) {
+	if req == nil {
+		return nil, zip.Errorf(http.StatusBadRequest, "%s", ErrInvalidRequest.Error())
 	}
 	p.mu.RLock()
 	blob, ok := p.modelCache[strings.ToLower(req.ModelDigestSHA256)]
 	tamper := p.tamperOutput
 	p.mu.RUnlock()
 	if !ok {
-		writeErrJSON(w, http.StatusNotFound, fmt.Errorf("%w: model %s not loaded on provider %s", ErrNotFound, req.ModelDigestSHA256, p.ProviderID))
-		return
+		return nil, zip.Errorf(http.StatusNotFound, "%s: model %s not loaded on provider %s", ErrNotFound, req.ModelDigestSHA256, p.ProviderID)
 	}
 	outText, outDigest, tokens := ExecuteDeterministicInference(blob, req.Prompt, req.Seed, req.MaxTokens)
 	if tamper {
@@ -504,7 +601,7 @@ func (p *ProviderNodeServer) handleInfer(w http.ResponseWriter, r *http.Request)
 		ProviderAddress:    p.KeyPair.Address(),
 		ModelID:            req.ModelID,
 		ModelDigestSHA256:  strings.ToLower(req.ModelDigestSHA256),
-		InputDigestSHA256:  ComputeRequestInputDigest(req),
+		InputDigestSHA256:  ComputeRequestInputDigest(*req),
 		OutputText:         outText,
 		OutputDigestSHA256: outDigest,
 		TokensGenerated:    tokens,
@@ -512,10 +609,9 @@ func (p *ProviderNodeServer) handleInfer(w http.ResponseWriter, r *http.Request)
 		VerificationClass:  VerificationClassDeterministicHash,
 	}
 	if err := SignExecutionReceipt(p.Domain, p.KeyPair, &receipt); err != nil {
-		writeErrJSON(w, http.StatusInternalServerError, err)
-		return
+		return nil, zip.Errorf(http.StatusInternalServerError, "%s", err.Error())
 	}
-	writeJSON(w, http.StatusOK, receipt)
+	return &receipt, nil
 }
 
 // SchedulerServer is a stateless HTTP job scheduler that discovers eligible
@@ -539,12 +635,8 @@ func NewSchedulerServer(id string, plane ControlPlaneKind, domain EIP712Domain, 
 		BootstrapURLs: append([]string(nil), bootstrapURLs...),
 		HTTPClient:    client,
 	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"id": s.ID, "plane": s.Plane, "status": "ok"})
-	})
-	mux.HandleFunc("/v1/schedule", s.handleSchedule)
-	s.Server = httptest.NewServer(mux)
+	app, err := NewSchedulerApp(s, nil)
+	s.Server = startZipTestServer(app, err)
 	return s
 }
 
@@ -559,24 +651,20 @@ type scheduleDispatchRequest struct {
 	PreferredProvider string           `json:"preferredProvider,omitempty"`
 }
 
-func (s *SchedulerServer) handleSchedule(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeErrJSON(w, http.StatusMethodNotAllowed, ErrInvalidRequest)
-		return
-	}
-	var in scheduleDispatchRequest
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err)
-		return
+func (s *SchedulerServer) opHealth(_ context.Context, _ *emptyIn) (*NodeHealthOut, error) {
+	return &NodeHealthOut{ID: s.ID, Plane: s.Plane, Status: "ok"}, nil
+}
+
+func (s *SchedulerServer) opSchedule(_ context.Context, in *scheduleDispatchRequest) (*InferenceExecutionReceipt, error) {
+	if in == nil {
+		return nil, zip.Errorf(http.StatusBadRequest, "%s", ErrInvalidRequest.Error())
 	}
 	providers, err := DiscoverPeersFromBootstraps(s.HTTPClient, s.Domain, s.BootstrapURLs, in.Request.ModelID)
 	if err != nil {
-		writeErrJSON(w, http.StatusServiceUnavailable, err)
-		return
+		return nil, zip.Errorf(http.StatusServiceUnavailable, "%s", err.Error())
 	}
 	if len(providers) == 0 {
-		writeErrJSON(w, http.StatusNotFound, fmt.Errorf("%w: no providers for model %s", ErrNotFound, in.Request.ModelID))
-		return
+		return nil, zip.Errorf(http.StatusNotFound, "%s: no providers for model %s", ErrNotFound, in.Request.ModelID)
 	}
 	var chosen ProviderAdvertisement
 	if in.PreferredProvider != "" {
@@ -589,8 +677,7 @@ func (s *SchedulerServer) handleSchedule(w http.ResponseWriter, r *http.Request)
 			}
 		}
 		if !found {
-			writeErrJSON(w, http.StatusNotFound, fmt.Errorf("%w: preferred provider %s not found", ErrNotFound, in.PreferredProvider))
-			return
+			return nil, zip.Errorf(http.StatusNotFound, "%s: preferred provider %s not found", ErrNotFound, in.PreferredProvider)
 		}
 	} else {
 		idx := s.rrCounter.Add(1) - 1
@@ -598,10 +685,9 @@ func (s *SchedulerServer) handleSchedule(w http.ResponseWriter, r *http.Request)
 	}
 	var receipt InferenceExecutionReceipt
 	if _, err := doJSONRequest(s.HTTPClient, http.MethodPost, chosen.EndpointURL+"/v1/infer", in.Request, &receipt); err != nil {
-		writeErrJSON(w, http.StatusBadGateway, err)
-		return
+		return nil, zip.Errorf(http.StatusBadGateway, "%s", err.Error())
 	}
-	writeJSON(w, http.StatusOK, receipt)
+	return &receipt, nil
 }
 
 // FacilitatorServer is an independent EIP-712 payment settlement facilitator
@@ -631,20 +717,8 @@ func NewFacilitatorServer(id string, plane ControlPlaneKind, kp *KeyPair, domain
 		seenPayments:  make(map[string]struct{}),
 		prevChainHash: "genesis",
 	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"id":      f.ID,
-			"plane":   f.Plane,
-			"address": f.KeyPair.Address(),
-			"status":  "ok",
-		})
-	})
-	mux.HandleFunc("/v1/payments/mint", f.handleMint)
-	mux.HandleFunc("/v1/payments/settle", f.handleSettle)
-	mux.HandleFunc("/v1/payments/balance/", f.handleBalance)
-	mux.HandleFunc("/v1/payments/ledger", f.handleLedger)
-	f.Server = httptest.NewServer(mux)
+	app, err := NewFacilitatorApp(f, nil)
+	f.Server = startZipTestServer(app, err)
 	return f
 }
 
@@ -654,72 +728,57 @@ func (f *FacilitatorServer) URL() string { return f.Server.URL }
 // Close shuts down the facilitator HTTP listener.
 func (f *FacilitatorServer) Close() { f.Server.Close() }
 
-type mintReq struct {
-	Address string `json:"address"`
-	Amount  uint64 `json:"amount"`
+func (f *FacilitatorServer) opHealth(_ context.Context, _ *emptyIn) (*FacilitatorHealthOut, error) {
+	return &FacilitatorHealthOut{
+		ID:      f.ID,
+		Plane:   f.Plane,
+		Address: f.KeyPair.Address(),
+		Status:  "ok",
+	}, nil
 }
 
-func (f *FacilitatorServer) handleMint(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeErrJSON(w, http.StatusMethodNotAllowed, ErrInvalidRequest)
-		return
-	}
-	var in mintReq
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err)
-		return
+func (f *FacilitatorServer) opMint(_ context.Context, in *MintRequest) (*BalanceOut, error) {
+	if in == nil {
+		return nil, zip.Errorf(http.StatusBadRequest, "%s", ErrInvalidRequest.Error())
 	}
 	norm, err := NormalizeAddress(in.Address)
 	if err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err)
-		return
+		return nil, zip.Errorf(http.StatusBadRequest, "%s", err.Error())
 	}
 	f.mu.Lock()
 	f.balances[norm] += in.Amount
 	f.mintedTotal += in.Amount
 	bal := f.balances[norm]
 	f.mu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{"address": norm, "balance": bal})
+	return &BalanceOut{Address: norm, Balance: bal}, nil
 }
 
-func (f *FacilitatorServer) handleSettle(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeErrJSON(w, http.StatusMethodNotAllowed, ErrInvalidRequest)
-		return
+func (f *FacilitatorServer) opSettle(_ context.Context, auth *PaymentAuthorization) (*SettlementReceipt, error) {
+	if auth == nil {
+		return nil, zip.Errorf(http.StatusBadRequest, "%s", ErrInvalidRequest.Error())
 	}
-	var auth PaymentAuthorization
-	if err := json.NewDecoder(r.Body).Decode(&auth); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := VerifyPaymentAuthorization(f.Domain, auth); err != nil {
-		writeErrJSON(w, http.StatusUnauthorized, err)
-		return
+	if err := VerifyPaymentAuthorization(f.Domain, *auth); err != nil {
+		return nil, zip.Errorf(http.StatusUnauthorized, "%s", err.Error())
 	}
 	if auth.ValidBefore > 0 && time.Now().UTC().Unix() > auth.ValidBefore {
-		writeErrJSON(w, http.StatusBadRequest, fmt.Errorf("%w: payment authorization expired", ErrInvalidRequest))
-		return
+		return nil, zip.Errorf(http.StatusBadRequest, "%s: payment authorization expired", ErrInvalidRequest)
 	}
 	payer, err := NormalizeAddress(auth.PayerAddress)
 	if err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err)
-		return
+		return nil, zip.Errorf(http.StatusBadRequest, "%s", err.Error())
 	}
 	payee, err := NormalizeAddress(auth.PayeeAddress)
 	if err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err)
-		return
+		return nil, zip.Errorf(http.StatusBadRequest, "%s", err.Error())
 	}
 	f.mu.Lock()
 	if _, exists := f.seenPayments[auth.PaymentID]; exists {
 		f.mu.Unlock()
-		writeErrJSON(w, http.StatusConflict, ErrReplayDetected)
-		return
+		return nil, zip.Errorf(http.StatusConflict, "%s", ErrReplayDetected.Error())
 	}
 	if f.balances[payer] < auth.AmountAtomic {
 		f.mu.Unlock()
-		writeErrJSON(w, http.StatusPaymentRequired, ErrInsufficientBalance)
-		return
+		return nil, zip.Errorf(http.StatusPaymentRequired, "%s", ErrInsufficientBalance.Error())
 	}
 	f.balances[payer] -= auth.AmountAtomic
 	f.balances[payee] += auth.AmountAtomic
@@ -753,37 +812,38 @@ func (f *FacilitatorServer) handleSettle(w http.ResponseWriter, r *http.Request)
 		f.balances[payer] += auth.AmountAtomic
 		delete(f.seenPayments, auth.PaymentID)
 		f.mu.Unlock()
-		writeErrJSON(w, http.StatusInternalServerError, err)
-		return
+		return nil, zip.Errorf(http.StatusInternalServerError, "%s", err.Error())
 	}
 	f.prevChainHash = ledgerHash
 	f.ledger = append(f.ledger, receipt)
 	f.mu.Unlock()
-	writeJSON(w, http.StatusOK, receipt)
+	return &receipt, nil
 }
 
-func (f *FacilitatorServer) handleBalance(w http.ResponseWriter, r *http.Request) {
-	addr := strings.TrimPrefix(r.URL.Path, "/v1/payments/balance/")
+func (f *FacilitatorServer) opBalance(_ context.Context, in *AddressParamIn) (*BalanceOut, error) {
+	addr := ""
+	if in != nil {
+		addr = strings.TrimSpace(in.Address)
+	}
 	norm, err := NormalizeAddress(addr)
 	if err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err)
-		return
+		return nil, zip.Errorf(http.StatusBadRequest, "%s", err.Error())
 	}
 	f.mu.RLock()
 	bal := f.balances[norm]
 	f.mu.RUnlock()
-	writeJSON(w, http.StatusOK, map[string]any{"address": norm, "balance": bal})
+	return &BalanceOut{Address: norm, Balance: bal}, nil
 }
 
-func (f *FacilitatorServer) handleLedger(w http.ResponseWriter, r *http.Request) {
+func (f *FacilitatorServer) opLedger(_ context.Context, _ *emptyIn) (*LedgerOut, error) {
 	f.mu.RLock()
 	out := append([]SettlementReceipt(nil), f.ledger...)
 	drift := f.conservationDriftLocked()
 	f.mu.RUnlock()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"entries":           out,
-		"conservationDrift": drift,
-	})
+	return &LedgerOut{
+		Entries:           out,
+		ConservationDrift: drift,
+	}, nil
 }
 
 func (f *FacilitatorServer) conservationDriftLocked() int64 {
@@ -851,14 +911,8 @@ func NewSovereignVaultServer(id string, plane ControlPlaneKind, domain EIP712Dom
 		Domain:    domain,
 		envelopes: make(map[string]EncryptedDataEnvelope),
 	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"id": v.ID, "plane": v.Plane, "status": "ok"})
-	})
-	mux.HandleFunc("/v1/vault/snapshots", v.handlePutSnapshot)
-	mux.HandleFunc("/v1/vault/snapshots/", v.handleGetSnapshot)
-	mux.HandleFunc("/v1/vault/export", v.handleExportAll)
-	v.Server = httptest.NewServer(mux)
+	app, err := NewVaultApp(v, nil)
+	v.Server = startZipTestServer(app, err)
 	return v
 }
 
@@ -868,50 +922,46 @@ func (v *SovereignVaultServer) URL() string { return v.Server.URL }
 // Close shuts down the vault HTTP listener.
 func (v *SovereignVaultServer) Close() { v.Server.Close() }
 
-func (v *SovereignVaultServer) handlePutSnapshot(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeErrJSON(w, http.StatusMethodNotAllowed, ErrInvalidRequest)
-		return
-	}
-	var env EncryptedDataEnvelope
-	if err := json.NewDecoder(r.Body).Decode(&env); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err)
-		return
-	}
-	if env.CapabilityManifest.CustodialEscrow {
-		writeErrJSON(w, http.StatusBadRequest, fmt.Errorf("%w: custodial escrow must be false", ErrInvalidRequest))
-		return
-	}
-	sh, err := envelopeStructHash(env)
-	if err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err)
-		return
-	}
-	signer, err := RecoverSignerAddress(v.Domain.TypedDataDigest(sh), env.OwnerSignature)
-	if err != nil || !SameAddress(signer, env.OwnerAddress) {
-		writeErrJSON(w, http.StatusUnauthorized, ErrInvalidSignature)
-		return
-	}
-	v.mu.Lock()
-	v.envelopes[env.SnapshotID] = env
-	v.mu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{"snapshotId": env.SnapshotID, "stored": true})
+func (v *SovereignVaultServer) opHealth(_ context.Context, _ *emptyIn) (*NodeHealthOut, error) {
+	return &NodeHealthOut{ID: v.ID, Plane: v.Plane, Status: "ok"}, nil
 }
 
-func (v *SovereignVaultServer) handleGetSnapshot(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/v1/vault/snapshots/")
+func (v *SovereignVaultServer) opPutSnapshot(_ context.Context, env *EncryptedDataEnvelope) (*StoreSnapshotOut, error) {
+	if env == nil {
+		return nil, zip.Errorf(http.StatusBadRequest, "%s", ErrInvalidRequest.Error())
+	}
+	if err := VerifyEncryptedEnvelope(v.Domain, *env); err != nil {
+		if err == ErrInvalidSignature {
+			return nil, zip.Errorf(http.StatusUnauthorized, "%s", err.Error())
+		}
+		return nil, zip.Errorf(http.StatusBadRequest, "%s", err.Error())
+	}
+	v.mu.Lock()
+	if existing, exists := v.envelopes[env.SnapshotID]; exists && !SameAddress(existing.OwnerAddress, env.OwnerAddress) {
+		v.mu.Unlock()
+		return nil, zip.Errorf(http.StatusForbidden, "%s: snapshot %s is owned by another principal", ErrUnauthorizedDataAccess, env.SnapshotID)
+	}
+	v.envelopes[env.SnapshotID] = *env
+	v.mu.Unlock()
+	return &StoreSnapshotOut{SnapshotID: env.SnapshotID, Stored: true}, nil
+}
+
+func (v *SovereignVaultServer) opGetSnapshot(_ context.Context, in *IDParamIn) (*EncryptedDataEnvelope, error) {
+	id := ""
+	if in != nil {
+		id = strings.TrimSpace(in.ID)
+	}
 	v.mu.RLock()
 	env, ok := v.envelopes[id]
 	v.mu.RUnlock()
 	if !ok {
-		writeErrJSON(w, http.StatusNotFound, ErrNotFound)
-		return
+		return nil, zip.Errorf(http.StatusNotFound, "%s", ErrNotFound.Error())
 	}
-	writeJSON(w, http.StatusOK, env)
+	return &env, nil
 }
 
-func (v *SovereignVaultServer) handleExportAll(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"envelopes": v.SnapshotState()})
+func (v *SovereignVaultServer) opExportAll(_ context.Context, _ *emptyIn) (*VaultExportOut, error) {
+	return &VaultExportOut{Envelopes: v.SnapshotState()}, nil
 }
 
 // SnapshotState exports all stored encrypted envelopes in deterministic order.
@@ -931,6 +981,9 @@ func (v *SovereignVaultServer) HydrateFromFork(envs []EncryptedDataEnvelope) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	for _, e := range envs {
+		if existing, exists := v.envelopes[e.SnapshotID]; exists && !SameAddress(existing.OwnerAddress, e.OwnerAddress) {
+			continue
+		}
 		v.envelopes[e.SnapshotID] = e
 	}
 }
@@ -947,6 +1000,21 @@ type HanzoControlPlane struct {
 	Facilitator *FacilitatorServer
 	Vault       *SovereignVaultServer
 	killed      atomic.Bool
+}
+
+func (hp *HanzoControlPlane) opGatewayHealth(_ context.Context, _ *emptyIn) (*HanzoGatewayHealthOut, error) {
+	if hp.killed.Load() {
+		return nil, zip.Errorf(http.StatusServiceUnavailable, "%s", ErrHanzoPlaneOffline.Error())
+	}
+	return &HanzoGatewayHealthOut{
+		Service:     "hanzo-gateway",
+		Plane:       PlaneHanzo,
+		Registry:    hp.Registry.URL(),
+		Mirror:      hp.Mirror.URL(),
+		Scheduler:   hp.Scheduler.URL(),
+		Facilitator: hp.Facilitator.URL(),
+		Vault:       hp.Vault.URL(),
+	}, nil
 }
 
 // NewHanzoControlPlane starts all Hanzo-operated convenience endpoints and
@@ -970,23 +1038,8 @@ func NewHanzoControlPlane(domain EIP712Domain, guard *HostBlocker) (*HanzoContro
 		Facilitator: fac,
 		Vault:       vault,
 	}
-	gwMux := http.NewServeMux()
-	gwMux.HandleFunc("/v1/health", func(w http.ResponseWriter, r *http.Request) {
-		if hp.killed.Load() {
-			writeErrJSON(w, http.StatusServiceUnavailable, ErrHanzoPlaneOffline)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"service":     "hanzo-gateway",
-			"plane":       PlaneHanzo,
-			"registry":    reg.URL(),
-			"mirror":      mir.URL(),
-			"scheduler":   sched.URL(),
-			"facilitator": fac.URL(),
-			"vault":       vault.URL(),
-		})
-	})
-	hp.Gateway = httptest.NewServer(gwMux)
+	gwApp, gwErr := NewHanzoGatewayApp(hp, nil)
+	hp.Gateway = startZipTestServer(gwApp, gwErr)
 
 	guard.RegisterHanzoEndpoint(hp.Gateway.URL)
 	guard.RegisterHanzoEndpoint(reg.URL())
@@ -1089,11 +1142,13 @@ func (cp *CommunityControlPlane) Close() {
 }
 
 // ExportForkBundle builds and signs a complete portable NetworkForkBundle from
-// this community operator's live state.
+// this community operator's live state, including verified content-addressed
+// model artifacts so forks remain self-contained after origin shutdown.
 func (cp *CommunityControlPlane) ExportForkBundle() (NetworkForkBundle, error) {
 	providers, models, govs := cp.BootstrapNodes[0].SnapshotState()
 	ledger, bals := cp.Facilitator.SnapshotState()
 	vault := cp.Vault.SnapshotState()
+	blobs := cp.Mirror.SnapshotBlobs()
 
 	bundle := NetworkForkBundle{
 		ProtocolVersion:  ProtocolVersion,
@@ -1102,6 +1157,7 @@ func (cp *CommunityControlPlane) ExportForkBundle() (NetworkForkBundle, error) {
 		OperatorAddress:  cp.OperatorKP.Address(),
 		Providers:        providers,
 		Models:           models,
+		ModelBlobs:       blobs,
 		SettlementLedger: ledger,
 		Balances:         bals,
 		Governance:       govs,
@@ -1114,9 +1170,13 @@ func (cp *CommunityControlPlane) ExportForkBundle() (NetworkForkBundle, error) {
 }
 
 // HydrateFromFork verifies bundle offline and hydrates every component of this
-// fresh community operator plane from the portable snapshot.
+// fresh community operator plane—including its local content-addressed model
+// artifact mirror—from the portable snapshot.
 func (cp *CommunityControlPlane) HydrateFromFork(bundle NetworkForkBundle) error {
 	if err := VerifyForkBundleOffline(cp.Domain, bundle); err != nil {
+		return err
+	}
+	if err := cp.Mirror.HydrateBlobs(bundle.ModelBlobs); err != nil {
 		return err
 	}
 	for _, b := range cp.BootstrapNodes {

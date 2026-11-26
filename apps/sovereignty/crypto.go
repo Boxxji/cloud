@@ -755,6 +755,26 @@ func DecryptUserData(domain EIP712Domain, userKey []byte, env EncryptedDataEnvel
 	return plaintext, nil
 }
 
+// VerifyEncryptedEnvelope verifies an EncryptedDataEnvelope's non-custodial
+// capability manifest and owner EIP-712 signature offline.
+func VerifyEncryptedEnvelope(domain EIP712Domain, env EncryptedDataEnvelope) error {
+	if strings.TrimSpace(env.SnapshotID) == "" {
+		return fmt.Errorf("%w: empty snapshotId", ErrInvalidRequest)
+	}
+	if env.CapabilityManifest.CustodialEscrow {
+		return fmt.Errorf("%w: custodial escrow must be false", ErrInvalidRequest)
+	}
+	sh, err := envelopeStructHash(env)
+	if err != nil {
+		return err
+	}
+	signer, err := RecoverSignerAddress(domain.TypedDataDigest(sh), env.OwnerSignature)
+	if err != nil || !SameAddress(signer, env.OwnerAddress) {
+		return ErrInvalidSignature
+	}
+	return nil
+}
+
 // --- Fork Bundle Integrity & Signing ---
 
 func computeForkBundleDigest(b NetworkForkBundle) (string, error) {
@@ -796,8 +816,9 @@ func SignForkBundle(domain EIP712Domain, kp *KeyPair, b *NetworkForkBundle) erro
 }
 
 // VerifyForkBundleOffline verifies the bundle digest, operator signature, and
-// every signed provider advertisement, model manifest, settlement receipt, and
-// governance vote contained inside the fork bundle completely offline.
+// every signed provider advertisement, model manifest and artifact blob,
+// settlement receipt, governance vote, and owner-signed vault envelope
+// contained inside the fork bundle completely offline.
 func VerifyForkBundleOffline(domain EIP712Domain, b NetworkForkBundle) error {
 	if b.ProtocolVersion != ProtocolVersion {
 		return fmt.Errorf("%w: unsupported protocol version %q", ErrForkBundleCorrupted, b.ProtocolVersion)
@@ -828,9 +849,23 @@ func VerifyForkBundleOffline(domain EIP712Domain, b NetworkForkBundle) error {
 			return fmt.Errorf("%w: provider %s: %v", ErrForkBundleCorrupted, p.ProviderID, err)
 		}
 	}
+	verifiedBlobs := make(map[string]int64, len(b.ModelBlobs))
+	for digest, blob := range b.ModelBlobs {
+		normDigest := strings.ToLower(strings.TrimSpace(digest))
+		actual := SHA256Hex(blob)
+		if normDigest == "" || !strings.EqualFold(actual, normDigest) {
+			return fmt.Errorf("%w: model blob %s digest mismatch (got %s)", ErrForkBundleCorrupted, digest, actual)
+		}
+		verifiedBlobs[normDigest] = int64(len(blob))
+	}
 	for _, m := range b.Models {
 		if err := VerifyModelManifest(domain, m); err != nil {
 			return fmt.Errorf("%w: model %s: %v", ErrForkBundleCorrupted, m.ModelID, err)
+		}
+		normDigest := strings.ToLower(strings.TrimSpace(m.DigestSHA256))
+		size, ok := verifiedBlobs[normDigest]
+		if !ok || size != m.SizeBytes {
+			return fmt.Errorf("%w: model %s missing verified artifact blob %s", ErrForkBundleCorrupted, m.ModelID, normDigest)
 		}
 	}
 	prevHash := "genesis"
@@ -844,11 +879,33 @@ func VerifyForkBundleOffline(domain EIP712Domain, b NetworkForkBundle) error {
 		prevHash = s.LedgerHash
 	}
 	for _, g := range b.Governance {
+		seenVoters := make(map[string]struct{}, len(g.Votes))
 		for _, v := range g.Votes {
 			if err := VerifyGovernanceVote(domain, v); err != nil {
 				return fmt.Errorf("%w: governance vote %s: %v", ErrForkBundleCorrupted, g.ProposalID, err)
 			}
+			if v.ProposalID != g.ProposalID || v.Action != g.Action || v.Payload != g.Payload {
+				return fmt.Errorf("%w: governance vote %s conflicts with proposal contents", ErrForkBundleCorrupted, g.ProposalID)
+			}
+			normVoter, err := NormalizeAddress(v.VoterAddress)
+			if err != nil {
+				return fmt.Errorf("%w: governance voter address %s: %v", ErrForkBundleCorrupted, v.VoterAddress, err)
+			}
+			if _, dup := seenVoters[normVoter]; dup {
+				return fmt.Errorf("%w: duplicate governance voter %s on %s", ErrForkBundleCorrupted, normVoter, g.ProposalID)
+			}
+			seenVoters[normVoter] = struct{}{}
 		}
+	}
+	seenSnapshots := make(map[string]string, len(b.EncryptedVault))
+	for _, env := range b.EncryptedVault {
+		if err := VerifyEncryptedEnvelope(domain, env); err != nil {
+			return fmt.Errorf("%w: vault envelope %s: %v", ErrForkBundleCorrupted, env.SnapshotID, err)
+		}
+		if prevOwner, exists := seenSnapshots[env.SnapshotID]; exists && !SameAddress(prevOwner, env.OwnerAddress) {
+			return fmt.Errorf("%w: vault snapshot %s has conflicting owners", ErrForkBundleCorrupted, env.SnapshotID)
+		}
+		seenSnapshots[env.SnapshotID] = env.OwnerAddress
 	}
 	return nil
 }
