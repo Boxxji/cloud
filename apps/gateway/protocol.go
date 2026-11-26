@@ -913,6 +913,10 @@ func verifyReceipt(
 			return fmt.Errorf("%w: receipt request hash (%s) does not match bound quote request hash (%s)",
 				ErrInvalidReceipt, r.RequestHash, expectedQuote.RequestHash)
 		}
+		if expectedQuote.MaxTokens <= 0 || r.CompletionTokens > expectedQuote.MaxTokens {
+			return fmt.Errorf("%w: receipt completion tokens (%d) exceeds bound quote maxTokens (%d)",
+				ErrInvalidReceipt, r.CompletionTokens, expectedQuote.MaxTokens)
+		}
 	}
 
 	if expectedRequestHash != "" && r.RequestHash != expectedRequestHash {

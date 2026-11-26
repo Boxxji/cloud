@@ -1620,3 +1620,435 @@ func TestTamperedTokenMetadataRejectedAndUsageFromSignedReceipt(t *testing.T) {
 		t.Fatalf("expected MultiGatewayClient to reject tampered Usage with ErrInvalidReceipt, got %v", err)
 	}
 }
+
+func writeJSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	_ = json.NewEncoder(rw).Encode(v)
+}
+
+func TestApplyGatewayFeeOverflowRejected(t *testing.T) {
+	const overflowPrice = uint64(18444901242133756455)
+	if _, err := ApplyGatewayFeeChecked(overflowPrice, 10); !errors.Is(err, ErrInvalidQuote) {
+		t.Fatalf("expected ErrInvalidQuote for ApplyGatewayFeeChecked(%d, 10), got %v", overflowPrice, err)
+	}
+	if _, err := ApplyGatewayFeeChecked(^uint64(0), 1); !errors.Is(err, ErrInvalidQuote) {
+		t.Fatalf("expected ErrInvalidQuote for MaxUint64 with 1 bps fee, got %v", err)
+	}
+	if _, err := ApplyGatewayFeeChecked(^uint64(0), ^uint64(0)); !errors.Is(err, ErrInvalidQuote) {
+		t.Fatalf("expected ErrInvalidQuote for MaxUint64 * MaxUint64 without panic, got %v", err)
+	}
+	if got := ApplyGatewayFee(overflowPrice, 10); got == 0 {
+		t.Fatalf("ApplyGatewayFee wrapped to 0 on overflow")
+	}
+
+	// End-to-end scheduler check: provider quoting overflowPrice must be rejected
+	// rather than ranked as free under lowest_cost.
+	domain := DefaultDomain()
+	now := time.Now().Unix()
+	overflowWorker, err := NewWorkerNode(WorkerConfig{
+		ProviderID:         "worker-overflow",
+		Models:             defaultTestModels(),
+		PriceMicroUSDPer1M: overflowPrice,
+		AdvertisedTTFTMs:   5,
+		Domain:             domain,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer overflowWorker.Close()
+
+	honestWorker, err := NewWorkerNode(WorkerConfig{
+		ProviderID:         "worker-honest",
+		Models:             defaultTestModels(),
+		PriceMicroUSDPer1M: 400_000,
+		AdvertisedTTFTMs:   15,
+		Domain:             domain,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer honestWorker.Close()
+
+	recOverflow, err := overflowWorker.SignedRecord(now, 3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recHonest, err := honestWorker.SignedRecord(now, 3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gw, err := NewGateway(GatewayConfig{
+		GatewayID:     "gw-fee-overflow",
+		OperatorName:  "Fee Overflow Guard",
+		OperatorType:  OperatorTypeCommunity,
+		Domain:        domain,
+		Strategy:      StrategyLowestCost,
+		GatewayFeeBps: 10,
+		StaticWorkers: []WorkerRecord{recOverflow, recHonest},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := gw.ChatCompletions(context.Background(), ChatCompletionRequest{
+		Model:     "zen-7b-instruct",
+		Messages:  []ChatMessage{{Role: "user", Content: "check overflow guard"}},
+		MaxTokens: 32,
+		Strategy:  string(StrategyLowestCost),
+	})
+	if err != nil {
+		t.Fatalf("ChatCompletions failed: %v", err)
+	}
+	if resp.EnsoRoute.ProviderID != "worker-honest" {
+		t.Fatalf("expected honest worker to win, got %s (effectivePrice=%d)",
+			resp.EnsoRoute.ProviderID, resp.EnsoRoute.EffectivePriceMicroUSDPer1M)
+	}
+	if resp.EnsoRoute.EffectivePriceMicroUSDPer1M <= 400_000 {
+		t.Fatalf("expected fee-inclusive price > 400000, got %d", resp.EnsoRoute.EffectivePriceMicroUSDPer1M)
+	}
+}
+
+func TestWorkerAndDirectoryExposeTypedOpenAPIAndMCP(t *testing.T) {
+	domain := DefaultDomain()
+	worker, err := NewWorkerNode(WorkerConfig{
+		ProviderID:         "worker-typed-ops",
+		Models:             defaultTestModels(),
+		PriceMicroUSDPer1M: 250_000,
+		AdvertisedTTFTMs:   10,
+		Domain:             domain,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Close()
+
+	dirSrv, err := NewDirectoryPeerServer("dir-typed-ops", "Typed Ops Directory", domain, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dirSrv.Close()
+
+	checkSurface := func(name, baseURL string, wantPaths []string, minTools int) {
+		t.Helper()
+		resp, err := http.Get(baseURL + "/.well-known/openapi.json")
+		if err != nil {
+			t.Fatalf("%s GET /.well-known/openapi.json: %v", name, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("%s expected 200 for openapi.json, got %d: %s", name, resp.StatusCode, string(raw))
+		}
+		var spec struct {
+			OpenAPI string                 `json:"openapi"`
+			Paths   map[string]interface{} `json:"paths"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&spec); err != nil {
+			t.Fatalf("%s decode openapi: %v", name, err)
+		}
+		for _, p := range wantPaths {
+			if _, ok := spec.Paths[p]; !ok {
+				t.Errorf("%s OpenAPI missing typed path %s", name, p)
+			}
+		}
+
+		mcpReq := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`
+		mcpResp, err := http.Post(baseURL+"/mcp", "application/json", bytes.NewBufferString(mcpReq))
+		if err != nil {
+			t.Fatalf("%s POST /mcp: %v", name, err)
+		}
+		defer mcpResp.Body.Close()
+		raw, _ := io.ReadAll(mcpResp.Body)
+		if mcpResp.StatusCode != http.StatusOK {
+			t.Fatalf("%s expected 200 for POST /mcp, got %d: %s", name, mcpResp.StatusCode, string(raw))
+		}
+		var mcpOut struct {
+			Result struct {
+				Tools []map[string]any `json:"tools"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(raw, &mcpOut); err != nil {
+			t.Fatalf("%s decode /mcp: %v (raw=%s)", name, err, string(raw))
+		}
+		if len(mcpOut.Result.Tools) < minTools {
+			t.Fatalf("%s expected at least %d MCP tools, got %d", name, minTools, len(mcpOut.Result.Tools))
+		}
+	}
+
+	checkSurface("worker", worker.URL(), []string{
+		"/worker/v1/record",
+		"/worker/v1/quote",
+		"/worker/v1/execute",
+	}, 3)
+
+	checkSurface("directory", dirSrv.URL(), []string{
+		"/directory/v1/workers",
+		"/directory/v1/gossip",
+		"/directory/v1/snapshot",
+	}, 4)
+}
+
+func TestFailoverRefreshesExpiredBackupQuotes(t *testing.T) {
+	domain := DefaultDomain()
+	now := time.Now().Unix()
+
+	primary, err := NewWorkerNode(WorkerConfig{
+		ProviderID:         "worker-slow-primary",
+		Models:             defaultTestModels(),
+		PriceMicroUSDPer1M: 100_000, // cheaper so selected first under lowest_cost
+		AdvertisedTTFTMs:   5,
+		QuoteTTL:           1 * time.Second,
+		Domain:             domain,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer primary.Close()
+	primary.SetFaultMode(FaultTimeout)
+	primary.SetTimeoutDelay(2500 * time.Millisecond)
+
+	backup, err := NewWorkerNode(WorkerConfig{
+		ProviderID:         "worker-healthy-backup",
+		Models:             defaultTestModels(),
+		PriceMicroUSDPer1M: 200_000,
+		AdvertisedTTFTMs:   10,
+		QuoteTTL:           1 * time.Second, // initial quote expires while primary times out
+		Domain:             domain,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+
+	recPrimary, err := primary.SignedRecord(now, 3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recBackup, err := backup.SignedRecord(now, 3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gw, err := NewGateway(GatewayConfig{
+		GatewayID:         "gw-expired-backup-failover",
+		OperatorName:      "Failover Refresh",
+		OperatorType:      OperatorTypeCommunity,
+		Domain:            domain,
+		Strategy:          StrategyLowestCost,
+		QuoteCacheEnabled: false,
+		FailoverEnabled:   BoolPtr(true),
+		ProviderTimeout:   1500 * time.Millisecond, // > 1s QuoteTTL so backup quote expires during attempt 1
+		StaticWorkers:     []WorkerRecord{recPrimary, recBackup},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := gw.ChatCompletions(context.Background(), ChatCompletionRequest{
+		Model:     "zen-7b-instruct",
+		Messages:  []ChatMessage{{Role: "user", Content: "failover with short quote ttl"}},
+		MaxTokens: 32,
+		Strategy:  string(StrategyLowestCost),
+	})
+	if err != nil {
+		t.Fatalf("expected failover to refresh expired backup quote and succeed, got %v", err)
+	}
+	if resp.EnsoRoute.ProviderID != "worker-healthy-backup" || !resp.EnsoRoute.FailoverOccurred {
+		t.Fatalf("expected failover to worker-healthy-backup, got route=%+v", resp.EnsoRoute)
+	}
+	if backup.QuoteCalls() < 2 {
+		t.Fatalf("expected backup worker to receive refreshed quote call, got %d quote calls", backup.QuoteCalls())
+	}
+}
+
+func TestWorkerAndReceiptEnforceQuoteMaxTokensCap(t *testing.T) {
+	domain := DefaultDomain()
+	now := time.Now().Unix()
+	kp, err := KeyPairFromSeed([]byte("quote-maxtokens-worker"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewWorkerNode(WorkerConfig{
+		ProviderID:         "worker-maxtokens",
+		Models:             defaultTestModels(),
+		PriceMicroUSDPer1M: 300_000,
+		AdvertisedTTFTMs:   10,
+		Domain:             domain,
+		KeyPair:            kp,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Close()
+
+	largeReq := ChatCompletionRequest{
+		Model:     "zen-7b-instruct",
+		Messages:  []ChatMessage{{Role: "user", Content: "produce 512 tokens under 1-token quote"}},
+		MaxTokens: 512,
+	}
+	largeReqHash := CanonicalRequestHash(largeReq)
+
+	// Obtain a quote with MaxTokens=1 bound to largeReq's hash.
+	qBody, _ := json.Marshal(QuoteRequest{
+		ModelID:     largeReq.Model,
+		MaxTokens:   1,
+		RequestHash: largeReqHash,
+		GatewayID:   "gw-cap-test",
+	})
+	qResp, err := http.Post(worker.URL()+"/worker/v1/quote", "application/json", bytes.NewReader(qBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer qResp.Body.Close()
+	if qResp.StatusCode != http.StatusOK {
+		t.Fatalf("quote status=%d", qResp.StatusCode)
+	}
+	var oneTokenQuote InferenceQuote
+	if err := json.NewDecoder(qResp.Body).Decode(&oneTokenQuote); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Worker execute MUST reject 512-token request under 1-token quote.
+	execBody, _ := json.Marshal(ExecuteRequest{
+		Quote:           oneTokenQuote,
+		Request:         largeReq,
+		GatewayID:       "gw-cap-test",
+		GatewayOperator: "Cap Tester",
+	})
+	execResp, err := http.Post(worker.URL()+"/worker/v1/execute", "application/json", bytes.NewReader(execBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer execResp.Body.Close()
+	if execResp.StatusCode != http.StatusBadRequest {
+		raw, _ := io.ReadAll(execResp.Body)
+		t.Fatalf("expected HTTP 400 when executing 512-token request under 1-token quote, got %d: %s", execResp.StatusCode, string(raw))
+	}
+
+	// 2. VerifyReceipt and VerifyReceiptWithoutContent MUST reject receipts exceeding quote MaxTokens.
+	qh, err := QuoteHash(domain, oneTokenQuote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := "over-cap output"
+	rcpt := ExecutionReceipt{
+		ReceiptID:         "rcpt-over-cap",
+		ProtocolVersion:   ProtocolVersion,
+		VerificationClass: ReceiptVerificationClass,
+		GatewayID:         "gw-cap-test",
+		GatewayOperator:   "Cap Tester",
+		ProviderID:        oneTokenQuote.ProviderID,
+		ModelID:           oneTokenQuote.ModelID,
+		ModelDigest:       oneTokenQuote.ModelDigest,
+		QuoteID:           oneTokenQuote.QuoteID,
+		QuoteHash:         qh,
+		QuoteNonce:        oneTokenQuote.Nonce,
+		RequestHash:       largeReqHash,
+		OutputHash:        ComputeOutputHash(content),
+		PromptTokens:      12,
+		CompletionTokens:  512,
+		TotalTokens:       524,
+		TTFTMs:            5.0,
+		TotalLatencyMs:    10.0,
+		CompletedAt:       now,
+	}
+	if err := SignReceipt(domain, kp, &rcpt); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyReceipt(domain, rcpt, &oneTokenQuote, largeReqHash, content); !errors.Is(err, ErrInvalidReceipt) {
+		t.Fatalf("expected ErrInvalidReceipt for completionTokens > quote.MaxTokens, got %v", err)
+	}
+	if err := VerifyReceiptWithoutContent(domain, rcpt, &oneTokenQuote, largeReqHash); !errors.Is(err, ErrInvalidReceipt) {
+		t.Fatalf("expected ErrInvalidReceipt from VerifyReceiptWithoutContent for completionTokens > quote.MaxTokens, got %v", err)
+	}
+}
+
+func TestGatewayRefreshesDiscoveryOnModelSpecificMiss(t *testing.T) {
+	domain := DefaultDomain()
+	now := time.Now().Unix()
+
+	modelA := ModelSpec{ModelID: "model-alpha", ModelDigest: SHA256Hex([]byte("alpha-v1")), License: "Apache-2.0"}
+	modelB := ModelSpec{ModelID: "model-beta", ModelDigest: SHA256Hex([]byte("beta-v1")), License: "Apache-2.0"}
+
+	workerA, err := NewWorkerNode(WorkerConfig{
+		ProviderID:         "worker-static-alpha",
+		Models:             []ModelSpec{modelA},
+		PriceMicroUSDPer1M: 200_000,
+		AdvertisedTTFTMs:   10,
+		Domain:             domain,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer workerA.Close()
+
+	workerB, err := NewWorkerNode(WorkerConfig{
+		ProviderID:         "worker-dir-beta",
+		Models:             []ModelSpec{modelB},
+		PriceMicroUSDPer1M: 250_000,
+		AdvertisedTTFTMs:   10,
+		Domain:             domain,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer workerB.Close()
+
+	dirSrv, err := NewDirectoryPeerServer("dir-model-miss", "Model Miss Dir", domain, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dirSrv.Close()
+
+	recA, err := workerA.SignedRecord(now, 3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recB, err := workerB.SignedRecord(now, 3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dirSrv.RegisterWorker(recB); err != nil {
+		t.Fatal(err)
+	}
+
+	// Gateway starts with static workerA (so local directory is non-empty) and
+	// directory peer holding workerB for model-beta.
+	gw, err := NewGateway(GatewayConfig{
+		GatewayID:     "gw-model-miss-refresh",
+		OperatorName:  "Model Miss Guard",
+		OperatorType:  OperatorTypeCommunity,
+		Domain:        domain,
+		StaticWorkers: []WorkerRecord{recA},
+		DirectoryURLs: []string{dirSrv.URL()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// FetchQuotes for model-beta must refresh discovery despite workerA being cached.
+	qResp, err := gw.FetchQuotes(context.Background(), QuotesQuery{Model: "model-beta", MaxTokens: 32})
+	if err != nil {
+		t.Fatalf("FetchQuotes for model-beta failed despite directory peer holding it: %v", err)
+	}
+	if len(qResp.Candidates) != 1 || qResp.Candidates[0].Worker.ProviderID != "worker-dir-beta" {
+		t.Fatalf("unexpected quotes response: %+v", qResp)
+	}
+
+	// Simulate workerB expiring locally while workerA remains valid, and directory
+	// holding a renewed record for workerB.
+	gw.Directory().RemoveWorker("worker-dir-beta")
+	chatResp, err := gw.ChatCompletions(context.Background(), ChatCompletionRequest{
+		Model:     "model-beta",
+		Messages:  []ChatMessage{{Role: "user", Content: "discover renewed model-beta"}},
+		MaxTokens: 32,
+	})
+	if err != nil {
+		t.Fatalf("ChatCompletions for model-beta failed on model-specific miss: %v", err)
+	}
+	if chatResp.EnsoRoute.ProviderID != "worker-dir-beta" {
+		t.Fatalf("expected worker-dir-beta, got %s", chatResp.EnsoRoute.ProviderID)
+	}
+}
+

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"net/http"
 	"sort"
 	"strings"
@@ -45,14 +46,37 @@ func NormalizeStrategy(s string) Strategy {
 	return StrategyWeightedSLOScore
 }
 
-// ApplyGatewayFee returns basePriceMicroUSD plus the gateway's competitive
-// routing fee in basis points (100 bps = 1%).
-func ApplyGatewayFee(basePriceMicroUSD uint64, feeBps uint64) uint64 {
+// ApplyGatewayFeeChecked computes basePriceMicroUSD plus the gateway's
+// competitive routing fee in basis points (100 bps = 1%) using exact 128-bit
+// arithmetic, returning ErrInvalidQuote if the fee-inclusive price overflows
+// uint64.
+func ApplyGatewayFeeChecked(basePriceMicroUSD uint64, feeBps uint64) (uint64, error) {
 	if feeBps == 0 || basePriceMicroUSD == 0 {
-		return basePriceMicroUSD
+		return basePriceMicroUSD, nil
 	}
-	fee := (basePriceMicroUSD*feeBps + 9999) / 10000
-	return basePriceMicroUSD + fee
+	hi, lo := bits.Mul64(basePriceMicroUSD, feeBps)
+	lo, carry := bits.Add64(lo, 9999, 0)
+	hi += carry
+	if hi >= 10000 {
+		return 0, fmt.Errorf("%w: fee-inclusive price overflows uint64", ErrInvalidQuote)
+	}
+	fee, _ := bits.Div64(hi, lo, 10000)
+	total, overflow := bits.Add64(basePriceMicroUSD, fee, 0)
+	if overflow != 0 {
+		return 0, fmt.Errorf("%w: fee-inclusive price overflows uint64", ErrInvalidQuote)
+	}
+	return total, nil
+}
+
+// ApplyGatewayFee returns basePriceMicroUSD plus the gateway's competitive
+// routing fee in basis points (100 bps = 1%), saturating at math.MaxUint64 if
+// the result would overflow uint64.
+func ApplyGatewayFee(basePriceMicroUSD uint64, feeBps uint64) uint64 {
+	total, err := ApplyGatewayFeeChecked(basePriceMicroUSD, feeBps)
+	if err != nil {
+		return math.MaxUint64
+	}
+	return total
 }
 
 // ProviderHealth tracks strictly ephemeral local observations on a single
@@ -293,17 +317,24 @@ func (s *Scheduler) FetchAndRankQuotes(
 	if s.cfg.QuoteCacheEnabled && s.cfg.QuoteCacheTTL > 0 && requestHash != "" {
 		if cached, ok := s.getWarmCache(modelID, workers); ok {
 			cands := make([]CandidateQuote, 0, len(cached))
+			var rejected []error
 			for _, e := range cached {
+				effPrice, err := ApplyGatewayFeeChecked(e.quote.PriceMicroUSDPer1M, s.cfg.GatewayFeeBps)
+				if err != nil {
+					rejected = append(rejected, fmt.Errorf("provider %s: %w", e.worker.ProviderID, err))
+					continue
+				}
 				cands = append(cands, CandidateQuote{
 					Worker:                      e.worker,
 					Quote:                       e.quote,
 					QuoteHash:                   e.quoteHash,
-					EffectivePriceMicroUSDPer1M: ApplyGatewayFee(e.quote.PriceMicroUSDPer1M, s.cfg.GatewayFeeBps),
+					EffectivePriceMicroUSDPer1M: effPrice,
 				})
 			}
 			ranked := RankCandidates(strategy, cands, s.snapshotHealth())
 			return QuoteFetchResult{
 				Candidates:      ranked,
+				RejectedErrors:  rejected,
 				CacheHit:        true,
 				RefreshDuration: time.Since(start),
 			}
@@ -322,7 +353,7 @@ func (s *Scheduler) FetchAndRankQuotes(
 		wg.Add(1)
 		go func(idx int, rec WorkerRecord) {
 			defer wg.Done()
-			q, qh, err := s.fetchSingleQuote(ctx, rec, modelID, maxTokens, requestHash)
+			q, qh, effPrice, err := s.fetchSingleQuote(ctx, rec, modelID, maxTokens, requestHash)
 			if err != nil {
 				results[idx] = fetchOut{err: fmt.Errorf("provider %s: %w", rec.ProviderID, err)}
 				return
@@ -332,7 +363,7 @@ func (s *Scheduler) FetchAndRankQuotes(
 					Worker:                      rec,
 					Quote:                       q,
 					QuoteHash:                   qh,
-					EffectivePriceMicroUSDPer1M: ApplyGatewayFee(q.PriceMicroUSDPer1M, s.cfg.GatewayFeeBps),
+					EffectivePriceMicroUSDPer1M: effPrice,
 				},
 				ok: true,
 			}
@@ -412,7 +443,7 @@ func (s *Scheduler) fetchSingleQuote(
 	modelID string,
 	maxTokens int,
 	requestHash string,
-) (InferenceQuote, string, error) {
+) (InferenceQuote, string, uint64, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, s.cfg.ProviderTimeout)
 	defer cancel()
 
@@ -423,46 +454,50 @@ func (s *Scheduler) fetchSingleQuote(
 		GatewayID:   s.cfg.GatewayID,
 	})
 	if err != nil {
-		return InferenceQuote{}, "", err
+		return InferenceQuote{}, "", 0, err
 	}
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, strings.TrimRight(rec.EndpointURL, "/")+"/worker/v1/quote", bytes.NewReader(body))
 	if err != nil {
-		return InferenceQuote{}, "", err
+		return InferenceQuote{}, "", 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return InferenceQuote{}, "", fmt.Errorf("%w: %v", ErrProviderUnavailable, err)
+		return InferenceQuote{}, "", 0, fmt.Errorf("%w: %v", ErrProviderUnavailable, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return InferenceQuote{}, "", fmt.Errorf("%w: quote status %d", ErrProviderUnavailable, resp.StatusCode)
+		return InferenceQuote{}, "", 0, fmt.Errorf("%w: quote status %d", ErrProviderUnavailable, resp.StatusCode)
 	}
 
 	var q InferenceQuote
 	if err := json.NewDecoder(resp.Body).Decode(&q); err != nil {
-		return InferenceQuote{}, "", fmt.Errorf("%w: decode quote: %v", ErrInvalidQuote, err)
+		return InferenceQuote{}, "", 0, fmt.Errorf("%w: decode quote: %v", ErrInvalidQuote, err)
 	}
 	if err := VerifyQuote(s.cfg.Domain, q, time.Now().Unix()); err != nil {
-		return InferenceQuote{}, "", err
+		return InferenceQuote{}, "", 0, err
 	}
 	if !SameAddress(q.ProviderAddress, rec.OperatorAddress) || q.ProviderID != rec.ProviderID {
-		return InferenceQuote{}, "", fmt.Errorf("%w: quote provider %s (%s) does not match directory record %s (%s)",
+		return InferenceQuote{}, "", 0, fmt.Errorf("%w: quote provider %s (%s) does not match directory record %s (%s)",
 			ErrSignerMismatch, q.ProviderID, q.ProviderAddress, rec.ProviderID, rec.OperatorAddress)
 	}
 	spec, ok := rec.FindModel(modelID)
 	if !ok || q.ModelDigest != spec.ModelDigest {
-		return InferenceQuote{}, "", fmt.Errorf("%w: quote model digest mismatch", ErrInvalidQuote)
+		return InferenceQuote{}, "", 0, fmt.Errorf("%w: quote model digest mismatch", ErrInvalidQuote)
 	}
 	if requestHash != "" && q.RequestHash != requestHash {
-		return InferenceQuote{}, "", fmt.Errorf("%w: quote requestHash mismatch", ErrInvalidQuote)
+		return InferenceQuote{}, "", 0, fmt.Errorf("%w: quote requestHash mismatch", ErrInvalidQuote)
+	}
+	effPrice, err := ApplyGatewayFeeChecked(q.PriceMicroUSDPer1M, s.cfg.GatewayFeeBps)
+	if err != nil {
+		return InferenceQuote{}, "", 0, err
 	}
 	qh, err := QuoteHash(s.cfg.Domain, q)
 	if err != nil {
-		return InferenceQuote{}, "", err
+		return InferenceQuote{}, "", 0, err
 	}
-	return q, qh, nil
+	return q, qh, effPrice, nil
 }
 
 // ScheduleResult contains the executed inference response, verified quote &
@@ -517,13 +552,16 @@ func (s *Scheduler) ScheduleAndExecute(
 		cand := qRes.Candidates[attempt]
 		execQuote := cand.Quote
 		execQuoteHash := cand.QuoteHash
+		effPrice := cand.EffectivePriceMicroUSDPer1M
 
-		// When ranking came from a warm standing quote cache, fetch a fresh
-		// single-use signed quote bound to this RequestHash from the chosen
-		// provider so replay-nonce protection remains strict.
-		if qRes.CacheHit {
+		// When ranking came from a warm standing quote cache, or when a slow
+		// earlier attempt consumed this backup quote's lifetime, fetch a fresh
+		// single-use signed quote bound to this RequestHash before consuming
+		// the nonce and dispatching.
+		nowUnix := time.Now().Unix()
+		if qRes.CacheHit || nowUnix >= execQuote.ExpiresAt {
 			qStart := time.Now()
-			freshQ, freshQH, err := s.fetchSingleQuote(ctx, cand.Worker, req.Model, maxTokens, reqHash)
+			freshQ, freshQH, freshEffPrice, err := s.fetchSingleQuote(ctx, cand.Worker, req.Model, maxTokens, reqHash)
 			extraQuoteDur += time.Since(qStart)
 			if err != nil {
 				s.recordFailure(cand.Worker.ProviderID)
@@ -533,11 +571,21 @@ func (s *Scheduler) ScheduleAndExecute(
 			}
 			// If rapid price churn shifted the winner's price above cached,
 			// invalidate cache so subsequent requests re-rank cleanly.
-			if freshQ.PriceMicroUSDPer1M != cand.Quote.PriceMicroUSDPer1M {
+			if qRes.CacheHit && freshQ.PriceMicroUSDPer1M != cand.Quote.PriceMicroUSDPer1M {
 				s.InvalidateQuoteCache()
 			}
 			execQuote = freshQ
 			execQuoteHash = freshQH
+			effPrice = freshEffPrice
+		} else {
+			checkedPrice, err := ApplyGatewayFeeChecked(execQuote.PriceMicroUSDPer1M, s.cfg.GatewayFeeBps)
+			if err != nil {
+				s.recordFailure(cand.Worker.ProviderID)
+				failedProviders = append(failedProviders, cand.Worker.ProviderID)
+				lastErr = err
+				continue
+			}
+			effPrice = checkedPrice
 		}
 
 		// Enforce local per-gateway replay nonce guard before execution.
@@ -584,7 +632,6 @@ func (s *Scheduler) ScheduleAndExecute(
 		verifyMs := float64(time.Since(verifyStart).Microseconds()) / 1000.0
 
 		s.recordSuccess(cand.Worker.ProviderID, execResp.TTFTMs)
-		effPrice := ApplyGatewayFee(execQuote.PriceMicroUSDPer1M, s.cfg.GatewayFeeBps)
 		_ = execQuoteHash
 
 		return &ScheduleResult{

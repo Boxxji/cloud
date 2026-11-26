@@ -309,10 +309,11 @@ func (g *Gateway) FetchQuotes(ctx context.Context, query QuotesQuery) (*QuotesRe
 	if query.Model == "" {
 		return nil, fmt.Errorf("%w: model is required", ErrInvalidRequest)
 	}
-	if len(g.dir.ListWorkers(time.Now().Unix())) == 0 && len(g.cfg.DirectoryURLs) > 0 {
-		_, _ = g.SyncDirectory(ctx)
-	}
 	workers := g.dir.DiscoverForModel(query.Model, time.Now().Unix())
+	if len(workers) == 0 && len(g.cfg.DirectoryURLs) > 0 {
+		_, _ = g.SyncDirectory(ctx)
+		workers = g.dir.DiscoverForModel(query.Model, time.Now().Unix())
+	}
 	if len(workers) == 0 {
 		return nil, ErrNoHealthyProviders
 	}
@@ -342,10 +343,11 @@ func (g *Gateway) ChatCompletions(ctx context.Context, req ChatCompletionRequest
 	g.calls.Add(1)
 	g.chatCalls.Add(1)
 
-	if len(g.dir.ListWorkers(time.Now().Unix())) == 0 && len(g.cfg.DirectoryURLs) > 0 {
-		_, _ = g.SyncDirectory(ctx)
-	}
 	workers := g.dir.DiscoverForModel(req.Model, time.Now().Unix())
+	if len(workers) == 0 && len(g.cfg.DirectoryURLs) > 0 {
+		_, _ = g.SyncDirectory(ctx)
+		workers = g.dir.DiscoverForModel(req.Model, time.Now().Unix())
+	}
 	if len(workers) == 0 {
 		return nil, ErrNoHealthyProviders
 	}

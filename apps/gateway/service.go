@@ -67,6 +67,84 @@ func NewApp(gw *Gateway, log luxlog.Logger) (*zip.App, error) {
 	if gw != nil && gw.GatewayID() != "" {
 		name = gw.GatewayID()
 	}
+	app := newBaseZipApp(name, log)
+	if err := Mount(app, log, gw); err != nil {
+		return nil, err
+	}
+	if err := app.Build(); err != nil {
+		return nil, err
+	}
+	return app, nil
+}
+
+// MountWorker registers a WorkerNode's /worker/v1/* protocol operations onto
+// app through zip's typed operation registry.
+func MountWorker(app *zip.App, w *WorkerNode) error {
+	if app == nil {
+		return errors.New("gateway: nil zip app")
+	}
+	if w == nil {
+		return errors.New("gateway: nil worker node")
+	}
+	wg := app.Group("/worker/v1")
+	wg.Get("/record", w.opRecord)
+	wg.Post("/quote", w.opQuote)
+	wg.Post("/execute", w.opExecute)
+	return nil
+}
+
+// NewWorkerApp constructs a standalone zip.App with w mounted via the typed
+// operation registry and builds all projections (REST, OpenAPI, MCP, CLI, SDK).
+func NewWorkerApp(w *WorkerNode, log luxlog.Logger) (*zip.App, error) {
+	name := "enso-worker"
+	if w != nil && w.ProviderID() != "" {
+		name = w.ProviderID()
+	}
+	app := newBaseZipApp(name, log)
+	if err := MountWorker(app, w); err != nil {
+		return nil, err
+	}
+	if err := app.Build(); err != nil {
+		return nil, err
+	}
+	return app, nil
+}
+
+// MountDirectory registers a DirectoryPeerServer's /directory/v1/* protocol
+// operations onto app through zip's typed operation registry.
+func MountDirectory(app *zip.App, d *DirectoryPeerServer) error {
+	if app == nil {
+		return errors.New("gateway: nil zip app")
+	}
+	if d == nil {
+		return errors.New("gateway: nil directory peer server")
+	}
+	dg := app.Group("/directory/v1")
+	dg.Get("/workers", d.opListWorkers)
+	dg.Post("/workers", d.opRegisterWorker)
+	dg.Post("/gossip", d.opGossip)
+	dg.Get("/snapshot", d.opSnapshot)
+	return nil
+}
+
+// NewDirectoryApp constructs a standalone zip.App with d mounted via the typed
+// operation registry and builds all projections (REST, OpenAPI, MCP, CLI, SDK).
+func NewDirectoryApp(d *DirectoryPeerServer, log luxlog.Logger) (*zip.App, error) {
+	name := "enso-directory"
+	if d != nil && d.PeerID != "" {
+		name = d.PeerID
+	}
+	app := newBaseZipApp(name, log)
+	if err := MountDirectory(app, d); err != nil {
+		return nil, err
+	}
+	if err := app.Build(); err != nil {
+		return nil, err
+	}
+	return app, nil
+}
+
+func newBaseZipApp(name string, log luxlog.Logger) *zip.App {
 	logger := log
 	if logger == nil {
 		logger = luxlog.NewNoOpLogger()
@@ -82,13 +160,7 @@ func NewApp(gw *Gateway, log luxlog.Logger) (*zip.App, error) {
 		}
 		return c.Next()
 	}))
-	if err := Mount(app, log, gw); err != nil {
-		return nil, err
-	}
-	if err := app.Build(); err != nil {
-		return nil, err
-	}
-	return app, nil
+	return app
 }
 
 type zipOps struct {

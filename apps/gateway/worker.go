@@ -13,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/zap-proto/zip"
 )
 
 // FaultMode injects deterministic or adversarial provider behaviors over real
@@ -245,42 +247,34 @@ func (w *WorkerNode) SignedRecord(nowUnix int64, ttlSeconds int64) (WorkerRecord
 	return rec, nil
 }
 
-// Handler returns the net/http handler implementing /worker/v1/*.
+// Handler returns the net/http handler implementing /worker/v1/* derived from
+// MountWorker's typed zip.App operation registry (with OpenAPI and MCP projections).
 func (w *WorkerNode) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/worker/v1/record", w.handleRecord)
-	mux.HandleFunc("/worker/v1/quote", w.handleQuote)
-	mux.HandleFunc("/worker/v1/execute", w.handleExecute)
-	return mux
+	app, err := NewWorkerApp(w, nil)
+	if err != nil {
+		return http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+		})
+	}
+	return zipHTTPHandler(app)
 }
 
-func (w *WorkerNode) handleRecord(rw http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+func (w *WorkerNode) opRecord(_ context.Context, _ *emptyIn) (*WorkerRecord, error) {
 	rec, err := w.SignedRecord(time.Now().Unix(), 3600)
 	if err != nil {
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
-		return
+		return nil, zip.Errorf(http.StatusInternalServerError, "%s", err.Error())
 	}
-	writeJSON(rw, http.StatusOK, rec)
+	return &rec, nil
 }
 
-func (w *WorkerNode) handleQuote(rw http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
-		return
+func (w *WorkerNode) opQuote(_ context.Context, req *QuoteRequest) (*InferenceQuote, error) {
+	if req == nil {
+		return nil, zip.Errorf(http.StatusBadRequest, "invalid quote request json")
 	}
 	qNum := uint64(w.quoteCalls.Add(1))
-
-	var req QuoteRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(rw, "invalid quote request json", http.StatusBadRequest)
-		return
-	}
-	if req.MaxTokens <= 0 {
-		req.MaxTokens = 128
+	maxTokens := req.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 128
 	}
 
 	w.mu.RLock()
@@ -303,8 +297,7 @@ func (w *WorkerNode) handleQuote(rw http.ResponseWriter, r *http.Request) {
 	w.mu.RUnlock()
 
 	if !found {
-		http.Error(rw, "model not supported by worker", http.StatusNotFound)
-		return
+		return nil, zip.Errorf(http.StatusNotFound, "model not supported by worker")
 	}
 
 	effectivePrice := basePrice
@@ -328,8 +321,7 @@ func (w *WorkerNode) handleQuote(rw http.ResponseWriter, r *http.Request) {
 		seq := w.nonceSeq.Add(1)
 		rnd, err := RandomNonceHex()
 		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
+			return nil, zip.Errorf(http.StatusInternalServerError, "%s", err.Error())
 		}
 		nonce = fmt.Sprintf("%s-%d-%s", w.cfg.ProviderID, seq, rnd[:12])
 	}
@@ -347,15 +339,14 @@ func (w *WorkerNode) handleQuote(rw http.ResponseWriter, r *http.Request) {
 		ModelDigest:        matched.ModelDigest,
 		PriceMicroUSDPer1M: effectivePrice,
 		MaxTTFTMs:          ttftMs,
-		MaxTokens:          req.MaxTokens,
+		MaxTokens:          maxTokens,
 		IssuedAt:           issuedAt,
 		ExpiresAt:          expiresAt,
 		Nonce:              nonce,
 		RequestHash:        req.RequestHash,
 	}
 	if err := SignQuote(w.domain, w.kp, &quote); err != nil {
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
-		return
+		return nil, zip.Errorf(http.StatusInternalServerError, "%s", err.Error())
 	}
 
 	switch mode {
@@ -371,22 +362,15 @@ func (w *WorkerNode) handleQuote(rw http.ResponseWriter, r *http.Request) {
 		w.failedCalls.Add(1)
 	}
 
-	writeJSON(rw, http.StatusOK, quote)
+	return &quote, nil
 }
 
-func (w *WorkerNode) handleExecute(rw http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
-		return
+func (w *WorkerNode) opExecute(ctx context.Context, req *ExecuteRequest) (*ExecuteResponse, error) {
+	if req == nil {
+		return nil, zip.Errorf(http.StatusBadRequest, "invalid execute request json")
 	}
 	execNum := w.executeCalls.Add(1)
 	start := time.Now()
-
-	var req ExecuteRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(rw, "invalid execute request json", http.StatusBadRequest)
-		return
-	}
 
 	w.mu.RLock()
 	mode := w.faultMode
@@ -398,8 +382,7 @@ func (w *WorkerNode) handleExecute(rw http.ResponseWriter, r *http.Request) {
 
 	if mode == FaultCrash500 {
 		w.failedCalls.Add(1)
-		http.Error(rw, "simulated provider crash", http.StatusInternalServerError)
-		return
+		return nil, zip.Errorf(http.StatusInternalServerError, "simulated provider crash")
 	}
 	if mode == FaultIntermittent && faultRate > 0 {
 		// Exact deterministic Bresenham spacing matching faultRate% for any N.
@@ -407,56 +390,33 @@ func (w *WorkerNode) handleExecute(rw http.ResponseWriter, r *http.Request) {
 		curr := (execNum * int64(faultRate)) / 100
 		if curr > prev {
 			w.failedCalls.Add(1)
-			http.Error(rw, "simulated intermittent provider fault", http.StatusServiceUnavailable)
-			return
+			return nil, zip.Errorf(http.StatusServiceUnavailable, "simulated intermittent provider fault")
 		}
 	}
 	if mode == FaultTimeout {
 		w.failedCalls.Add(1)
 		select {
 		case <-time.After(timeoutDelay):
-			http.Error(rw, "provider timed out", http.StatusGatewayTimeout)
-		case <-r.Context().Done():
+			return nil, zip.Errorf(http.StatusGatewayTimeout, "provider timed out")
+		case <-ctx.Done():
+			return nil, zip.Errorf(http.StatusGatewayTimeout, "request canceled")
 		}
-		return
 	}
 
 	if err := VerifyQuote(w.domain, req.Quote, time.Now().Unix()); err != nil {
-		http.Error(rw, err.Error(), http.StatusBadRequest)
-		return
+		return nil, zip.Errorf(http.StatusBadRequest, "%s", err.Error())
 	}
 	if !SameAddress(req.Quote.ProviderAddress, w.kp.Address()) {
-		http.Error(rw, "quote signed by different provider", http.StatusBadRequest)
-		return
+		return nil, zip.Errorf(http.StatusBadRequest, "quote signed by different provider")
 	}
 	reqHash := CanonicalRequestHash(req.Request)
 	if req.Quote.RequestHash != "" && req.Quote.RequestHash != reqHash {
-		http.Error(rw, fmt.Sprintf("%s: quote requestHash (%s) != request hash (%s)", ErrInvalidQuote, req.Quote.RequestHash, reqHash), http.StatusBadRequest)
-		return
+		return nil, zip.Errorf(http.StatusBadRequest, "%s: quote requestHash (%s) != request hash (%s)", ErrInvalidQuote, req.Quote.RequestHash, reqHash)
 	}
 	if req.Request.Model != "" && req.Request.Model != req.Quote.ModelID {
-		http.Error(rw, fmt.Sprintf("%s: request model (%s) != quote model (%s)", ErrInvalidQuote, req.Request.Model, req.Quote.ModelID), http.StatusBadRequest)
-		return
+		return nil, zip.Errorf(http.StatusBadRequest, "%s: request model (%s) != quote model (%s)", ErrInvalidQuote, req.Request.Model, req.Quote.ModelID)
 	}
 
-	if simTTFT > 0 {
-		select {
-		case <-time.After(simTTFT):
-		case <-r.Context().Done():
-			return
-		}
-	}
-	ttftMs := float64(time.Since(start).Microseconds()) / 1000.0
-
-	if simGen > 0 {
-		select {
-		case <-time.After(simGen):
-		case <-r.Context().Done():
-			return
-		}
-	}
-
-	promptTokens := estimatePromptTokens(req.Request.Messages)
 	completionTokens := req.Request.MaxTokens
 	if completionTokens <= 0 {
 		completionTokens = 64
@@ -464,6 +424,29 @@ func (w *WorkerNode) handleExecute(rw http.ResponseWriter, r *http.Request) {
 	if completionTokens > 512 {
 		completionTokens = 512
 	}
+	if completionTokens > req.Quote.MaxTokens {
+		return nil, zip.Errorf(http.StatusBadRequest, "%s: requested completion tokens (%d) exceeds quote maxTokens (%d)",
+			ErrInvalidQuote, completionTokens, req.Quote.MaxTokens)
+	}
+
+	if simTTFT > 0 {
+		select {
+		case <-time.After(simTTFT):
+		case <-ctx.Done():
+			return nil, zip.Errorf(http.StatusGatewayTimeout, "request canceled")
+		}
+	}
+	ttftMs := float64(time.Since(start).Microseconds()) / 1000.0
+
+	if simGen > 0 {
+		select {
+		case <-time.After(simGen):
+		case <-ctx.Done():
+			return nil, zip.Errorf(http.StatusGatewayTimeout, "request canceled")
+		}
+	}
+
+	promptTokens := estimatePromptTokens(req.Request.Messages)
 
 	// Deterministic completion tied to model digest and canonical request hash.
 	content := buildDeterministicCompletion(req.Quote.ModelID, req.Quote.ModelDigest, reqHash, req.Request.Messages, completionTokens)
@@ -471,8 +454,7 @@ func (w *WorkerNode) handleExecute(rw http.ResponseWriter, r *http.Request) {
 
 	qh, err := QuoteHash(w.domain, req.Quote)
 	if err != nil {
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
-		return
+		return nil, zip.Errorf(http.StatusInternalServerError, "%s", err.Error())
 	}
 	totalLatencyMs := float64(time.Since(start).Microseconds()) / 1000.0
 
@@ -504,8 +486,7 @@ func (w *WorkerNode) handleExecute(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := SignReceipt(w.domain, w.kp, &receipt); err != nil {
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
-		return
+		return nil, zip.Errorf(http.StatusInternalServerError, "%s", err.Error())
 	}
 
 	returnedContent := content
@@ -518,14 +499,14 @@ func (w *WorkerNode) handleExecute(rw http.ResponseWriter, r *http.Request) {
 		w.failedCalls.Add(1)
 	}
 
-	writeJSON(rw, http.StatusOK, ExecuteResponse{
+	return &ExecuteResponse{
 		Content:          returnedContent,
 		PromptTokens:     promptTokens,
 		CompletionTokens: completionTokens,
 		TTFTMs:           ttftMs,
 		TotalLatencyMs:   totalLatencyMs,
 		Receipt:          receipt,
-	})
+	}, nil
 }
 
 func estimatePromptTokens(msgs []ChatMessage) int {
@@ -573,12 +554,6 @@ func flipLastHexChar(s string) string {
 		return s[:len(s)-1] + "1"
 	}
 	return s[:len(s)-1] + "0"
-}
-
-func writeJSON(rw http.ResponseWriter, status int, v any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	_ = json.NewEncoder(rw).Encode(v)
 }
 
 // --- Decentralized Multi-Peer Directory HTTP Server ---
@@ -707,78 +682,99 @@ func (d *DirectoryPeerServer) GossipToPeer(ctx context.Context, peerURL string, 
 	return nil
 }
 
-// Handler serves /directory/v1/workers, /directory/v1/gossip, and /directory/v1/snapshot.
+// DirectoryWorkersResponse is the typed payload for GET /directory/v1/workers.
+type DirectoryWorkersResponse struct {
+	PeerID          string         `json:"peerId"`
+	Operator        string         `json:"operator"`
+	ProtocolVersion string         `json:"protocolVersion"`
+	Workers         []WorkerRecord `json:"workers"`
+}
+
+// DirectoryRegisterResponse is the typed payload for POST /directory/v1/workers.
+type DirectoryRegisterResponse struct {
+	Registered bool   `json:"registered"`
+	ProviderID string `json:"providerId"`
+}
+
+// DirectoryGossipRequest is the typed payload for POST /directory/v1/gossip.
+type DirectoryGossipRequest struct {
+	Workers []WorkerRecord `json:"workers"`
+}
+
+// DirectoryGossipResponse is the typed response for POST /directory/v1/gossip.
+type DirectoryGossipResponse struct {
+	Accepted int `json:"accepted"`
+	Rejected int `json:"rejected"`
+	Total    int `json:"total"`
+}
+
+// Handler serves /directory/v1/workers, /directory/v1/gossip, and
+// /directory/v1/snapshot derived from MountDirectory's typed zip.App operation
+// registry (with OpenAPI and MCP projections).
 func (d *DirectoryPeerServer) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/directory/v1/workers", func(rw http.ResponseWriter, r *http.Request) {
-		d.calls.Add(1)
-		if d.disabled.Load() {
-			http.Error(rw, ErrGatewayDisabled.Error(), http.StatusServiceUnavailable)
-			return
-		}
-		switch r.Method {
-		case http.MethodGet:
-			writeJSON(rw, http.StatusOK, map[string]any{
-				"peerId":          d.PeerID,
-				"operator":        d.Operator,
-				"protocolVersion": ProtocolVersion,
-				"workers":         d.dir.ListWorkers(time.Now().Unix()),
-			})
-		case http.MethodPost:
-			var rec WorkerRecord
-			if err := json.NewDecoder(r.Body).Decode(&rec); err != nil {
-				http.Error(rw, "invalid worker record json", http.StatusBadRequest)
-				return
-			}
-			if err := d.dir.RegisterWorker(rec, time.Now().Unix()); err != nil {
-				http.Error(rw, err.Error(), http.StatusUnprocessableEntity)
-				return
-			}
-			writeJSON(rw, http.StatusOK, map[string]any{"registered": true, "providerId": rec.ProviderID})
-		default:
-			http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
-		}
-	})
-	mux.HandleFunc("/directory/v1/gossip", func(rw http.ResponseWriter, r *http.Request) {
-		d.calls.Add(1)
-		if d.disabled.Load() {
-			http.Error(rw, ErrGatewayDisabled.Error(), http.StatusServiceUnavailable)
-			return
-		}
-		if r.Method != http.MethodPost {
-			http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var payload struct {
-			Workers []WorkerRecord `json:"workers"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			http.Error(rw, "invalid gossip payload", http.StatusBadRequest)
-			return
-		}
-		accepted, rejected := d.dir.MergeRecords(payload.Workers, time.Now().Unix())
-		writeJSON(rw, http.StatusOK, map[string]any{
-			"accepted": accepted,
-			"rejected": rejected,
-			"total":    len(d.dir.ListWorkers(time.Now().Unix())),
-		})
-	})
-	mux.HandleFunc("/directory/v1/snapshot", func(rw http.ResponseWriter, r *http.Request) {
-		d.calls.Add(1)
-		if d.disabled.Load() {
-			http.Error(rw, ErrGatewayDisabled.Error(), http.StatusServiceUnavailable)
-			return
-		}
-		if r.Method != http.MethodGet {
-			http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		snap, err := d.dir.ExportSnapshot(d.kp, d.PeerID, time.Now().Unix())
-		if err != nil {
+	app, err := NewDirectoryApp(d, nil)
+	if err != nil {
+		return http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		writeJSON(rw, http.StatusOK, snap)
-	})
-	return mux
+		})
+	}
+	return zipHTTPHandler(app)
+}
+
+func (d *DirectoryPeerServer) opListWorkers(_ context.Context, _ *emptyIn) (*DirectoryWorkersResponse, error) {
+	d.calls.Add(1)
+	if d.disabled.Load() {
+		return nil, zip.Errorf(http.StatusServiceUnavailable, "%s", ErrGatewayDisabled.Error())
+	}
+	return &DirectoryWorkersResponse{
+		PeerID:          d.PeerID,
+		Operator:        d.Operator,
+		ProtocolVersion: ProtocolVersion,
+		Workers:         d.dir.ListWorkers(time.Now().Unix()),
+	}, nil
+}
+
+func (d *DirectoryPeerServer) opRegisterWorker(_ context.Context, rec *WorkerRecord) (*DirectoryRegisterResponse, error) {
+	d.calls.Add(1)
+	if d.disabled.Load() {
+		return nil, zip.Errorf(http.StatusServiceUnavailable, "%s", ErrGatewayDisabled.Error())
+	}
+	if rec == nil {
+		return nil, zip.Errorf(http.StatusBadRequest, "invalid worker record json")
+	}
+	if err := d.dir.RegisterWorker(*rec, time.Now().Unix()); err != nil {
+		return nil, zip.Errorf(http.StatusUnprocessableEntity, "%s", err.Error())
+	}
+	return &DirectoryRegisterResponse{
+		Registered: true,
+		ProviderID: rec.ProviderID,
+	}, nil
+}
+
+func (d *DirectoryPeerServer) opGossip(_ context.Context, payload *DirectoryGossipRequest) (*DirectoryGossipResponse, error) {
+	d.calls.Add(1)
+	if d.disabled.Load() {
+		return nil, zip.Errorf(http.StatusServiceUnavailable, "%s", ErrGatewayDisabled.Error())
+	}
+	if payload == nil {
+		return nil, zip.Errorf(http.StatusBadRequest, "invalid gossip payload")
+	}
+	accepted, rejected := d.dir.MergeRecords(payload.Workers, time.Now().Unix())
+	return &DirectoryGossipResponse{
+		Accepted: accepted,
+		Rejected: rejected,
+		Total:    len(d.dir.ListWorkers(time.Now().Unix())),
+	}, nil
+}
+
+func (d *DirectoryPeerServer) opSnapshot(_ context.Context, _ *emptyIn) (*DirectorySnapshot, error) {
+	d.calls.Add(1)
+	if d.disabled.Load() {
+		return nil, zip.Errorf(http.StatusServiceUnavailable, "%s", ErrGatewayDisabled.Error())
+	}
+	snap, err := d.dir.ExportSnapshot(d.kp, d.PeerID, time.Now().Unix())
+	if err != nil {
+		return nil, zip.Errorf(http.StatusInternalServerError, "%s", err.Error())
+	}
+	return &snap, nil
 }
