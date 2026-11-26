@@ -171,6 +171,66 @@ func (rt *RoutingTable) UpsertPeer(info PeerInfo) bool {
 	return false
 }
 
+// UpsertPeerHint inserts an unverified peer hint learned from gossip or remote
+// DHT peer lists. If the peer is already known with endpoints (or locally
+// liveness-verified), its validated addresses and metadata are preserved so an
+// arbitrary neighbor cannot poison live direct or relay routes.
+func (rt *RoutingTable) UpsertPeerHint(info PeerInfo) bool {
+	if info.PeerID == "" || info.PeerID == rt.selfID {
+		return false
+	}
+	cp := ClonePeerInfo(info)
+	cp.KeyHash = PeerKeyHash(cp.PeerID)
+	cp.LivenessVerified = false
+	cp.RTTMs = 0
+	cp.ConsecutiveFailures = 0
+
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+
+	idx := rt.bucketIndex(cp.KeyHash)
+	bucket := rt.buckets[idx]
+	for i := range bucket {
+		if bucket[i].PeerID == cp.PeerID {
+			existing := bucket[i]
+			// Never let an unverified hint replace an existing peer's known endpoints
+			// or identity metadata. Only backfill missing fields.
+			if existing.PublicKey == "" && cp.PublicKey != "" {
+				existing.PublicKey = cp.PublicKey
+			}
+			if len(existing.Addrs) == 0 && len(existing.RelayAddrs) == 0 {
+				existing.Addrs = cp.Addrs
+				existing.RelayAddrs = cp.RelayAddrs
+				if existing.NATMode == "" {
+					existing.NATMode = cp.NATMode
+				}
+				if existing.Role == "" {
+					existing.Role = cp.Role
+				}
+			}
+			bucket[i] = existing
+			rt.buckets[idx] = bucket
+			return true
+		}
+	}
+
+	if len(bucket) < rt.k {
+		rt.buckets[idx] = append(bucket, cp)
+		return true
+	}
+
+	// Evict the oldest peer with failures if bucket is full; never evict verified peers for an unverified hint.
+	for i := range bucket {
+		if bucket[i].ConsecutiveFailures > 0 {
+			bucket = append(bucket[:i], bucket[i+1:]...)
+			bucket = append(bucket, cp)
+			rt.buckets[idx] = bucket
+			return true
+		}
+	}
+	return false
+}
+
 // GetPeer looks up a peer by ID.
 func (rt *RoutingTable) GetPeer(id PeerID) (PeerInfo, bool) {
 	if id == "" || id == rt.selfID {

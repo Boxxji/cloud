@@ -5,6 +5,7 @@ package p2pnet
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
@@ -135,10 +136,36 @@ type InferenceRequest struct {
 	Timestamp       int64  `json:"timestamp"`
 }
 
+// InferenceRequestDigest computes a canonical domain-separated SHA-256 digest
+// over the semantic execution parameters of req so providers cryptographically
+// bind signed InferenceResponses to the exact request executed.
+func InferenceRequestDigest(req InferenceRequest) string {
+	raw, _ := json.Marshal(struct {
+		RequestID       string `json:"request_id"`
+		ModelID         string `json:"model_id"`
+		PromptTokens    int    `json:"prompt_tokens"`
+		MaxOutputTokens int    `json:"max_output_tokens"`
+		PromptDigest    string `json:"prompt_digest"`
+	}{
+		RequestID:       req.RequestID,
+		ModelID:         req.ModelID,
+		PromptTokens:    req.PromptTokens,
+		MaxOutputTokens: req.MaxOutputTokens,
+		PromptDigest:    req.PromptDigest,
+	})
+	h := sha256.New()
+	h.Write([]byte("hanzo-p2pnet-inference-req-v1\x00"))
+	h.Write(raw)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // InferenceResponse is signed by the serving provider's Ed25519 key.
 type InferenceResponse struct {
 	RequestID         string            `json:"request_id"`
 	ModelID           string            `json:"model_id"`
+	RequestDigest     string            `json:"request_digest"`
+	ClientPeerID      PeerID            `json:"client_peer_id,omitempty"`
+	RequestTimestamp  int64             `json:"request_timestamp,omitempty"`
 	ServedByPeerID    PeerID            `json:"served_by_peer_id"`
 	ServedByPublicKey string            `json:"served_by_public_key"`
 	ViaRelayPeerID    PeerID            `json:"via_relay_peer_id,omitempty"`
@@ -155,6 +182,9 @@ type InferenceResponse struct {
 type unsignedInferenceResponse struct {
 	RequestID         string  `json:"request_id"`
 	ModelID           string  `json:"model_id"`
+	RequestDigest     string  `json:"request_digest"`
+	ClientPeerID      PeerID  `json:"client_peer_id,omitempty"`
+	RequestTimestamp  int64   `json:"request_timestamp,omitempty"`
 	ServedByPeerID    PeerID  `json:"served_by_peer_id"`
 	ServedByPublicKey string  `json:"served_by_public_key"`
 	ViaRelayPeerID    PeerID  `json:"via_relay_peer_id,omitempty"`
@@ -170,6 +200,9 @@ func canonicalInferenceResponseBytes(resp InferenceResponse) ([]byte, error) {
 	u := unsignedInferenceResponse{
 		RequestID:         resp.RequestID,
 		ModelID:           resp.ModelID,
+		RequestDigest:     resp.RequestDigest,
+		ClientPeerID:      resp.ClientPeerID,
+		RequestTimestamp:  resp.RequestTimestamp,
 		ServedByPeerID:    resp.ServedByPeerID,
 		ServedByPublicKey: resp.ServedByPublicKey,
 		ViaRelayPeerID:    resp.ViaRelayPeerID,
@@ -232,7 +265,9 @@ func VerifyInferenceResponse(resp InferenceResponse, expectedPeer PeerID) error 
 
 // VerifyInferenceResponseForRequest validates the serving provider's Ed25519
 // signature and PeerID binding AND cryptographically binds the signed response
-// to the outstanding request's RequestID and ModelID to prevent relay replay.
+// to the complete outstanding request (RequestID, ModelID, PromptTokens,
+// MaxOutputTokens, PromptDigest, and any caller-populated ClientPeerID and
+// Timestamp) to prevent circuit-relay tampering or replay.
 func VerifyInferenceResponseForRequest(resp InferenceResponse, req InferenceRequest, expectedPeer PeerID) error {
 	if err := VerifyInferenceResponse(resp, expectedPeer); err != nil {
 		return err
@@ -242,6 +277,16 @@ func VerifyInferenceResponseForRequest(resp InferenceResponse, req InferenceRequ
 	}
 	if resp.ModelID == "" || resp.ModelID != req.ModelID {
 		return fmt.Errorf("%w: response model_id %q != expected %q", ErrResponseMismatch, resp.ModelID, req.ModelID)
+	}
+	expectedDigest := InferenceRequestDigest(req)
+	if resp.RequestDigest == "" || resp.RequestDigest != expectedDigest {
+		return fmt.Errorf("%w: response request_digest %q != expected %q", ErrResponseMismatch, resp.RequestDigest, expectedDigest)
+	}
+	if req.ClientPeerID != "" && resp.ClientPeerID != req.ClientPeerID {
+		return fmt.Errorf("%w: response client_peer_id %q != expected %q", ErrResponseMismatch, resp.ClientPeerID, req.ClientPeerID)
+	}
+	if req.Timestamp != 0 && resp.RequestTimestamp != req.Timestamp {
+		return fmt.Errorf("%w: response request_timestamp %d != expected %d", ErrResponseMismatch, resp.RequestTimestamp, req.Timestamp)
 	}
 	return nil
 }

@@ -315,6 +315,11 @@ func (n *Node) maintenanceLoop() {
 			}
 			now := n.nowUnix()
 			n.Store.PruneExpired(now)
+			if n.Config.NATMode == NATRelayed {
+				relCtx, cancel := context.WithTimeout(n.ctx, defaultRPCTimeout)
+				n.maintainRelays(relCtx, 2)
+				cancel()
+			}
 			if n.maybeRenewSelfAnnouncement() {
 				pubCtx, cancel := context.WithTimeout(n.ctx, defaultRPCTimeout)
 				n.PublishAnnouncement(pubCtx)
@@ -938,7 +943,7 @@ func (n *Node) handleRPCWithRelay(ctx context.Context, remotePeer PeerID, viaRel
 						continue
 					}
 				}
-				n.Table.UpsertPeer(sanitizeRemotePeerInfo(pi))
+				n.Table.UpsertPeerHint(sanitizeRemotePeerInfo(pi))
 			}
 		}
 		out, _ := json.Marshal(GossipSyncResponse{
@@ -1074,11 +1079,15 @@ func (n *Node) SubmitAnnouncement(ctx context.Context, ann CapabilityAnnouncemen
 
 func (n *Node) executeInference(req InferenceRequest, viaRelay PeerID) (InferenceResponse, error) {
 	start := time.Now()
+	reqDigest := InferenceRequestDigest(req)
 	if n.Config.RogueHijackMode {
 		// Adversarial rogue node simulates a routing hijack under the unverified negative control.
 		resp := InferenceResponse{
 			RequestID:         req.RequestID,
 			ModelID:           req.ModelID,
+			RequestDigest:     reqDigest,
+			ClientPeerID:      req.ClientPeerID,
+			RequestTimestamp:  req.Timestamp,
 			ServedByPeerID:    n.ID.PeerID,
 			ServedByPublicKey: n.ID.PublicKeyHex(),
 			ViaRelayPeerID:    viaRelay,
@@ -1133,15 +1142,18 @@ func (n *Node) executeInference(req InferenceRequest, viaRelay PeerID) (Inferenc
 	}
 
 	resp := InferenceResponse{
-		RequestID:       req.RequestID,
-		ModelID:         req.ModelID,
-		ViaRelayPeerID:  viaRelay,
-		TokensGenerated: tokens,
-		TTFTMs:          ttftMs,
-		TotalLatencyMs:  totalMs,
-		CostMicroUSD:    costMicroUSD,
-		OutputDigest:    hex.EncodeToString(h[:16]),
-		Timestamp:       n.nowUnix(),
+		RequestID:        req.RequestID,
+		ModelID:          req.ModelID,
+		RequestDigest:    reqDigest,
+		ClientPeerID:     req.ClientPeerID,
+		RequestTimestamp: req.Timestamp,
+		ViaRelayPeerID:   viaRelay,
+		TokensGenerated:  tokens,
+		TTFTMs:           ttftMs,
+		TotalLatencyMs:   totalMs,
+		CostMicroUSD:     costMicroUSD,
+		OutputDigest:     hex.EncodeToString(h[:16]),
+		Timestamp:        n.nowUnix(),
 	}
 	return SignInferenceResponse(n.ID, resp)
 }
@@ -1302,10 +1314,11 @@ func (n *Node) callPeerWithSkipRelays(ctx context.Context, peer PeerInfo, req RP
 }
 
 func (n *Node) resolvePeer(id PeerID) (PeerInfo, bool) {
-	if p, ok := n.Table.GetPeer(id); ok {
+	p, inTable := n.Table.GetPeer(id)
+	if inTable && p.LivenessVerified && p.ConsecutiveFailures == 0 && (len(p.Addrs) > 0 || len(p.RelayAddrs) > 0) {
 		return p, true
 	}
-	if ann, ok := n.Store.GetAnnouncement(id, n.nowUnix()); ok {
+	if ann, ok := n.Store.GetAnnouncement(id, n.nowUnix()); ok && (len(ann.Addrs) > 0 || len(ann.RelayAddrs) > 0) {
 		return PeerInfo{
 			PeerID:     ann.PeerID,
 			PublicKey:  ann.PublicKey,
@@ -1315,6 +1328,9 @@ func (n *Node) resolvePeer(id PeerID) (PeerInfo, bool) {
 			NATMode:    ann.NATMode,
 			Role:       ann.Role,
 		}, true
+	}
+	if inTable {
+		return p, true
 	}
 	return PeerInfo{}, false
 }
@@ -1426,6 +1442,95 @@ func (n *Node) serveNATRelayLoop(relayID PeerID, circuitAddr string, conn net.Co
 	}
 }
 
+func (n *Node) relayCandidates() []PeerInfo {
+	seen := make(map[PeerID]PeerInfo)
+	for _, p := range n.Table.AllPeers() {
+		if p.NATMode == NATRelayServer {
+			seen[p.PeerID] = p
+		}
+	}
+	for _, ann := range n.Store.ListAnnouncements(n.nowUnix()) {
+		if ann.PeerID == n.ID.PeerID || ann.NATMode != NATRelayServer {
+			continue
+		}
+		if cur, ok := seen[ann.PeerID]; !ok || (!cur.LivenessVerified && len(ann.Addrs) > 0) {
+			seen[ann.PeerID] = PeerInfo{
+				PeerID:     ann.PeerID,
+				PublicKey:  ann.PublicKey,
+				KeyHash:    PeerKeyHash(ann.PeerID),
+				Addrs:      ann.Addrs,
+				RelayAddrs: ann.RelayAddrs,
+				NATMode:    ann.NATMode,
+				Role:       ann.Role,
+			}
+		}
+	}
+	out := make([]PeerInfo, 0, len(seen))
+	for _, p := range seen {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ConsecutiveFailures != out[j].ConsecutiveFailures {
+			return out[i].ConsecutiveFailures < out[j].ConsecutiveFailures
+		}
+		if out[i].LivenessVerified != out[j].LivenessVerified {
+			return out[i].LivenessVerified
+		}
+		return out[i].PeerID < out[j].PeerID
+	})
+	return out
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (n *Node) maintainRelays(ctx context.Context, targetCount int) {
+	if n.Config.NATMode != NATRelayed {
+		return
+	}
+	if targetCount <= 0 {
+		targetCount = 2
+	}
+	n.mu.RLock()
+	before := len(n.natRelays)
+	n.mu.RUnlock()
+
+	active := before
+	if active < targetCount {
+		for _, p := range n.relayCandidates() {
+			n.mu.RLock()
+			_, has := n.natRelays[p.PeerID]
+			cur := len(n.natRelays)
+			n.mu.RUnlock()
+			if has || cur >= targetCount {
+				continue
+			}
+			if _, err := n.RegisterWithRelay(ctx, p); err == nil {
+				active++
+			}
+		}
+	}
+	if active == 0 {
+		return
+	}
+	ann := n.SelfAnnouncement()
+	curAddrs := n.RelayMultiaddrs()
+	if active != before || !stringSlicesEqual(ann.RelayAddrs, curAddrs) {
+		if _, err := n.RefreshSelfAnnouncement(); err == nil {
+			n.PublishAnnouncement(ctx)
+		}
+	}
+}
+
 // EnsureRelays ensures a NATRelayed node has at least targetCount active
 // circuit-relay reservations, automatically migrating to surviving relay peers
 // from its Kademlia routing table if prior relays died, then refreshes and
@@ -1443,11 +1548,7 @@ func (n *Node) EnsureRelays(ctx context.Context, targetCount int) error {
 	n.mu.RUnlock()
 
 	if active < targetCount {
-		candidates := n.Table.AllPeers()
-		for _, p := range candidates {
-			if p.NATMode != NATRelayServer {
-				continue
-			}
+		for _, p := range n.relayCandidates() {
 			n.mu.RLock()
 			_, has := n.natRelays[p.PeerID]
 			cur := len(n.natRelays)
@@ -1583,7 +1684,7 @@ func (n *Node) FindNode(ctx context.Context, target [32]byte) []PeerInfo {
 						discoveredAny = true
 						mu.Unlock()
 					}
-					n.Table.UpsertPeer(sanitizeRemotePeerInfo(dp))
+					n.Table.UpsertPeerHint(sanitizeRemotePeerInfo(dp))
 				}
 			}(peer)
 		}
@@ -1727,7 +1828,7 @@ func (n *Node) GossipRound(ctx context.Context, fanout int) int {
 							continue
 						}
 					}
-					n.Table.UpsertPeer(sanitizeRemotePeerInfo(dp))
+					n.Table.UpsertPeerHint(sanitizeRemotePeerInfo(dp))
 				}
 			}
 		}(peer)
@@ -1806,7 +1907,7 @@ func (n *Node) FindProviders(ctx context.Context, modelID string) []CapabilityAn
 								continue
 							}
 						}
-						n.Table.UpsertPeer(sanitizeRemotePeerInfo(dp))
+						n.Table.UpsertPeerHint(sanitizeRemotePeerInfo(dp))
 					}
 				}
 			}(peer)

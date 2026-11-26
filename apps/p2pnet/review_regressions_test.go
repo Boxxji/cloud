@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -1062,3 +1063,435 @@ func TestCircuitRelayedInferenceResponseSignatureRemainsValid(t *testing.T) {
 		t.Fatalf("returned RouteResult.Response failed VerifyInferenceResponseForRequest: %v", err)
 	}
 }
+
+// Round-2 Finding 1 regression: a circuit relay that preserves RequestID and
+// ModelID while modifying PromptDigest or MaxOutputTokens before forwarding to
+// an honest provider MUST be rejected by VerifyInferenceResponseForRequest and
+// RouteInference.
+func TestCircuitRelayRequestTamperingRejected(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// Unit-level binding check on PromptDigest and MaxOutputTokens.
+	provID, err := GenerateIdentity(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origReq := InferenceRequest{
+		RequestID:       "req-tamper-1",
+		ModelID:         "model-tamper",
+		PromptTokens:    32,
+		MaxOutputTokens: 8,
+		PromptDigest:    "honest-prompt-digest",
+	}
+	tamperedReq := origReq
+	tamperedReq.PromptDigest = "evil-prompt-digest"
+	tamperedReq.MaxOutputTokens = 1
+
+	respForTampered, err := SignInferenceResponse(provID, InferenceResponse{
+		RequestID:       tamperedReq.RequestID,
+		ModelID:         tamperedReq.ModelID,
+		RequestDigest:   InferenceRequestDigest(tamperedReq),
+		TokensGenerated: 1,
+		TTFTMs:          0.1,
+		TotalLatencyMs:  0.2,
+		CostMicroUSD:    1,
+		OutputDigest:    "abcd1234",
+		Timestamp:       time.Now().Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyInferenceResponseForRequest(respForTampered, origReq, provID.PeerID); !errors.Is(err, ErrResponseMismatch) {
+		t.Fatalf("expected ErrResponseMismatch when relay tampers PromptDigest/MaxOutputTokens, got %v", err)
+	}
+
+	// End-to-end loopback reproduction: a TLS-authenticated relay intercepts
+	// RPCInferRequest, mutates PromptDigest and reduces MaxOutputTokens 8 -> 1,
+	// forwards to the honest provider, and returns the provider's signed reply.
+	tamperRelayID, err := GenerateIdentity(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tamperCert, err := GeneratePeerTLSCert(tamperRelayID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tamperLn, err := tls.Listen("tcp4", "127.0.0.1:0", ServerTLSConfig(tamperCert))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tamperLn.Close() }()
+	tamperAddr := fmt.Sprintf("/ip4/127.0.0.1/tcp/%d/p2p/%s", tamperLn.Addr().(*net.TCPAddr).Port, tamperRelayID.PeerID)
+
+	provider, err := NewNode(NodeConfig{
+		Role:                  RoleProvider,
+		NATMode:               NATRelayed,
+		Policy:                DefaultVerifyPolicy(),
+		HanzoRegistryDisabled: true,
+		Models: []ModelCapability{
+			{ModelID: "model-tamper", MaxContextTokens: 8192, EstTokPerSec: 100, BaseLatencyMs: 5, PriceMicroUSDPer1MTokens: 100000},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer provider.Shutdown()
+
+	var sessMu sync.Mutex
+	sessions := make(map[PeerID]*relaySession)
+
+	go func() {
+		for {
+			conn, err := tamperLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				tlsConn := c.(*tls.Conn)
+				if err := tlsConn.Handshake(); err != nil {
+					_ = c.Close()
+					return
+				}
+				env, _, err := readFrame(c)
+				if err != nil {
+					_ = c.Close()
+					return
+				}
+				switch env.Type {
+				case RPCRelayRegister:
+					circuitAddr := FormatCircuitMultiaddr(tamperRelayID.PeerID, env.FromPeer)
+					payload, _ := json.Marshal(RelayRegisterResponse{Accepted: true, CircuitAddr: circuitAddr})
+					_, _ = writeFrame(c, RPCEnvelope{
+						RequestID: env.RequestID,
+						Type:      env.Type,
+						FromPeer:  tamperRelayID.PeerID,
+						ToPeer:    env.FromPeer,
+						Payload:   payload,
+					})
+					sessMu.Lock()
+					sessions[env.FromPeer] = &relaySession{peerID: env.FromPeer, conn: c}
+					sessMu.Unlock()
+				case RPCRelayForward:
+					defer func() { _ = c.Close() }()
+					var rf RelayForwardRequest
+					if err := json.Unmarshal(env.Payload, &rf); err != nil {
+						return
+					}
+					// Tamper with PromptDigest and MaxOutputTokens while preserving RequestID and ModelID!
+					if rf.Inner.Type == RPCInferRequest {
+						var ireq InferenceRequest
+						if err := json.Unmarshal(rf.Inner.Payload, &ireq); err == nil {
+							ireq.PromptDigest = "relay-tampered-prompt"
+							ireq.MaxOutputTokens = 1
+							rf.Inner.Payload, _ = json.Marshal(ireq)
+						}
+					}
+					sessMu.Lock()
+					sess := sessions[rf.TargetPeer]
+					sessMu.Unlock()
+					if sess == nil {
+						return
+					}
+					fwdResp, _, _, err := sess.forward(ctx, rf.Inner)
+					if err != nil {
+						return
+					}
+					out, _ := json.Marshal(fwdResp)
+					_, _ = writeFrame(c, RPCEnvelope{
+						RequestID: env.RequestID,
+						Type:      env.Type,
+						FromPeer:  tamperRelayID.PeerID,
+						ToPeer:    env.FromPeer,
+						Payload:   out,
+					})
+				default:
+					_ = c.Close()
+				}
+			}(conn)
+		}
+	}()
+
+	tamperPeer := PeerInfo{
+		PeerID:           tamperRelayID.PeerID,
+		PublicKey:        tamperRelayID.PublicKeyHex(),
+		Addrs:            []string{tamperAddr},
+		NATMode:          NATRelayServer,
+		Role:             RoleRelay,
+		LivenessVerified: true,
+	}
+	if _, err := provider.RegisterWithRelay(ctx, tamperPeer); err != nil {
+		t.Fatalf("RegisterWithRelay(tamperRelay): %v", err)
+	}
+	ann, err := provider.RefreshSelfAnnouncement()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := NewNode(NodeConfig{
+		Role:                  RoleClient,
+		NATMode:               NATDirect,
+		Policy:                DefaultVerifyPolicy(),
+		HanzoRegistryDisabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer client.Shutdown()
+	client.Table.UpsertPeer(tamperPeer)
+	if err := client.IngestAnnouncement(ann, tamperRelayID.PeerID, true); err != nil {
+		t.Fatal(err)
+	}
+
+	// RouteInference must reject the honest provider's response to the relay-tampered request!
+	if _, err := client.RouteInference(ctx, InferenceRequest{
+		RequestID:       "req-e2e-tamper",
+		ModelID:         "model-tamper",
+		PromptTokens:    32,
+		MaxOutputTokens: 8,
+		PromptDigest:    "honest-client-prompt",
+	}); err == nil {
+		t.Fatalf("expected RouteInference to reject relay-tampered PromptDigest/MaxOutputTokens")
+	}
+}
+
+// Round-2 Finding 2 regression: an arbitrary TLS-authenticated neighbor sending
+// GOSSIP_SYNC.Peers with a live relay's PeerID/PublicKey and a bogus TCP address
+// MUST NOT overwrite the validated relay endpoint or break inference routing.
+func TestGossipSyncCannotPoisonValidatedRelayEndpoint(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	relay, err := NewNode(NodeConfig{
+		Role:                  RoleRelay,
+		NATMode:               NATRelayServer,
+		Policy:                DefaultVerifyPolicy(),
+		HanzoRegistryDisabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := relay.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Shutdown()
+
+	provider, err := NewNode(NodeConfig{
+		Role:                  RoleProvider,
+		NATMode:               NATRelayed,
+		Policy:                DefaultVerifyPolicy(),
+		HanzoRegistryDisabled: true,
+		Models: []ModelCapability{
+			{ModelID: "gossip-guard-model", MaxContextTokens: 8192, EstTokPerSec: 100, BaseLatencyMs: 5, PriceMicroUSDPer1MTokens: 100000},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer provider.Shutdown()
+
+	client, err := NewNode(NodeConfig{
+		Role:                  RoleClient,
+		NATMode:               NATDirect,
+		Policy:                DefaultVerifyPolicy(),
+		HanzoRegistryDisabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer client.Shutdown()
+
+	attacker, err := NewNode(NodeConfig{
+		Role:                  RoleClient,
+		NATMode:               NATDirect,
+		Policy:                DefaultVerifyPolicy(),
+		HanzoRegistryDisabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := attacker.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer attacker.Shutdown()
+
+	seeds := []PeerInfo{relay.PeerInfo()}
+	if err := provider.Bootstrap(ctx, seeds); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Bootstrap(ctx, seeds); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify baseline relayed inference works.
+	if _, err := client.RouteInference(ctx, InferenceRequest{
+		ModelID:      "gossip-guard-model",
+		PromptDigest: "before-poison",
+	}); err != nil {
+		t.Fatalf("baseline RouteInference failed: %v", err)
+	}
+
+	// Attacker sends GOSSIP_SYNC.Peers containing relay's genuine PeerID/PublicKey
+	// paired with a bogus dead TCP address.
+	poisonedRelay := PeerInfo{
+		PeerID:           relay.ID.PeerID,
+		PublicKey:        relay.ID.PublicKeyHex(),
+		Addrs:            []string{fmt.Sprintf("/ip4/127.0.0.1/tcp/1/p2p/%s", relay.ID.PeerID)},
+		NATMode:          NATRelayServer,
+		Role:             RoleRelay,
+		LivenessVerified: true,
+	}
+	gossipPayload, _ := json.Marshal(GossipSyncRequest{
+		Peers: []PeerInfo{poisonedRelay},
+	})
+	if _, _, _, err := attacker.callPeer(ctx, client.PeerInfo(), RPCEnvelope{
+		Type:    RPCGossipSync,
+		Payload: gossipPayload,
+	}); err != nil {
+		t.Fatalf("attacker GOSSIP_SYNC RPC failed: %v", err)
+	}
+
+	// Client must retain the validated relay endpoint and route inference cleanly.
+	gotRelay, ok := client.resolvePeer(relay.ID.PeerID)
+	if !ok {
+		t.Fatalf("expected relay peer to remain resolvable")
+	}
+	realHP, _ := relay.PeerInfo().PrimaryTCPAddr()
+	gotHP, _ := gotRelay.PrimaryTCPAddr()
+	if gotHP != realHP {
+		t.Fatalf("relay endpoint was poisoned by gossip: got %s, want %s", gotHP, realHP)
+	}
+	if _, err := client.RouteInference(ctx, InferenceRequest{
+		ModelID:      "gossip-guard-model",
+		PromptDigest: "after-poison",
+	}); err != nil {
+		t.Fatalf("RouteInference broken after gossip poison attempt: %v", err)
+	}
+}
+
+// Round-2 Finding 3 regression: a NATRelayed node using the normal Start/Bootstrap
+// lifecycle MUST automatically recover lost circuit-relay reservations and
+// republish its announcement from maintenanceLoop without manual EnsureRelays.
+func TestMaintenanceLoopRestoresLostNATRelayReservations(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	relay1, err := NewNode(NodeConfig{
+		Role:                  RoleRelay,
+		NATMode:               NATRelayServer,
+		Policy:                DefaultVerifyPolicy(),
+		HanzoRegistryDisabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := relay1.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	relay2, err := NewNode(NodeConfig{
+		Role:                  RoleRelay,
+		NATMode:               NATRelayServer,
+		Policy:                DefaultVerifyPolicy(),
+		HanzoRegistryDisabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := relay2.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer relay2.Shutdown()
+
+	provider, err := NewNode(NodeConfig{
+		Role:                  RoleProvider,
+		NATMode:               NATRelayed,
+		Policy:                DefaultVerifyPolicy(),
+		HanzoRegistryDisabled: true,
+		MaintenanceInterval:   15 * time.Millisecond,
+		Models: []ModelCapability{
+			{ModelID: "auto-relay-recover", MaxContextTokens: 8192, EstTokPerSec: 100, BaseLatencyMs: 5, PriceMicroUSDPer1MTokens: 100000},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer provider.Shutdown()
+
+	// Bootstrap provider with only relay1 initially so it has a single active tunnel.
+	if err := provider.Bootstrap(ctx, []PeerInfo{relay1.PeerInfo()}); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.RelayMultiaddrs()) != 1 {
+		t.Fatalf("expected 1 initial relay addr, got %v", provider.RelayMultiaddrs())
+	}
+
+	// Make relay2 known in provider's routing table AFTER initial single-relay registration,
+	// then kill relay1 so provider loses ALL active reservations.
+	provider.Table.UpsertPeer(relay2.PeerInfo())
+	relay1.Shutdown()
+
+	// Do NOT call EnsureRelays manually: maintenanceLoop must automatically
+	// register on relay2 and republish the updated announcement!
+	wantCircuit := FormatCircuitMultiaddr(relay2.ID.PeerID, provider.ID.PeerID)
+	deadline := time.Now().Add(5 * time.Second)
+	recovered := false
+	for time.Now().Before(deadline) {
+		for _, a := range provider.RelayMultiaddrs() {
+			if a == wantCircuit {
+				recovered = true
+				break
+			}
+		}
+		if recovered {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !recovered {
+		t.Fatalf("maintenanceLoop failed to automatically restore relay reservation on relay2 (addrs=%v)", provider.RelayMultiaddrs())
+	}
+
+	client, err := NewNode(NodeConfig{
+		Role:                  RoleClient,
+		NATMode:               NATDirect,
+		Policy:                DefaultVerifyPolicy(),
+		HanzoRegistryDisabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer client.Shutdown()
+	if err := client.Bootstrap(ctx, []PeerInfo{relay2.PeerInfo()}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := client.RouteInference(ctx, InferenceRequest{
+		ModelID:      "auto-relay-recover",
+		PromptDigest: "recovered-automatically",
+	})
+	if err != nil {
+		t.Fatalf("RouteInference after automatic maintenance relay recovery failed: %v", err)
+	}
+	if !res.UsedRelay || res.RelayPeerID != relay2.ID.PeerID {
+		t.Fatalf("expected route via relay2 %s, got used=%v relay=%s", relay2.ID.PeerID, res.UsedRelay, res.RelayPeerID)
+	}
+}
+
