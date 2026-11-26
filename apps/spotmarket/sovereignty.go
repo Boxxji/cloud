@@ -99,6 +99,7 @@ func gossipStateRoot(s GossipSnapshot) [32]byte {
 	writeUint64(&buf, uint64(len(telKeys)))
 	for _, k := range telKeys {
 		t := s.Telemetry[k]
+		writeLenPrefixed(&buf, k)
 		writeLenPrefixed(&buf, t.ProviderID)
 		writeUint64(&buf, math.Float64bits(t.MeasuredTTFTMs))
 		writeUint64(&buf, math.Float64bits(t.MeasuredLatencyMs))
@@ -377,6 +378,11 @@ func VerifyExportBundle(bundle MarketExportBundle) error {
 	expectedRoot := gossipStateRoot(bundle.Gossip)
 	if hex.EncodeToString(expectedRoot[:]) != bundle.Gossip.StateRootHex {
 		return fmt.Errorf("%w: gossip state root mismatch", ErrInvalidExportBundle)
+	}
+	for k, t := range bundle.Gossip.Telemetry {
+		if strings.TrimSpace(k) == "" || k != t.ProviderID {
+			return fmt.Errorf("%w: telemetry key %q does not match providerId %q", ErrInvalidExportBundle, k, t.ProviderID)
+		}
 	}
 
 	// Verify non-negative balances and exact ledger conservation independently

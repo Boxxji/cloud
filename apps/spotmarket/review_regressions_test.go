@@ -887,3 +887,298 @@ func TestSimLatencyUnitsCompletionAndFailoverFailureModel(t *testing.T) {
 			rep.FixedBaseline.LatencyP50Ms, rep.PrimarySpot.LatencyP50Ms)
 	}
 }
+
+func TestHTTPRejectsBuyerUnilateralSlashing(t *testing.T) {
+	now := int64(1760000000)
+	m := NewMarket(DefaultConfig())
+	kpProv, err := DeriveKeyPair("r2-slash-prov", 201, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kpExp, err := DeriveKeyPair("r2-slash-exp", 201, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.DepositBuyer("org-buyer", 50_000_000); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.DepositProviderWithKey("prov-honest", kpProv.PubKeyHex, 50_000_000); err != nil {
+		t.Fatal(err)
+	}
+
+	so := testOffer(t, kpProv, "off-slash-guard", "prov-honest", "independent", 400_000, now, 1)
+	if err := m.RegisterOffer(so, now); err != nil {
+		t.Fatal(err)
+	}
+
+	makeActiveLease := func(orderID, bidID string, nonce uint64) string {
+		t.Helper()
+		ord := Order{
+			OrderID:                orderID,
+			BuyerID:                "org-buyer",
+			Model:                  "llama-3.3-70b",
+			RequestedTokens:        500_000,
+			MinVRAMGB:              80,
+			MaxMicroUSDPer1MTokens: 600_000,
+			CreatedAtUnix:          now,
+			ExpiresAtUnix:          now + 600,
+		}
+		if err := m.SubmitOrder(ord, now); err != nil {
+			t.Fatal(err)
+		}
+		sb, err := SignBid(kpProv.PrivateKey, Bid{
+			ProtocolVersion:        ProtocolVersion,
+			BidID:                  bidID,
+			OrderID:                orderID,
+			OfferID:                so.Offer.OfferID,
+			ProviderID:             "prov-honest",
+			ProviderPubKeyHex:      kpProv.PubKeyHex,
+			BidMicroUSDPer1MTokens: 400_000,
+			OfferedTokens:          500_000,
+			CommittedVRAMGB:        80,
+			BondMicroUSD:           200_000,
+			IssuedAtUnix:           now,
+			ExpiresAtUnix:          now + 600,
+			Nonce:                  nonce,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := m.SubmitBid(sb, now); err != nil {
+			t.Fatal(err)
+		}
+		leases, _, err := m.ClearOrder(orderID, now)
+		if err != nil || len(leases) != 1 {
+			t.Fatalf("ClearOrder(%s): leases=%d err=%v", orderID, len(leases), err)
+		}
+		return leases[0].LeaseID
+	}
+
+	leaseZip := makeActiveLease("ord-slash-zip", "bid-slash-zip", 101)
+	leaseStd := makeActiveLease("ord-slash-std", "bid-slash-std", 102)
+
+	srv, err := NewServer(m, kpExp.PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.Now = func() int64 { return now }
+
+	app := zip.New(zip.Config{Logger: luxlog.New("test")})
+	if err := Mount(app, luxlog.New("test"), srv); err != nil {
+		t.Fatal(err)
+	}
+
+	doZip := func(path string, body map[string]any, user, org string, admin bool) (int, []byte) {
+		t.Helper()
+		raw, _ := json.Marshal(body)
+		req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(raw))
+		req.Header.Set("Content-Type", "application/json")
+		if user != "" {
+			req.Header.Set("X-User-Id", user)
+		}
+		if org != "" {
+			req.Header.Set("X-Org-Id", org)
+		}
+		if admin {
+			req.Header.Set("X-User-IsAdmin", "true")
+		}
+		resp, err := app.Test(req, zip.TestConfig{Timeout: 10 * time.Second, FailOnTimeout: true})
+		if err != nil {
+			t.Fatalf("app.Test %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		out, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, out
+	}
+
+	// Buyer cannot unilaterally slash via BaitAndSwitchPriceAttempted, non-delivery,
+	// partial delivery, inflated reported rate, or SLA breach on ZIP surface.
+	hostileReports := []map[string]any{
+		{"deliveredTokens": 500_000, "observedTtftMs": 80.0, "observedTokPerSec": 120.0, "completed": true, "baitAndSwitchPriceAttempted": true},
+		{"deliveredTokens": 500_000, "observedTtftMs": 80.0, "observedTokPerSec": 120.0, "completed": true, "reportedMicroUsdPer1MTokens": 999_999},
+		{"deliveredTokens": 0, "completed": false},
+		{"deliveredTokens": 250_000, "observedTtftMs": 80.0, "observedTokPerSec": 120.0, "completed": true},
+		{"deliveredTokens": 500_000, "observedTtftMs": 5000.0, "observedTokPerSec": 120.0, "completed": true},
+		{"deliveredTokens": 500_000, "observedTtftMs": 80.0, "observedTokPerSec": 1.0, "completed": true},
+	}
+	for i, rep := range hostileReports {
+		if code, b := doZip("/v1/spotmarket/leases/"+leaseZip+"/settle", rep, "buyer-user", "org-buyer", false); code != http.StatusForbidden {
+			t.Fatalf("case %d: buyer unilateral slashing on zip: want 403, got %d (%s)", i, code, string(b))
+		}
+	}
+
+	// Standalone net/http surface also blocks buyer unilateral slashing.
+	srvStd, err := NewServer(m, kpExp.PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srvStd.Now = func() int64 { return now }
+	srvStd.Acting = func(_ context.Context) (string, error) { return "org-buyer", nil }
+	h := srvStd.Handler()
+	rawBait, _ := json.Marshal(hostileReports[0])
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/spotmarket/leases/"+leaseStd+"/settle", bytes.NewReader(rawBait)))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("buyer unilateral slashing on net/http: want 403, got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	// Independently authorized settlement reporter (admin) CAN apply verified slashing.
+	if code, b := doZip("/v1/spotmarket/leases/"+leaseZip+"/settle", hostileReports[0], "settlement-verifier", "verifier-org", true); code != http.StatusOK {
+		t.Fatalf("independent settlement reporter slashing: want 200, got %d (%s)", code, string(b))
+	}
+
+	// Buyer CAN still confirm honest full delivery on leaseStd (zero slashing).
+	honestRaw, _ := json.Marshal(map[string]any{
+		"deliveredTokens":   500_000,
+		"observedTtftMs":    85.0,
+		"observedLatencyMs": computeGenerationLatencyMs(85.0, 500_000, 125.0),
+		"observedTokPerSec": 125.0,
+		"completed":         true,
+	})
+	recHonest := httptest.NewRecorder()
+	h.ServeHTTP(recHonest, httptest.NewRequest(http.MethodPost, "/v1/spotmarket/leases/"+leaseStd+"/settle", bytes.NewReader(honestRaw)))
+	if recHonest.Code != http.StatusOK {
+		t.Fatalf("buyer honest full-delivery settle: want 200, got %d (%s)", recHonest.Code, recHonest.Body.String())
+	}
+	if err := m.CheckConservation(); err != nil {
+		t.Fatalf("conservation drift: %v", err)
+	}
+}
+
+func TestExportBundleRejectsRekeyedTelemetry(t *testing.T) {
+	now := int64(1760000000)
+	m := NewMarket(DefaultConfig())
+	kpHonest, err := DeriveKeyPair("r2-tel-honest", 202, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kpAdv, err := DeriveKeyPair("r2-tel-adv", 202, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kpExp, err := DeriveKeyPair("r2-tel-exp", 202, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.DepositProviderWithKey("prov-a-honest", kpHonest.PubKeyHex, 1_000_000); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.DepositProviderWithKey("prov-b-adv", kpAdv.PubKeyHex, 1_000_000); err != nil {
+		t.Fatal(err)
+	}
+
+	soHonest := testOffer(t, kpHonest, "off-honest", "prov-a-honest", "independent", 400_000, now, 1)
+	soAdv := testOffer(t, kpAdv, "off-adv", "prov-b-adv", "independent", 400_000, now, 1)
+	if err := m.RegisterOffer(soHonest, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RegisterOffer(soAdv, now); err != nil {
+		t.Fatal(err)
+	}
+
+	bundle, err := m.ExportBundle(kpExp.PrivateKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyExportBundle(bundle); err != nil {
+		t.Fatalf("clean bundle failed verify: %v", err)
+	}
+
+	// Re-key telemetry map while preserving sorted key order (a < b):
+	// "prov-a-honest" -> "prov-a-rekeyed", "prov-b-adv" -> "prov-z-rekeyed"
+	// leaves value order identical, testing that gossipStateRoot commits map keys!
+	rekeyed := bundle
+	rekeyed.Gossip.Telemetry = map[string]ProviderTelemetry{
+		"prov-a-rekeyed": bundle.Gossip.Telemetry["prov-a-honest"],
+		"prov-z-rekeyed": bundle.Gossip.Telemetry["prov-b-adv"],
+	}
+	if err := VerifyExportBundle(rekeyed); !errors.Is(err, ErrInvalidExportBundle) {
+		t.Fatalf("expected VerifyExportBundle to reject re-keyed telemetry, got %v", err)
+	}
+	if _, err := ImportBundle(rekeyed, DefaultConfig(), now); !errors.Is(err, ErrInvalidExportBundle) {
+		t.Fatalf("expected ImportBundle to reject re-keyed telemetry, got %v", err)
+	}
+}
+
+func TestClearOrderRejectsExpiredOrderAndReleasesFunds(t *testing.T) {
+	m := NewMarket(DefaultConfig())
+	kp, err := DeriveKeyPair("r2-exp-prov", 203, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.DepositBuyer("buyer-exp", 10_000_000); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.DepositProviderWithKey("prov-exp", kp.PubKeyHex, 10_000_000); err != nil {
+		t.Fatal(err)
+	}
+
+	so := testOffer(t, kp, "off-exp", "prov-exp", "independent", 400_000, 100, 1)
+	if err := m.RegisterOffer(so, 100); err != nil {
+		t.Fatal(err)
+	}
+
+	ord := Order{
+		OrderID:                "ord-exp-1",
+		BuyerID:                "buyer-exp",
+		Model:                  "llama-3.3-70b",
+		RequestedTokens:        1_000_000,
+		MinVRAMGB:              80,
+		MaxMicroUSDPer1MTokens: 600_000,
+		CreatedAtUnix:          100,
+		ExpiresAtUnix:          110,
+	}
+	if err := m.SubmitOrder(ord, 100); err != nil {
+		t.Fatal(err)
+	}
+	sb, err := SignBid(kp.PrivateKey, Bid{
+		ProtocolVersion:        ProtocolVersion,
+		BidID:                  "bid-exp-1",
+		OrderID:                ord.OrderID,
+		OfferID:                so.Offer.OfferID,
+		ProviderID:             "prov-exp",
+		ProviderPubKeyHex:      kp.PubKeyHex,
+		BidMicroUSDPer1MTokens: 400_000,
+		OfferedTokens:          1_000_000,
+		CommittedVRAMGB:        80,
+		BondMicroUSD:           200_000,
+		IssuedAtUnix:           100,
+		ExpiresAtUnix:          1000,
+		Nonce:                  1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SubmitBid(sb, 100); err != nil {
+		t.Fatal(err)
+	}
+
+	// ClearOrder at t=111 (after order expiry at 110, while offer/bid expire at 1000)
+	// WITHOUT calling ExpireStale must reject the order and refund escrow + unlock bond.
+	leases, _, err := m.ClearOrder(ord.OrderID, 111)
+	if !errors.Is(err, ErrExpiredOrder) {
+		t.Fatalf("expected ErrExpiredOrder on expired order clear, got leases=%d err=%v", len(leases), err)
+	}
+	if len(leases) != 0 {
+		t.Fatalf("expected 0 leases awarded for expired order, got %d", len(leases))
+	}
+	snap := m.LedgerSnapshot()
+	if snap.BuyerEscrow["buyer-exp"] != 0 || snap.BuyerBalances["buyer-exp"] != 10_000_000 {
+		t.Fatalf("buyer escrow not refunded cleanly: escrow=%d bal=%d", snap.BuyerEscrow["buyer-exp"], snap.BuyerBalances["buyer-exp"])
+	}
+	if snap.ProviderLockedBonds["prov-exp"] != 0 || snap.ProviderBalances["prov-exp"] != 10_000_000 {
+		t.Fatalf("provider bond not unlocked cleanly: locked=%d bal=%d", snap.ProviderLockedBonds["prov-exp"], snap.ProviderBalances["prov-exp"])
+	}
+	if err := m.CheckConservation(); err != nil {
+		t.Fatalf("conservation drift after expired order clear: %v", err)
+	}
+	// Calling ExpireStale afterward must not double-refund.
+	if n := m.ExpireStale(112); n != 0 {
+		t.Fatalf("expected 0 additional expiries, got %d", n)
+	}
+	if err := m.CheckConservation(); err != nil {
+		t.Fatalf("conservation drift after follow-up ExpireStale: %v", err)
+	}
+}
+

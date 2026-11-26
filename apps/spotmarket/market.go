@@ -758,6 +758,10 @@ func (m *Market) ClearOrder(orderID string, nowUnix int64) ([]Lease, []Rejection
 	if m.orderCleared[orderID] {
 		return nil, nil, fmt.Errorf("%w: order %s already cleared", ErrInvalidOrder, orderID)
 	}
+	if order.ExpiresAtUnix <= nowUnix {
+		m.expireOrderLocked(orderID, order)
+		return nil, nil, fmt.Errorf("%w: order %s expired at %d (now %d)", ErrExpiredOrder, orderID, order.ExpiresAtUnix, nowUnix)
+	}
 
 	bids := m.bidsByOrder[orderID]
 	candidates := make([]Candidate, 0, len(bids))
@@ -1279,20 +1283,24 @@ func (m *Market) ExpireStale(nowUnix int64) int {
 		if m.orderCleared[orderID] || ord.ExpiresAtUnix > nowUnix {
 			continue
 		}
-		for _, sb := range m.bidsByOrder[orderID] {
-			if sb.Bid.BondMicroUSD > 0 {
-				m.providerLockedBonds[sb.Bid.ProviderID] -= sb.Bid.BondMicroUSD
-				m.providerBalances[sb.Bid.ProviderID] += sb.Bid.BondMicroUSD
-			}
-		}
-		if ord.EscrowMicroUSD > 0 {
-			m.buyerEscrow[ord.BuyerID] -= ord.EscrowMicroUSD
-			m.buyerBalances[ord.BuyerID] += ord.EscrowMicroUSD
-		}
-		m.orderCleared[orderID] = true
+		m.expireOrderLocked(orderID, ord)
 		expired++
 	}
 	return expired
+}
+
+func (m *Market) expireOrderLocked(orderID string, ord Order) {
+	for _, sb := range m.bidsByOrder[orderID] {
+		if sb.Bid.BondMicroUSD > 0 {
+			m.providerLockedBonds[sb.Bid.ProviderID] -= sb.Bid.BondMicroUSD
+			m.providerBalances[sb.Bid.ProviderID] += sb.Bid.BondMicroUSD
+		}
+	}
+	if ord.EscrowMicroUSD > 0 {
+		m.buyerEscrow[ord.BuyerID] -= ord.EscrowMicroUSD
+		m.buyerBalances[ord.BuyerID] += ord.EscrowMicroUSD
+	}
+	m.orderCleared[orderID] = true
 }
 
 // Order returns a copy of an order by ID.

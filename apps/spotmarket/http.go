@@ -40,6 +40,13 @@ type Server struct {
 	// and requires a validated platform-admin caller (401 if unauthenticated,
 	// 403 if non-admin) so a multi-org tenant cannot inspect another org's state.
 	AuthorizeExport func(ctx context.Context) error
+
+	// AuthorizeSettlement optionally validates settlement authority and
+	// evidence for POST /v1/spotmarket/leases/:id/settle. When nil, an
+	// independently authorized settlement reporter (validated admin caller)
+	// may submit any verified settlement report, while a lease's owning buyer
+	// may only confirm full honest delivery (no slashing or escrow clawback).
+	AuthorizeSettlement func(ctx context.Context, lease Lease, rep DeliveryReport) error
 }
 
 // NewServer constructs a dual-surface HTTP Server backed by m. If signer is
@@ -151,19 +158,69 @@ func (s *Server) clearOrderAuthorized(ctx context.Context, orderID string) ([]Le
 	return leases, rejections, nil
 }
 
-func (s *Server) settleLeaseAuthorized(ctx context.Context, leaseID string, rep DeliveryReport) (SettlementReceipt, error) {
-	owner, err := s.acting(ctx)
-	if err != nil {
-		return SettlementReceipt{}, err
+// settlementRequiresIndependentReporter reports whether rep would penalize the
+// provider via bond slashing or escrow clawback (bait-and-switch, non-delivery,
+// partial delivery, or SLA breach) rather than confirming full honest delivery.
+func settlementRequiresIndependentReporter(lease Lease, rep DeliveryReport) bool {
+	if rep.BaitAndSwitchPriceAttempted {
+		return true
 	}
+	if rep.ReportedMicroUSDPer1MTokens > 0 && rep.ReportedMicroUSDPer1MTokens > lease.AgreedMicroUSDPer1MTokens {
+		return true
+	}
+	if !rep.Completed || rep.DeliveredTokens < lease.AllocatedTokens {
+		return true
+	}
+	if lease.TargetTTFTMs > 0 && !(rep.ObservedTTFTMs > 0 && rep.ObservedTTFTMs <= float64(lease.TargetTTFTMs)) {
+		return true
+	}
+	if lease.MinThroughputTokPerSec > 0 && !(rep.ObservedTokPerSec >= lease.MinThroughputTokPerSec) {
+		return true
+	}
+	return false
+}
+
+func (s *Server) settleLeaseAuthorized(ctx context.Context, leaseID string, rep DeliveryReport) (SettlementReceipt, error) {
+	rep.LeaseID = leaseID
+	if s.AuthorizeSettlement != nil {
+		lease, ok := s.Market.Lease(leaseID)
+		if !ok {
+			return SettlementReceipt{}, zip.ErrNotFound("lease not found")
+		}
+		if err := s.AuthorizeSettlement(ctx, lease, rep); err != nil {
+			return SettlementReceipt{}, err
+		}
+		rcpt, err := s.Market.SettleLease(leaseID, rep, s.nowUnix())
+		if err != nil {
+			return SettlementReceipt{}, httpErrorFor(err)
+		}
+		return rcpt, nil
+	}
+
+	c := zip.CallerOf(ctx)
+	isIndependentReporter := strings.TrimSpace(c.User) != "" && c.Admin
+	var owner string
+	if !isIndependentReporter {
+		var err error
+		owner, err = s.acting(ctx)
+		if err != nil {
+			return SettlementReceipt{}, err
+		}
+	}
+
 	lease, ok := s.Market.Lease(leaseID)
 	if !ok {
 		return SettlementReceipt{}, zip.ErrNotFound("lease not found")
 	}
-	if lease.BuyerID != owner {
-		return SettlementReceipt{}, zip.ErrForbidden("lease belongs to another principal")
+	if !isIndependentReporter {
+		if lease.BuyerID != owner {
+			return SettlementReceipt{}, zip.ErrForbidden("lease belongs to another principal")
+		}
+		if settlementRequiresIndependentReporter(lease, rep) {
+			return SettlementReceipt{}, zip.ErrForbidden("slashing or clawback settlement requires verified evidence or an independently authorized settlement reporter")
+		}
 	}
-	rep.LeaseID = leaseID
+
 	rcpt, err := s.Market.SettleLease(leaseID, rep, s.nowUnix())
 	if err != nil {
 		return SettlementReceipt{}, httpErrorFor(err)
