@@ -312,8 +312,73 @@ func randomHexID() string {
 	return "0x" + hex.EncodeToString(b[:])
 }
 
+// eip712HashString encodes a Solidity EIP-712 `string` value as keccak256(bytes(s)).
+func eip712HashString(s string) [32]byte {
+	return Keccak256Bytes([]byte(s))
+}
+
+// eip712WordAddress encodes an EVM `address` as a 32-byte big-endian ABI word (12 zero bytes || 20 address bytes).
+func eip712WordAddress(addr string) [32]byte {
+	var word [32]byte
+	if raw, err := decodeAddressBytes(addr); err == nil {
+		copy(word[12:], raw[:])
+	}
+	return word
+}
+
+// eip712WordUint64 encodes a `uint64` as a 32-byte big-endian ABI word.
+func eip712WordUint64(v uint64) [32]byte {
+	var word [32]byte
+	binary.BigEndian.PutUint64(word[24:], v)
+	return word
+}
+
+// eip712WordInt64 encodes a signed `int64` as a sign-extended 32-byte big-endian two's-complement ABI word.
+func eip712WordInt64(v int64) [32]byte {
+	var word [32]byte
+	if v < 0 {
+		for i := 0; i < 24; i++ {
+			word[i] = 0xff
+		}
+	}
+	binary.BigEndian.PutUint64(word[24:], uint64(v))
+	return word
+}
+
+// eip712WordUint8 encodes a `uint8` as a 32-byte big-endian ABI word.
+func eip712WordUint8(v uint8) [32]byte {
+	var word [32]byte
+	word[31] = v
+	return word
+}
+
+// eip712EncodeStruct computes keccak256(typeHash || word_0 || ... || word_{n-1})
+// per EIP-712 encodeData / hashStruct specification.
+func eip712EncodeStruct(typeHash [32]byte, words ...[32]byte) [32]byte {
+	h := sha3.NewLegacyKeccak256()
+	_, _ = h.Write(typeHash[:])
+	for i := range words {
+		_, _ = h.Write(words[i][:])
+	}
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out
+}
+
+// eip712HashStringSlice encodes a `string[]` per EIP-712 as keccak256(concat(keccak256(s_i))).
+func eip712HashStringSlice(items []string) [32]byte {
+	h := sha3.NewLegacyKeccak256()
+	for _, s := range items {
+		elem := eip712HashString(s)
+		_, _ = h.Write(elem[:])
+	}
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out
+}
+
 // hashStrings deterministically hashes an ordered list of strings with length prefixing
-// so concatenation ambiguities ("a","bc" vs "ab","c") are impossible.
+// so concatenation ambiguities ("a","bc" vs "ab","c") are impossible (used for internal IDs).
 func hashStrings(items ...string) [32]byte {
 	h := sha3.NewLegacyKeccak256()
 	var lenBuf [8]byte
@@ -327,14 +392,22 @@ func hashStrings(items ...string) [32]byte {
 	return out
 }
 
+var endpointDescriptorTypeHash = Keccak256Bytes([]byte(
+	"EndpointDescriptor(string protocol,string url,string version,string authScheme,bytes32 capabilitiesHash)",
+))
+
 func hashEndpoints(eps []EndpointDescriptor) [32]byte {
 	h := sha3.NewLegacyKeccak256()
-	var lenBuf [8]byte
-	binary.BigEndian.PutUint64(lenBuf[:], uint64(len(eps)))
-	_, _ = h.Write(lenBuf[:])
 	for _, ep := range eps {
-		capsHash := hashStrings(ep.Capabilities...)
-		entry := hashStrings(ep.Protocol, ep.URL, ep.Version, ep.AuthScheme, hex.EncodeToString(capsHash[:]))
+		capsHash := eip712HashStringSlice(ep.Capabilities)
+		entry := eip712EncodeStruct(
+			endpointDescriptorTypeHash,
+			eip712HashString(ep.Protocol),
+			eip712HashString(ep.URL),
+			eip712HashString(ep.Version),
+			eip712HashString(ep.AuthScheme),
+			capsHash,
+		)
 		_, _ = h.Write(entry[:])
 	}
 	var out [32]byte

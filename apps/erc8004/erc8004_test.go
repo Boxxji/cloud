@@ -579,13 +579,26 @@ func TestAdversarialTrustProbes(t *testing.T) {
 	}
 
 	// Probe 8: Direct self-feedback by agent owner rejected.
+	selfPayTx := Keccak256Hex([]byte("self-tx"))
+	if err := svc.Identity.RecordVerifiedPayment(PaymentAuthReceipt{
+		AgentID:       ag.AgentID,
+		DelegationID:  grant.DelegationID,
+		PayerAddress:  actors.owner.Address(),
+		PayeeAddress:  actors.delegate.Address(),
+		AmountAtomic:  10000,
+		Asset:         "USDC",
+		PaymentTxHash: selfPayTx,
+		AuthorizedAt:  now,
+	}); err != nil {
+		t.Fatalf("RecordVerifiedPayment (self test setup): %v", err)
+	}
 	selfReceipt := signWorkReceipt(t, domain, actors.delegate, actors.owner, WorkReceipt{
 		ReceiptID:       "wr-self",
 		AgentID:         ag.AgentID,
 		DelegationID:    grant.DelegationID,
 		ClientAddress:   actors.owner.Address(),
 		WorkerAddress:   actors.delegate.Address(),
-		PaymentTxHash:   Keccak256Hex([]byte("self-tx")),
+		PaymentTxHash:   selfPayTx,
 		AmountAtomic:    10000,
 		Asset:           "USDC",
 		ToolCallsDigest: Keccak256Hex([]byte("tc")),
@@ -786,13 +799,26 @@ func TestBoundaryRegimes(t *testing.T) {
 	rep := NewReputationRegistry(reg)
 	sockpuppet, _ := GenerateKeyPair()
 	for i := 1; i <= 4; i++ {
+		washTx := Keccak256Hex([]byte(fmt.Sprintf("wash-tx-%d", i)))
+		if err := reg.RecordVerifiedPayment(PaymentAuthReceipt{
+			AgentID:       ag.AgentID,
+			DelegationID:  grant.DelegationID,
+			PayerAddress:  sockpuppet.Address(),
+			PayeeAddress:  actors.delegate.Address(),
+			AmountAtomic:  1000,
+			Asset:         "USDC",
+			PaymentTxHash: washTx,
+			AuthorizedAt:  curTime.Unix(),
+		}); err != nil {
+			t.Fatalf("RecordVerifiedPayment wash %d: %v", i, err)
+		}
 		wr := signWorkReceipt(t, domain, actors.delegate, sockpuppet, WorkReceipt{
 			ReceiptID:       fmt.Sprintf("wash-%d", i),
 			AgentID:         ag.AgentID,
 			DelegationID:    grant.DelegationID,
 			ClientAddress:   sockpuppet.Address(),
 			WorkerAddress:   actors.delegate.Address(),
-			PaymentTxHash:   Keccak256Hex([]byte(fmt.Sprintf("wash-tx-%d", i))),
+			PaymentTxHash:   washTx,
 			AmountAtomic:    1000,
 			Asset:           "USDC",
 			ToolCallsDigest: Keccak256Hex([]byte("noop")),
@@ -858,13 +884,26 @@ func TestSovereignExportMigrationAndTamperDetection(t *testing.T) {
 	if _, err := svc.Identity.RegisterDelegation(grant); err != nil {
 		t.Fatalf("RegisterDelegation: %v", err)
 	}
+	migPayTx := Keccak256Hex([]byte("mig-pay"))
+	if err := svc.Identity.RecordVerifiedPayment(PaymentAuthReceipt{
+		AgentID:       ag.AgentID,
+		DelegationID:  grant.DelegationID,
+		PayerAddress:  actors.client.Address(),
+		PayeeAddress:  actors.delegate.Address(),
+		AmountAtomic:  25000,
+		Asset:         "USDC",
+		PaymentTxHash: migPayTx,
+		AuthorizedAt:  now,
+	}); err != nil {
+		t.Fatalf("RecordVerifiedPayment: %v", err)
+	}
 	wr := signWorkReceipt(t, domain, actors.delegate, actors.client, WorkReceipt{
 		ReceiptID:       "wr-mig-1",
 		AgentID:         ag.AgentID,
 		DelegationID:    grant.DelegationID,
 		ClientAddress:   actors.client.Address(),
 		WorkerAddress:   actors.delegate.Address(),
-		PaymentTxHash:   Keccak256Hex([]byte("mig-pay")),
+		PaymentTxHash:   migPayTx,
 		AmountAtomic:    25000,
 		Asset:           "USDC",
 		ToolCallsDigest: Keccak256Hex([]byte("mig-tools")),

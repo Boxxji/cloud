@@ -99,32 +99,61 @@ func CanonicalAgentID(chainID uint64, registryAddr string, tokenID uint64) strin
 	return fmt.Sprintf("eip155:%d:%s:%d", chainID, norm, tokenID)
 }
 
-// RegistrationDigest computes the EIP-712 signing digest committing to the agent's
+// RegistrationDigest computes the canonical EIP-712 signing digest committing to the agent's
 // owner, controller, payment wallet, metadata, endpoints, capabilities, version, and status.
 func (a AgentIdentity) RegistrationDigest(domain EIP712Domain) [32]byte {
-	caps := sortedCopy(a.Capabilities)
-	capsHash := hashStrings(caps...)
+	capsHash := eip712HashStringSlice(sortedCopy(a.Capabilities))
 	mcpHash := hashEndpoints(a.MCPEndpoints)
 	a2aHash := hashEndpoints(a.A2AEndpoints)
 
 	typeHash := Keccak256Bytes([]byte(
 		"AgentRegistration(uint64 chainId,address registry,address owner,string controllerPubKey,address paymentWallet,string metadataUri,bytes32 mcpHash,bytes32 a2aHash,bytes32 capabilitiesHash,uint64 version,string status)",
 	))
-	payload := hashStrings(
-		hex.EncodeToString(typeHash[:]),
-		strconv.FormatUint(a.ChainID, 10),
-		strings.ToLower(strings.TrimSpace(a.RegistryAddress)),
-		strings.ToLower(strings.TrimSpace(a.OwnerAddress)),
-		strings.ToLower(strings.TrimSpace(a.ControllerPubKey)),
-		strings.ToLower(strings.TrimSpace(a.PaymentWallet)),
-		a.MetadataURI,
-		hex.EncodeToString(mcpHash[:]),
-		hex.EncodeToString(a2aHash[:]),
-		hex.EncodeToString(capsHash[:]),
-		strconv.FormatUint(a.Version, 10),
-		string(a.Status),
+	structHash := eip712EncodeStruct(
+		typeHash,
+		eip712WordUint64(a.ChainID),
+		eip712WordAddress(a.RegistryAddress),
+		eip712WordAddress(a.OwnerAddress),
+		eip712HashString(strings.ToLower(strings.TrimSpace(a.ControllerPubKey))),
+		eip712WordAddress(a.PaymentWallet),
+		eip712HashString(a.MetadataURI),
+		mcpHash,
+		a2aHash,
+		capsHash,
+		eip712WordUint64(a.Version),
+		eip712HashString(string(a.Status)),
 	)
-	return domain.TypedDataDigest(payload)
+	return domain.TypedDataDigest(structHash)
+}
+
+// UpdateDigest computes the canonical EIP-712 signing digest for an agent identity update,
+// explicitly binding target TokenID and AgentID so a signed update for agent A cannot be
+// replayed against agent B under the same owner.
+func (a AgentIdentity) UpdateDigest(domain EIP712Domain) [32]byte {
+	capsHash := eip712HashStringSlice(sortedCopy(a.Capabilities))
+	mcpHash := hashEndpoints(a.MCPEndpoints)
+	a2aHash := hashEndpoints(a.A2AEndpoints)
+
+	typeHash := Keccak256Bytes([]byte(
+		"AgentUpdate(uint64 chainId,address registry,uint64 tokenId,string agentId,address owner,string controllerPubKey,address paymentWallet,string metadataUri,bytes32 mcpHash,bytes32 a2aHash,bytes32 capabilitiesHash,uint64 version,string status)",
+	))
+	structHash := eip712EncodeStruct(
+		typeHash,
+		eip712WordUint64(a.ChainID),
+		eip712WordAddress(a.RegistryAddress),
+		eip712WordUint64(a.TokenID),
+		eip712HashString(a.AgentID),
+		eip712WordAddress(a.OwnerAddress),
+		eip712HashString(strings.ToLower(strings.TrimSpace(a.ControllerPubKey))),
+		eip712WordAddress(a.PaymentWallet),
+		eip712HashString(a.MetadataURI),
+		mcpHash,
+		a2aHash,
+		capsHash,
+		eip712WordUint64(a.Version),
+		eip712HashString(string(a.Status)),
+	)
+	return domain.TypedDataDigest(structHash)
 }
 
 // SignedCredential is an offline-verifiable attestation of agent capabilities and MCP/A2A endpoints.
@@ -143,29 +172,29 @@ type SignedCredential struct {
 	Signature      string               `json:"signature"`
 }
 
-// Digest computes the EIP-712 signing digest for a SignedCredential.
+// Digest computes the canonical EIP-712 signing digest for a SignedCredential.
 func (c SignedCredential) Digest(domain EIP712Domain) [32]byte {
-	capsHash := hashStrings(sortedCopy(c.Capabilities)...)
+	capsHash := eip712HashStringSlice(sortedCopy(c.Capabilities))
 	mcpHash := hashEndpoints(c.MCPEndpoints)
 	a2aHash := hashEndpoints(c.A2AEndpoints)
 	typeHash := Keccak256Bytes([]byte(
 		"SignedCredential(string credentialId,string agentId,address issuer,address subject,string claimType,bytes32 capabilitiesHash,bytes32 mcpHash,bytes32 a2aHash,int64 issuedAt,int64 expiresAt,uint64 nonce)",
 	))
-	payload := hashStrings(
-		hex.EncodeToString(typeHash[:]),
-		c.CredentialID,
-		c.AgentID,
-		strings.ToLower(strings.TrimSpace(c.IssuerAddress)),
-		strings.ToLower(strings.TrimSpace(c.SubjectAddress)),
-		c.ClaimType,
-		hex.EncodeToString(capsHash[:]),
-		hex.EncodeToString(mcpHash[:]),
-		hex.EncodeToString(a2aHash[:]),
-		strconv.FormatInt(c.IssuedAt, 10),
-		strconv.FormatInt(c.ExpiresAt, 10),
-		strconv.FormatUint(c.Nonce, 10),
+	structHash := eip712EncodeStruct(
+		typeHash,
+		eip712HashString(c.CredentialID),
+		eip712HashString(c.AgentID),
+		eip712WordAddress(c.IssuerAddress),
+		eip712WordAddress(c.SubjectAddress),
+		eip712HashString(c.ClaimType),
+		capsHash,
+		mcpHash,
+		a2aHash,
+		eip712WordInt64(c.IssuedAt),
+		eip712WordInt64(c.ExpiresAt),
+		eip712WordUint64(c.Nonce),
 	)
-	return domain.TypedDataDigest(payload)
+	return domain.TypedDataDigest(structHash)
 }
 
 // DelegationGrant bounds what tools, sandbox resources, and payment spend a delegate key
@@ -213,55 +242,55 @@ func (g DelegationGrant) ComputeID() string {
 	return "0x" + hex.EncodeToString(d[:])
 }
 
-// Digest computes the EIP-712 signing digest signed by OwnerAddress to authorize this grant.
+// Digest computes the canonical EIP-712 signing digest signed by OwnerAddress to authorize this grant.
 func (g DelegationGrant) Digest(domain EIP712Domain) [32]byte {
-	toolsHash := hashStrings(sortedCopy(g.AllowedTools)...)
-	resHash := hashStrings(sortedCopy(g.AllowedResources)...)
+	toolsHash := eip712HashStringSlice(sortedCopy(g.AllowedTools))
+	resHash := eip712HashStringSlice(sortedCopy(g.AllowedResources))
 	typeHash := Keccak256Bytes([]byte(
 		"DelegationGrant(string delegationId,string agentId,address owner,address delegate,string delegatePubKey,string taskScope,bytes32 allowedToolsHash,bytes32 allowedResourcesHash,uint64 maxSpendAtomic,uint64 maxPerCallAtomic,string asset,int64 issuedAt,int64 expiresAt,uint64 nonce,uint64 revocationEpoch)",
 	))
-	payload := hashStrings(
-		hex.EncodeToString(typeHash[:]),
-		g.DelegationID,
-		g.AgentID,
-		strings.ToLower(strings.TrimSpace(g.OwnerAddress)),
-		strings.ToLower(strings.TrimSpace(g.DelegateAddress)),
-		strings.ToLower(strings.TrimSpace(g.DelegatePubKey)),
-		g.TaskScope,
-		hex.EncodeToString(toolsHash[:]),
-		hex.EncodeToString(resHash[:]),
-		strconv.FormatUint(g.MaxSpendAtomic, 10),
-		strconv.FormatUint(g.MaxPerCallAtomic, 10),
-		g.Asset,
-		strconv.FormatInt(g.IssuedAt, 10),
-		strconv.FormatInt(g.ExpiresAt, 10),
-		strconv.FormatUint(g.Nonce, 10),
-		strconv.FormatUint(g.RevocationEpoch, 10),
+	structHash := eip712EncodeStruct(
+		typeHash,
+		eip712HashString(g.DelegationID),
+		eip712HashString(g.AgentID),
+		eip712WordAddress(g.OwnerAddress),
+		eip712WordAddress(g.DelegateAddress),
+		eip712HashString(strings.ToLower(strings.TrimSpace(g.DelegatePubKey))),
+		eip712HashString(g.TaskScope),
+		toolsHash,
+		resHash,
+		eip712WordUint64(g.MaxSpendAtomic),
+		eip712WordUint64(g.MaxPerCallAtomic),
+		eip712HashString(g.Asset),
+		eip712WordInt64(g.IssuedAt),
+		eip712WordInt64(g.ExpiresAt),
+		eip712WordUint64(g.Nonce),
+		eip712WordUint64(g.RevocationEpoch),
 	)
-	return domain.TypedDataDigest(payload)
+	return domain.TypedDataDigest(structHash)
 }
 
-// RevocationDigest computes the EIP-712 digest signed by an agent owner to revoke a delegation.
+// RevocationDigest computes the canonical EIP-712 digest signed by an agent owner to revoke a delegation.
 func RevocationDigest(domain EIP712Domain, agentID, delegationID string, nonce uint64) [32]byte {
 	typeHash := Keccak256Bytes([]byte("RevokeDelegation(string agentId,string delegationId,uint64 nonce)"))
-	payload := hashStrings(
-		hex.EncodeToString(typeHash[:]),
-		agentID,
-		delegationID,
-		strconv.FormatUint(nonce, 10),
+	structHash := eip712EncodeStruct(
+		typeHash,
+		eip712HashString(agentID),
+		eip712HashString(delegationID),
+		eip712WordUint64(nonce),
 	)
-	return domain.TypedDataDigest(payload)
+	return domain.TypedDataDigest(structHash)
 }
 
-// EpochBumpDigest computes the EIP-712 digest signed by an agent owner to bump the revocation epoch.
+// EpochBumpDigest computes the canonical EIP-712 digest signed by an agent owner to bump the revocation epoch.
 func EpochBumpDigest(domain EIP712Domain, agentID string, newEpoch uint64) [32]byte {
 	typeHash := Keccak256Bytes([]byte("BumpRevocationEpoch(string agentId,uint64 newEpoch)"))
-	payload := hashStrings(
-		hex.EncodeToString(typeHash[:]),
-		agentID,
-		strconv.FormatUint(newEpoch, 10),
+	structHash := eip712EncodeStruct(
+		typeHash,
+		eip712HashString(agentID),
+		eip712WordUint64(newEpoch),
 	)
-	return domain.TypedDataDigest(payload)
+	return domain.TypedDataDigest(structHash)
 }
 
 // ToolActionRequest is a delegate-signed request to execute a specific tool against a sandbox resource.
@@ -278,24 +307,24 @@ type ToolActionRequest struct {
 	DelegateSignature string `json:"delegateSignature"`
 }
 
-// Digest computes the EIP-712 signing digest signed by DelegateAddress for a tool call.
+// Digest computes the canonical EIP-712 signing digest signed by DelegateAddress for a tool call.
 func (r ToolActionRequest) Digest(domain EIP712Domain) [32]byte {
 	typeHash := Keccak256Bytes([]byte(
 		"ToolActionRequest(string requestId,string delegationId,string agentId,address delegate,string tool,string resource,string inputHash,uint64 nonce,int64 timestamp)",
 	))
-	payload := hashStrings(
-		hex.EncodeToString(typeHash[:]),
-		r.RequestID,
-		r.DelegationID,
-		r.AgentID,
-		strings.ToLower(strings.TrimSpace(r.DelegateAddress)),
-		r.Tool,
-		r.Resource,
-		r.InputHash,
-		strconv.FormatUint(r.Nonce, 10),
-		strconv.FormatInt(r.Timestamp, 10),
+	structHash := eip712EncodeStruct(
+		typeHash,
+		eip712HashString(r.RequestID),
+		eip712HashString(r.DelegationID),
+		eip712HashString(r.AgentID),
+		eip712WordAddress(r.DelegateAddress),
+		eip712HashString(r.Tool),
+		eip712HashString(r.Resource),
+		eip712HashString(r.InputHash),
+		eip712WordUint64(r.Nonce),
+		eip712WordInt64(r.Timestamp),
 	)
-	return domain.TypedDataDigest(payload)
+	return domain.TypedDataDigest(structHash)
 }
 
 // ToolExecutionRecord records an authorized tool execution and its output commitment.
@@ -325,25 +354,25 @@ type PaymentAuthRequest struct {
 	DelegateSignature string `json:"delegateSignature"`
 }
 
-// Digest computes the EIP-712 signing digest signed by DelegateAddress for a payment authorization.
+// Digest computes the canonical EIP-712 signing digest signed by DelegateAddress for a payment authorization.
 func (p PaymentAuthRequest) Digest(domain EIP712Domain) [32]byte {
 	typeHash := Keccak256Bytes([]byte(
 		"PaymentAuthRequest(string authId,string delegationId,string agentId,address delegate,address payee,uint64 amountAtomic,string asset,string taskRef,uint64 nonce,int64 timestamp)",
 	))
-	payload := hashStrings(
-		hex.EncodeToString(typeHash[:]),
-		p.AuthID,
-		p.DelegationID,
-		p.AgentID,
-		strings.ToLower(strings.TrimSpace(p.DelegateAddress)),
-		strings.ToLower(strings.TrimSpace(p.Payee)),
-		strconv.FormatUint(p.AmountAtomic, 10),
-		p.Asset,
-		p.TaskRef,
-		strconv.FormatUint(p.Nonce, 10),
-		strconv.FormatInt(p.Timestamp, 10),
+	structHash := eip712EncodeStruct(
+		typeHash,
+		eip712HashString(p.AuthID),
+		eip712HashString(p.DelegationID),
+		eip712HashString(p.AgentID),
+		eip712WordAddress(p.DelegateAddress),
+		eip712WordAddress(p.Payee),
+		eip712WordUint64(p.AmountAtomic),
+		eip712HashString(p.Asset),
+		eip712HashString(p.TaskRef),
+		eip712WordUint64(p.Nonce),
+		eip712WordInt64(p.Timestamp),
 	)
-	return domain.TypedDataDigest(payload)
+	return domain.TypedDataDigest(structHash)
 }
 
 // PaymentAuthReceipt proves that a payment authorization passed delegation enforcement
@@ -401,27 +430,27 @@ func (w WorkReceipt) ComputeHash() string {
 	return "0x" + hex.EncodeToString(d[:])
 }
 
-// Digest computes the EIP-712 digest signed by both worker and client to attest to completed paid work.
+// Digest computes the canonical EIP-712 digest signed by both worker and client to attest to completed paid work.
 func (w WorkReceipt) Digest(domain EIP712Domain) [32]byte {
 	typeHash := Keccak256Bytes([]byte(
 		"WorkReceipt(string receiptId,string agentId,string delegationId,address client,address worker,string paymentTxHash,uint64 amountAtomic,string asset,string toolCallsDigest,string taskOutputHash,int64 completedAt,string workReceiptHash)",
 	))
-	payload := hashStrings(
-		hex.EncodeToString(typeHash[:]),
-		w.ReceiptID,
-		w.AgentID,
-		w.DelegationID,
-		strings.ToLower(strings.TrimSpace(w.ClientAddress)),
-		strings.ToLower(strings.TrimSpace(w.WorkerAddress)),
-		strings.ToLower(strings.TrimSpace(w.PaymentTxHash)),
-		strconv.FormatUint(w.AmountAtomic, 10),
-		w.Asset,
-		strings.ToLower(strings.TrimSpace(w.ToolCallsDigest)),
-		strings.ToLower(strings.TrimSpace(w.TaskOutputHash)),
-		strconv.FormatInt(w.CompletedAt, 10),
-		strings.ToLower(strings.TrimSpace(w.WorkReceiptHash)),
+	structHash := eip712EncodeStruct(
+		typeHash,
+		eip712HashString(w.ReceiptID),
+		eip712HashString(w.AgentID),
+		eip712HashString(w.DelegationID),
+		eip712WordAddress(w.ClientAddress),
+		eip712WordAddress(w.WorkerAddress),
+		eip712HashString(strings.ToLower(strings.TrimSpace(w.PaymentTxHash))),
+		eip712WordUint64(w.AmountAtomic),
+		eip712HashString(w.Asset),
+		eip712HashString(strings.ToLower(strings.TrimSpace(w.ToolCallsDigest))),
+		eip712HashString(strings.ToLower(strings.TrimSpace(w.TaskOutputHash))),
+		eip712WordInt64(w.CompletedAt),
+		eip712HashString(strings.ToLower(strings.TrimSpace(w.WorkReceiptHash))),
 	)
-	return domain.TypedDataDigest(payload)
+	return domain.TypedDataDigest(structHash)
 }
 
 // ReputationFeedback is a client-signed ERC-8004 reputation attestation bound to a verified paid WorkReceipt.
@@ -439,26 +468,26 @@ type ReputationFeedback struct {
 	ClientSignature     string   `json:"clientSignature"`
 }
 
-// Digest computes the EIP-712 signing digest signed by ClientAddress.
+// Digest computes the canonical EIP-712 signing digest signed by ClientAddress.
 func (f ReputationFeedback) Digest(domain EIP712Domain) [32]byte {
-	tagsHash := hashStrings(sortedCopy(f.Tags)...)
+	tagsHash := eip712HashStringSlice(sortedCopy(f.Tags))
 	typeHash := Keccak256Bytes([]byte(
 		"ReputationFeedback(string feedbackId,string agentId,address client,uint8 score,bytes32 tagsHash,string comment,string workReceiptHash,uint64 paymentAmountAtomic,int64 submittedAt,uint64 nonce)",
 	))
-	payload := hashStrings(
-		hex.EncodeToString(typeHash[:]),
-		f.FeedbackID,
-		f.AgentID,
-		strings.ToLower(strings.TrimSpace(f.ClientAddress)),
-		strconv.FormatUint(uint64(f.Score), 10),
-		hex.EncodeToString(tagsHash[:]),
-		f.Comment,
-		strings.ToLower(strings.TrimSpace(f.WorkReceiptHash)),
-		strconv.FormatUint(f.PaymentAmountAtomic, 10),
-		strconv.FormatInt(f.SubmittedAt, 10),
-		strconv.FormatUint(f.Nonce, 10),
+	structHash := eip712EncodeStruct(
+		typeHash,
+		eip712HashString(f.FeedbackID),
+		eip712HashString(f.AgentID),
+		eip712WordAddress(f.ClientAddress),
+		eip712WordUint8(f.Score),
+		tagsHash,
+		eip712HashString(f.Comment),
+		eip712HashString(strings.ToLower(strings.TrimSpace(f.WorkReceiptHash))),
+		eip712WordUint64(f.PaymentAmountAtomic),
+		eip712WordInt64(f.SubmittedAt),
+		eip712WordUint64(f.Nonce),
 	)
-	return domain.TypedDataDigest(payload)
+	return domain.TypedDataDigest(structHash)
 }
 
 // ChainTxReceipt records a deterministic test-chain transaction, block height, gas used, and state root.
@@ -484,19 +513,43 @@ type RevocationRecord struct {
 	TxHash       string `json:"txHash"`
 }
 
+// EpochBumpRecord records an owner-signed bulk revocation epoch bump on-chain.
+type EpochBumpRecord struct {
+	AgentID      string `json:"agentId"`
+	NewEpoch     uint64 `json:"newEpoch"`
+	OwnerAddress string `json:"ownerAddress"`
+	BumpedAt     int64  `json:"bumpedAt"`
+	OwnerSig     string `json:"ownerSignature"`
+	TxHash       string `json:"txHash"`
+}
+
+// EnforcementState captures runtime spend counters, consumed tool/payment replay keys,
+// and verified payment settlements so snapshot migration preserves all security invariants.
+type EnforcementState struct {
+	DelegationSpent  map[string]uint64    `json:"delegationSpent,omitempty"`
+	ToolRequestIDs   []string             `json:"toolRequestIds,omitempty"`
+	ToolNonces       []string             `json:"toolNonces,omitempty"`
+	PaymentAuthIDs   []string             `json:"paymentAuthIds,omitempty"`
+	PaymentNonces    []string             `json:"paymentNonces,omitempty"`
+	VerifiedPayments []PaymentAuthReceipt `json:"verifiedPayments,omitempty"`
+}
+
 // StateSnapshot is a self-contained, independently verifiable export of all ERC-8004
-// registry, delegation, revocation, work-receipt, and reputation state for sovereign
-// migration across chains or operators.
+// registry, delegation, revocation, enforcement, work-receipt, and reputation state for
+// sovereign migration across chains or operators.
 type StateSnapshot struct {
 	FormatVersion string               `json:"formatVersion"`
 	Domain        EIP712Domain         `json:"domain"`
 	BlockNumber   uint64               `json:"blockNumber"`
 	ExportedAt    int64                `json:"exportedAt"`
 	StateRoot     string               `json:"stateRoot"`
+	EntityRoot    string               `json:"entityRoot"`
 	Agents        []AgentIdentity      `json:"agents"`
 	Credentials   []SignedCredential   `json:"credentials"`
 	Delegations   []DelegationGrant    `json:"delegations"`
 	Revocations   []RevocationRecord   `json:"revocations"`
+	EpochBumps    []EpochBumpRecord    `json:"epochBumps,omitempty"`
+	Enforcement   EnforcementState     `json:"enforcement"`
 	WorkReceipts  []WorkReceipt        `json:"workReceipts"`
 	Feedback      []ReputationFeedback `json:"feedback"`
 	TxLog         []ChainTxReceipt     `json:"txLog"`

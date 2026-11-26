@@ -1316,7 +1316,18 @@ func runNegativeRegimes(domain erc8004.EIP712Domain, cost CostMetrics) (Negative
 	// (b) Direct self-feedback (owner paying own agent) -> 100% blocked.
 	selfBlocked := 0
 	for i := 0; i < 5; i++ {
-		wr := erc8004.WorkReceipt{ReceiptID: fmt.Sprintf("self-wr-%d", i), AgentID: agW.AgentID, DelegationID: gW.DelegationID, ClientAddress: owner.Address(), WorkerAddress: delegate.Address(), PaymentTxHash: erc8004.Keccak256Hex([]byte(fmt.Sprintf("self-tx-%d", i))), AmountAtomic: 1000, Asset: "USDC", ToolCallsDigest: "0x01", TaskOutputHash: "0x02", CompletedAt: curTime.Unix()}
+		txHash := erc8004.Keccak256Hex([]byte(fmt.Sprintf("self-tx-%d", i)))
+		_ = regW.RecordVerifiedPayment(erc8004.PaymentAuthReceipt{
+			AgentID:       agW.AgentID,
+			DelegationID:  gW.DelegationID,
+			PayerAddress:  owner.Address(),
+			PayeeAddress:  delegate.Address(),
+			AmountAtomic:  1000,
+			Asset:         "USDC",
+			PaymentTxHash: txHash,
+			AuthorizedAt:  curTime.Unix(),
+		})
+		wr := erc8004.WorkReceipt{ReceiptID: fmt.Sprintf("self-wr-%d", i), AgentID: agW.AgentID, DelegationID: gW.DelegationID, ClientAddress: owner.Address(), WorkerAddress: delegate.Address(), PaymentTxHash: txHash, AmountAtomic: 1000, Asset: "USDC", ToolCallsDigest: "0x01", TaskOutputHash: "0x02", CompletedAt: curTime.Unix()}
 		wr.WorkReceiptHash = wr.ComputeHash()
 		wd := wr.Digest(domain)
 		wr.WorkerSignature, _ = delegate.SignDigest(wd)
@@ -1333,7 +1344,18 @@ func runNegativeRegimes(domain erc8004.EIP712Domain, cost CostMetrics) (Negative
 	sock1, _ := erc8004.KeyPairFromSeed([]byte("wash-sock-single"))
 	singleSucceeded := 0
 	for i := 0; i < 5; i++ {
-		wr := erc8004.WorkReceipt{ReceiptID: fmt.Sprintf("sw1-%d", i), AgentID: agW.AgentID, DelegationID: gW.DelegationID, ClientAddress: sock1.Address(), WorkerAddress: delegate.Address(), PaymentTxHash: erc8004.Keccak256Hex([]byte(fmt.Sprintf("sw1-tx-%d", i))), AmountAtomic: 1000, Asset: "USDC", ToolCallsDigest: "0x01", TaskOutputHash: "0x02", CompletedAt: curTime.Unix()}
+		txHash := erc8004.Keccak256Hex([]byte(fmt.Sprintf("sw1-tx-%d", i)))
+		_ = regW.RecordVerifiedPayment(erc8004.PaymentAuthReceipt{
+			AgentID:       agW.AgentID,
+			DelegationID:  gW.DelegationID,
+			PayerAddress:  sock1.Address(),
+			PayeeAddress:  delegate.Address(),
+			AmountAtomic:  1000,
+			Asset:         "USDC",
+			PaymentTxHash: txHash,
+			AuthorizedAt:  curTime.Unix(),
+		})
+		wr := erc8004.WorkReceipt{ReceiptID: fmt.Sprintf("sw1-%d", i), AgentID: agW.AgentID, DelegationID: gW.DelegationID, ClientAddress: sock1.Address(), WorkerAddress: delegate.Address(), PaymentTxHash: txHash, AmountAtomic: 1000, Asset: "USDC", ToolCallsDigest: "0x01", TaskOutputHash: "0x02", CompletedAt: curTime.Unix()}
 		wr.WorkReceiptHash = wr.ComputeHash()
 		wd := wr.Digest(domain)
 		wr.WorkerSignature, _ = delegate.SignDigest(wd)
@@ -1373,7 +1395,18 @@ func runNegativeRegimes(domain erc8004.EIP712Domain, cost CostMetrics) (Negative
 	const distCount = 10
 	for i := 0; i < distCount; i++ {
 		sp, _ := erc8004.KeyPairFromSeed([]byte(fmt.Sprintf("wash-dist-sock-%d", i)))
-		wr := erc8004.WorkReceipt{ReceiptID: fmt.Sprintf("swd-%d", i), AgentID: agW2.AgentID, DelegationID: gW2.DelegationID, ClientAddress: sp.Address(), WorkerAddress: delegate.Address(), PaymentTxHash: erc8004.Keccak256Hex([]byte(fmt.Sprintf("swd-tx-%d", i))), AmountAtomic: 1000, Asset: "USDC", ToolCallsDigest: "0x01", TaskOutputHash: "0x02", CompletedAt: curTime.Unix()}
+		txHash := erc8004.Keccak256Hex([]byte(fmt.Sprintf("swd-tx-%d", i)))
+		_ = regW.RecordVerifiedPayment(erc8004.PaymentAuthReceipt{
+			AgentID:       agW2.AgentID,
+			DelegationID:  gW2.DelegationID,
+			PayerAddress:  sp.Address(),
+			PayeeAddress:  delegate.Address(),
+			AmountAtomic:  1000,
+			Asset:         "USDC",
+			PaymentTxHash: txHash,
+			AuthorizedAt:  curTime.Unix(),
+		})
+		wr := erc8004.WorkReceipt{ReceiptID: fmt.Sprintf("swd-%d", i), AgentID: agW2.AgentID, DelegationID: gW2.DelegationID, ClientAddress: sp.Address(), WorkerAddress: delegate.Address(), PaymentTxHash: txHash, AmountAtomic: 1000, Asset: "USDC", ToolCallsDigest: "0x01", TaskOutputHash: "0x02", CompletedAt: curTime.Unix()}
 		wr.WorkReceiptHash = wr.ComputeHash()
 		wd := wr.Digest(domain)
 		wr.WorkerSignature, _ = delegate.SignDigest(wd)

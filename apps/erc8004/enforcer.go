@@ -3,7 +3,6 @@
 package erc8004
 
 import (
-	"encoding/hex"
 	"fmt"
 	"path"
 	"strings"
@@ -94,7 +93,6 @@ type ToolSandboxEnforcer struct {
 	mu         sync.Mutex
 	registry   *IdentityRegistry
 	revocation RevocationChecker
-	seenReq    map[string]bool // requestID and delegationID:nonce replay guard
 }
 
 // NewToolSandboxEnforcer constructs a runtime tool/sandbox enforcer backed by registry
@@ -106,7 +104,6 @@ func NewToolSandboxEnforcer(registry *IdentityRegistry, checker RevocationChecke
 	return &ToolSandboxEnforcer{
 		registry:   registry,
 		revocation: checker,
-		seenReq:    make(map[string]bool),
 	}
 }
 
@@ -154,7 +151,7 @@ func (e *ToolSandboxEnforcer) Execute(req ToolActionRequest, execFn ToolExecutor
 		return nil, fmt.Errorf("%w: resource %q outside delegation scope", ErrResourceNotAllowed, req.Resource)
 	}
 
-	// Atomically check live revocation and replay protection before execution.
+	// Atomically check live revocation and registry-persisted separated replay guards.
 	e.mu.Lock()
 	if revoked, reason := e.revocation.IsRevoked(grant.DelegationID, grant.AgentID, grant.RevocationEpoch); revoked {
 		e.mu.Unlock()
@@ -163,13 +160,10 @@ func (e *ToolSandboxEnforcer) Execute(req ToolActionRequest, execFn ToolExecutor
 		}
 		return nil, ErrDelegationRevoked
 	}
-	nonceKey := fmt.Sprintf("tool:%s:%d", grant.DelegationID, req.Nonce)
-	if e.seenReq[req.RequestID] || e.seenReq[nonceKey] {
+	if err := e.registry.reserveToolExecution(grant.DelegationID, req.RequestID, req.Nonce, grant.DelegateAddress); err != nil {
 		e.mu.Unlock()
-		return nil, ErrReplayDetected
+		return nil, err
 	}
-	e.seenReq[req.RequestID] = true
-	e.seenReq[nonceKey] = true
 	e.mu.Unlock()
 
 	output := "ok"
@@ -199,8 +193,6 @@ type PaymentLimitEnforcer struct {
 	mu         sync.Mutex
 	registry   *IdentityRegistry
 	revocation RevocationChecker
-	spent      map[string]uint64 // delegationID -> cumulative atomic units authorized
-	seenAuth   map[string]bool   // authID and delegationID:nonce replay guard
 }
 
 // NewPaymentLimitEnforcer constructs a concurrency-safe runtime payment enforcer.
@@ -211,13 +203,12 @@ func NewPaymentLimitEnforcer(registry *IdentityRegistry, checker RevocationCheck
 	return &PaymentLimitEnforcer{
 		registry:   registry,
 		revocation: checker,
-		spent:      make(map[string]uint64),
-		seenAuth:   make(map[string]bool),
 	}
 }
 
 // AuthorizePayment verifies the delegate's payment request and atomically reserves
-// AmountAtomic against the delegation's MaxPerCallAtomic and MaxSpendAtomic caps.
+// AmountAtomic against the delegation's MaxPerCallAtomic and MaxSpendAtomic caps,
+// persisting spend/replay state and verified payment evidence on the registry.
 func (p *PaymentLimitEnforcer) AuthorizePayment(req PaymentAuthRequest) (*PaymentAuthReceipt, error) {
 	if strings.TrimSpace(req.AuthID) == "" || req.AmountAtomic == 0 {
 		return nil, fmt.Errorf("%w: payment auth requires non-empty authId and positive amountAtomic", ErrInvalidRequest)
@@ -259,7 +250,7 @@ func (p *PaymentLimitEnforcer) AuthorizePayment(req PaymentAuthRequest) (*Paymen
 		return nil, fmt.Errorf("%w: %d > per-call limit %d", ErrPerCallLimitExceeded, req.AmountAtomic, grant.MaxPerCallAtomic)
 	}
 
-	// Atomically verify live revocation, replay guard, and cumulative spend cap.
+	// Atomically verify live revocation, separated replay guards, and persistent spend cap.
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -269,55 +260,20 @@ func (p *PaymentLimitEnforcer) AuthorizePayment(req PaymentAuthRequest) (*Paymen
 		}
 		return nil, ErrDelegationRevoked
 	}
-	nonceKey := fmt.Sprintf("pay:%s:%d", grant.DelegationID, req.Nonce)
-	if p.seenAuth[req.AuthID] || p.seenAuth[nonceKey] {
-		return nil, ErrReplayDetected
-	}
-
-	alreadySpent := p.spent[grant.DelegationID]
-	if req.AmountAtomic > grant.MaxSpendAtomic || alreadySpent > grant.MaxSpendAtomic-req.AmountAtomic {
-		return nil, fmt.Errorf("%w: spent %d + %d > max %d", ErrSpendLimitExceeded, alreadySpent, req.AmountAtomic, grant.MaxSpendAtomic)
-	}
-
-	newSpent := alreadySpent + req.AmountAtomic
-	p.spent[grant.DelegationID] = newSpent
-	p.seenAuth[req.AuthID] = true
-	p.seenAuth[nonceKey] = true
 
 	payerAddr := ag.PaymentWallet
 	if payerAddr == "" {
 		payerAddr = ag.OwnerAddress
 	}
-	txDigest := Keccak256Bytes(
-		[]byte("erc8004:pay:v1"),
-		[]byte(req.AuthID),
-		[]byte(grant.DelegationID),
-		[]byte(strings.ToLower(payerAddr)),
-		[]byte(strings.ToLower(payeeNorm)),
-		uint64Bytes(req.AmountAtomic),
-		[]byte(grant.Asset),
-		uint64Bytes(req.Nonce),
-	)
-	return &PaymentAuthReceipt{
-		AuthID:          req.AuthID,
-		DelegationID:    grant.DelegationID,
-		AgentID:         grant.AgentID,
-		PayerAddress:    payerAddr,
-		PayeeAddress:    payeeNorm,
-		AmountAtomic:    req.AmountAtomic,
-		SpentTotal:      newSpent,
-		RemainingAtomic: grant.MaxSpendAtomic - newSpent,
-		Asset:           grant.Asset,
-		PaymentTxHash:   "0x" + hex.EncodeToString(txDigest[:]),
-		AuthorizedAt:    now,
-	}, nil
+	return p.registry.reservePaymentExecution(*grant, req, payerAddr, payeeNorm, now)
 }
 
 // Spent returns the current cumulative atomic units authorized under delegationID.
 func (p *PaymentLimitEnforcer) Spent(delegationID string) uint64 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.spent[delegationID]
+	if p.registry == nil {
+		return 0
+	}
+	return p.registry.DelegationSpent(delegationID)
 }
 
 // EnforcementGate combines ToolSandboxEnforcer and PaymentLimitEnforcer behind a single

@@ -42,35 +42,52 @@ type SybilAnalysis struct {
 // ReputationRegistry tracks verified paid WorkReceipts and client-signed ERC-8004
 // ReputationFeedback bound to actual completed paid work.
 type ReputationRegistry struct {
-	mu           sync.RWMutex
-	identity     *IdentityRegistry
-	receipts     map[string]WorkReceipt        // lower(workReceiptHash) -> WorkReceipt
-	feedback     map[string]ReputationFeedback // feedbackID -> ReputationFeedback
-	byAgent      map[string][]string           // agentID -> []feedbackID
-	usedReceipts map[string]bool               // lower(workReceiptHash)+":"+lower(clientAddr) -> true
-	directSelf   int
-	unpaidDenied int
+	mu              sync.RWMutex
+	identity        *IdentityRegistry
+	receipts        map[string]WorkReceipt        // lower(workReceiptHash) -> WorkReceipt
+	usedPaymentTx   map[string]bool               // lower(paymentTxHash) -> true
+	feedback        map[string]ReputationFeedback // feedbackID -> ReputationFeedback
+	byAgent         map[string][]string           // agentID -> []feedbackID
+	usedReceipts    map[string]bool               // lower(workReceiptHash)+":"+lower(clientAddr) -> true
+	paymentVerifier func(receipt WorkReceipt, ag AgentIdentity) error
+	directSelf      int
+	unpaidDenied    int
 }
 
 // NewReputationRegistry creates a reputation registry linked to identity.
 func NewReputationRegistry(identity *IdentityRegistry) *ReputationRegistry {
 	return &ReputationRegistry{
-		identity:     identity,
-		receipts:     make(map[string]WorkReceipt),
-		feedback:     make(map[string]ReputationFeedback),
-		byAgent:      make(map[string][]string),
-		usedReceipts: make(map[string]bool),
+		identity:      identity,
+		receipts:      make(map[string]WorkReceipt),
+		usedPaymentTx: make(map[string]bool),
+		feedback:      make(map[string]ReputationFeedback),
+		byAgent:       make(map[string][]string),
+		usedReceipts:  make(map[string]bool),
 	}
 }
 
+// SetPaymentVerifier installs an optional external settlement verifier (e.g., on-chain
+// ERC-3009 / x402 facilitator proof check) used by RecordWorkReceipt instead of the
+// default IdentityRegistry verified-payment ledger lookup.
+func (r *ReputationRegistry) SetPaymentVerifier(fn func(receipt WorkReceipt, ag AgentIdentity) error) {
+	r.mu.Lock()
+	r.paymentVerifier = fn
+	r.mu.Unlock()
+}
+
 // VerifyWorkReceiptOffline independently verifies a WorkReceipt's hash commitment,
-// non-zero payment, and dual EIP-712 signatures (worker + client) without any remote call.
+// 32-byte payment transaction hash, non-zero payment, and dual EIP-712 signatures
+// (worker + client) without any remote call.
 func VerifyWorkReceiptOffline(receipt WorkReceipt, domain EIP712Domain) error {
 	if strings.TrimSpace(receipt.ReceiptID) == "" || strings.TrimSpace(receipt.AgentID) == "" {
 		return fmt.Errorf("%w: work receipt missing receiptId or agentId", ErrInvalidRequest)
 	}
-	if strings.TrimSpace(receipt.PaymentTxHash) == "" || strings.TrimSpace(receipt.TaskOutputHash) == "" {
-		return fmt.Errorf("%w: work receipt missing paymentTxHash or taskOutputHash", ErrInvalidRequest)
+	rawTx, err := decodeHex(receipt.PaymentTxHash)
+	if err != nil || len(rawTx) != 32 {
+		return fmt.Errorf("%w: work receipt paymentTxHash must be a 32-byte hex hash", ErrInvalidRequest)
+	}
+	if strings.TrimSpace(receipt.TaskOutputHash) == "" || strings.TrimSpace(receipt.Asset) == "" {
+		return fmt.Errorf("%w: work receipt missing taskOutputHash or asset", ErrInvalidRequest)
 	}
 	if receipt.AmountAtomic == 0 {
 		return ErrUnpaidWorkReceipt
@@ -95,8 +112,36 @@ func VerifyWorkReceiptOffline(receipt WorkReceipt, domain EIP712Domain) error {
 	return nil
 }
 
-// RecordWorkReceipt verifies and registers a completed paid WorkReceipt on-chain so
-// subsequent feedback can reference its WorkReceiptHash.
+func verifyWorkReceiptAgainstPayment(receipt WorkReceipt, ag AgentIdentity, vp PaymentAuthReceipt) error {
+	if vp.AmountAtomic == 0 || vp.AmountAtomic != receipt.AmountAtomic {
+		return fmt.Errorf("%w: payment amount %d != receipt amount %d", ErrWorkReceiptMismatch, vp.AmountAtomic, receipt.AmountAtomic)
+	}
+	if !strings.EqualFold(strings.TrimSpace(vp.Asset), strings.TrimSpace(receipt.Asset)) {
+		return fmt.Errorf("%w: payment asset %q != receipt asset %q", ErrAssetMismatch, vp.Asset, receipt.Asset)
+	}
+	if vp.AgentID != "" && vp.AgentID != receipt.AgentID {
+		return fmt.Errorf("%w: payment agentId %s != receipt agentId %s", ErrWorkReceiptMismatch, vp.AgentID, receipt.AgentID)
+	}
+	if receipt.DelegationID != "" && vp.DelegationID != "" && vp.DelegationID != receipt.DelegationID {
+		return fmt.Errorf("%w: payment delegationId %s != receipt delegationId %s", ErrWorkReceiptMismatch, vp.DelegationID, receipt.DelegationID)
+	}
+	isAgentParty := func(addr string) bool {
+		return SameAddress(addr, ag.OwnerAddress) ||
+			SameAddress(addr, ag.ControllerAddress) ||
+			(ag.PaymentWallet != "" && SameAddress(addr, ag.PaymentWallet)) ||
+			SameAddress(addr, receipt.WorkerAddress)
+	}
+	clientPaidAgent := SameAddress(vp.PayerAddress, receipt.ClientAddress) && isAgentParty(vp.PayeeAddress)
+	agentPaidClient := SameAddress(vp.PayeeAddress, receipt.ClientAddress) && isAgentParty(vp.PayerAddress)
+	if !clientPaidAgent && !agentPaidClient {
+		return fmt.Errorf("%w: payment participants (%s -> %s) do not match receipt client %s and agent %s",
+			ErrWorkReceiptMismatch, vp.PayerAddress, vp.PayeeAddress, receipt.ClientAddress, receipt.AgentID)
+	}
+	return nil
+}
+
+// RecordWorkReceipt verifies dual signatures, worker authorization, and settled payment
+// evidence matching amount, asset, and participants before registering a WorkReceipt.
 func (r *ReputationRegistry) RecordWorkReceipt(receipt WorkReceipt) (ChainTxReceipt, error) {
 	ag, err := r.identity.GetAgent(receipt.AgentID)
 	if err != nil {
@@ -120,16 +165,49 @@ func (r *ReputationRegistry) RecordWorkReceipt(receipt WorkReceipt) (ChainTxRece
 		return ChainTxReceipt{}, fmt.Errorf("%w: worker %s is not authorized for agent %s", ErrUnauthorizedSigner, receipt.WorkerAddress, receipt.AgentID)
 	}
 
+	// Require verified payment settlement evidence matching amount, asset, and participants.
+	r.mu.RLock()
+	verifier := r.paymentVerifier
+	r.mu.RUnlock()
+	if verifier != nil {
+		if err := verifier(receipt, *ag); err != nil {
+			r.mu.Lock()
+			r.unpaidDenied++
+			r.mu.Unlock()
+			return ChainTxReceipt{}, err
+		}
+	} else {
+		vp, ok := r.identity.GetVerifiedPayment(receipt.PaymentTxHash)
+		if !ok {
+			r.mu.Lock()
+			r.unpaidDenied++
+			r.mu.Unlock()
+			return ChainTxReceipt{}, fmt.Errorf("%w: no verified payment settlement for tx %s", ErrUnpaidWorkReceipt, receipt.PaymentTxHash)
+		}
+		if err := verifyWorkReceiptAgainstPayment(receipt, *ag, vp); err != nil {
+			r.mu.Lock()
+			r.unpaidDenied++
+			r.mu.Unlock()
+			return ChainTxReceipt{}, err
+		}
+	}
+
 	receipt.ClientAddress, _ = NormalizeAddress(receipt.ClientAddress)
 	receipt.WorkerAddress, _ = NormalizeAddress(receipt.WorkerAddress)
 	key := strings.ToLower(receipt.WorkReceiptHash)
+	payKey := strings.ToLower(strings.TrimSpace(receipt.PaymentTxHash))
 
 	r.mu.Lock()
 	if _, exists := r.receipts[key]; exists {
 		r.mu.Unlock()
 		return ChainTxReceipt{}, ErrReplayDetected
 	}
+	if r.usedPaymentTx[payKey] {
+		r.mu.Unlock()
+		return ChainTxReceipt{}, ErrReplayDetected
+	}
 	r.receipts[key] = receipt
+	r.usedPaymentTx[payKey] = true
 	r.mu.Unlock()
 
 	digest := receipt.Digest(domain)
@@ -329,6 +407,7 @@ func (r *ReputationRegistry) importWorkReceipt(wr WorkReceipt) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.receipts[strings.ToLower(wr.WorkReceiptHash)] = wr
+	r.usedPaymentTx[strings.ToLower(wr.PaymentTxHash)] = true
 }
 
 func (r *ReputationRegistry) importFeedback(fb ReputationFeedback) {
