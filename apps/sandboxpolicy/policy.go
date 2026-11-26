@@ -29,6 +29,9 @@ const (
 
 	// ErrnoEPERM is POSIX EPERM (Operation not permitted) returned under EnforceDeny.
 	ErrnoEPERM = 1
+	// ErrnoENOSYS is POSIX ENOSYS (Function not implemented), used for safe runtime
+	// fallback (e.g., clone3 -> legacy clone) when pointer arguments cannot be inspected.
+	ErrnoENOSYS = 38
 	// SignalSIGKILL is POSIX SIGKILL (9) emitted under EnforceSigkill.
 	SignalSIGKILL = 9
 )
@@ -114,25 +117,27 @@ const (
 	EffectDeny  RuleEffect = "deny"
 )
 
-// ArgOp specifies a comparison operator for a syscall 64-bit argument filter.
+// ArgOp specifies a comparison operator for a syscall argument filter.
 type ArgOp string
 
 const (
-	ArgOpEqual     ArgOp = "eq"
-	ArgOpNotEqual  ArgOp = "ne"
-	ArgOpMaskAny   ArgOp = "mask_any" // (arg & value) != 0
-	ArgOpMaskAll   ArgOp = "mask_all" // (arg & value) == value
-	ArgOpGreaterEq ArgOp = "ge"
-	ArgOpLessEq    ArgOp = "le"
+	ArgOpEqual      ArgOp = "eq"
+	ArgOpNotEqual   ArgOp = "ne"
+	ArgOpEqual32    ArgOp = "eq32" // compares low 32-bit C int width
+	ArgOpNotEqual32 ArgOp = "ne32" // compares low 32-bit C int width
+	ArgOpMaskAny    ArgOp = "mask_any"
+	ArgOpMaskAll    ArgOp = "mask_all"
+	ArgOpGreaterEq  ArgOp = "ge"
+	ArgOpLessEq     ArgOp = "le"
 )
 
 // SyscallArgFilter matches one of the 6 syscall argument registers (index 0..5).
 type SyscallArgFilter struct {
 	// Index selects the syscall argument register (0..5).
 	Index uint8 `json:"index"`
-	// Op selects the comparison operator ("eq", "ne", "mask_any", "mask_all", "ge", "le").
+	// Op selects the comparison operator ("eq", "ne", "eq32", "ne32", "mask_any", "mask_all", "ge", "le").
 	Op ArgOp `json:"op"`
-	// Value is the 64-bit immediate operand compared against the argument register.
+	// Value is the immediate operand compared against the argument register.
 	Value uint64 `json:"value"`
 }
 
@@ -147,6 +152,10 @@ func (f SyscallArgFilter) Matches(args [6]uint64) bool {
 		return v == f.Value
 	case ArgOpNotEqual:
 		return v != f.Value
+	case ArgOpEqual32:
+		return uint32(v) == uint32(f.Value)
+	case ArgOpNotEqual32:
+		return uint32(v) != uint32(f.Value)
 	case ArgOpMaskAny:
 		return (v & f.Value) != 0
 	case ArgOpMaskAll:
@@ -170,7 +179,10 @@ type SyscallRule struct {
 	Effect RuleEffect `json:"effect"`
 	// Action optionally overrides the policy mode when Effect is "deny".
 	Action EnforcementMode `json:"action,omitempty"`
-	// SyscallName is the canonical Linux x86_64 syscall name (e.g., "ptrace", "openat").
+	// Errno optionally overrides the errno returned when resolved Action is "enforce_deny"
+	// (defaults to EPERM=1; e.g., ENOSYS=38 for safe clone3 fallback).
+	Errno int `json:"errno,omitempty"`
+	// SyscallName is the canonical Linux syscall name for the policy's Arch (e.g., "ptrace", "openat").
 	SyscallName string `json:"syscallName,omitempty"`
 	// SyscallNumber optionally specifies the numeric syscall ID (-1 or omitted when using SyscallName).
 	SyscallNumber *int `json:"syscallNumber,omitempty"`
@@ -237,6 +249,9 @@ type NetworkRule struct {
 	PortStart uint16 `json:"portStart,omitempty"`
 	// PortEnd optionally restricts the destination/bind port upper bound (inclusive, defaults to PortStart if PortStart > 0).
 	PortEnd uint16 `json:"portEnd,omitempty"`
+	// MatchPortZero restricts matching strictly to port 0 (e.g., pre-bind ephemeral
+	// loopback requests such as 127.0.0.1:0 or [::1]:0). Cannot be combined with PortStart/PortEnd.
+	MatchPortZero bool `json:"matchPortZero,omitempty"`
 	// Reason explains the security rationale recorded in audit events.
 	Reason string `json:"reason,omitempty"`
 }
@@ -308,6 +323,7 @@ type compiledSyscallRule struct {
 	num    uint32
 	name   string
 	action EnforcementMode
+	errno  int
 }
 
 type compiledProcessRule struct {
@@ -319,13 +335,14 @@ type compiledProcessRule struct {
 }
 
 type compiledNetworkRule struct {
-	rule      NetworkRule
-	prefix    netip.Prefix
-	direction NetworkDirection
-	protocol  string
-	portStart uint16
-	portEnd   uint16
-	action    EnforcementMode
+	rule          NetworkRule
+	prefix        netip.Prefix
+	direction     NetworkDirection
+	protocol      string
+	portStart     uint16
+	portEnd       uint16
+	matchPortZero bool
+	action        EnforcementMode
 }
 
 // NormalizeCanonicalPath validates and cleans an absolute POSIX path prior to
@@ -495,9 +512,15 @@ func CompilePolicy(spec TracingPolicy) (*CompiledPolicy, error) {
 		if len(r.ArgFilters) > MaxArgFiltersPerRule {
 			return nil, fmt.Errorf("%w: syscall rule %q has %d arg filters (max %d)", ErrInvalidPolicy, r.ID, len(r.ArgFilters), MaxArgFiltersPerRule)
 		}
-		num, name, err := resolveSyscallIdentity(r.SyscallName, r.SyscallNumber)
+		num, name, err := resolveSyscallIdentityForArch(spec.Arch, r.SyscallName, r.SyscallNumber)
 		if err != nil {
 			return nil, fmt.Errorf("syscall rule %q: %w", r.ID, err)
+		}
+		if r.Errno < 0 || r.Errno > 4095 {
+			return nil, fmt.Errorf("%w: syscall rule %q errno %d out of range [0..4095]", ErrInvalidPolicy, r.ID, r.Errno)
+		}
+		if r.Errno > 0 && r.Effect != EffectDeny {
+			return nil, fmt.Errorf("%w: syscall rule %q cannot set errno on allow rule", ErrInvalidPolicy, r.ID)
 		}
 		var argsKeyB strings.Builder
 		for _, af := range r.ArgFilters {
@@ -505,7 +528,7 @@ func CompilePolicy(spec TracingPolicy) (*CompiledPolicy, error) {
 				return nil, fmt.Errorf("%w: syscall rule %q arg index %d out of range [0..5]", ErrInvalidPolicy, r.ID, af.Index)
 			}
 			switch af.Op {
-			case ArgOpEqual, ArgOpNotEqual, ArgOpMaskAny, ArgOpMaskAll, ArgOpGreaterEq, ArgOpLessEq:
+			case ArgOpEqual, ArgOpNotEqual, ArgOpEqual32, ArgOpNotEqual32, ArgOpMaskAny, ArgOpMaskAll, ArgOpGreaterEq, ArgOpLessEq:
 			default:
 				return nil, fmt.Errorf("%w: syscall rule %q unsupported arg op %q", ErrInvalidPolicy, r.ID, af.Op)
 			}
@@ -521,7 +544,15 @@ func CompilePolicy(spec TracingPolicy) (*CompiledPolicy, error) {
 		if err != nil {
 			return nil, fmt.Errorf("syscall rule %q: %w", r.ID, err)
 		}
-		cr := compiledSyscallRule{rule: r, num: num, name: name, action: act}
+		effErrno := 0
+		if r.Effect == EffectDeny && act == ModeEnforceDeny {
+			if r.Errno > 0 {
+				effErrno = r.Errno
+			} else {
+				effErrno = ErrnoEPERM
+			}
+		}
+		cr := compiledSyscallRule{rule: r, num: num, name: name, action: act, errno: effErrno}
 		cp.syscallsByNum[num] = append(cp.syscallsByNum[num], cr)
 		cp.allSyscalls = append(cp.allSyscalls, cr)
 	}
@@ -619,12 +650,13 @@ func CompilePolicy(spec TracingPolicy) (*CompiledPolicy, error) {
 
 	// 3. Compile and conflict-check Network rules.
 	type netConflictKey struct {
-		cidr      string
-		direction NetworkDirection
-		protocol  string
-		portStart uint16
-		portEnd   uint16
-		priority  int
+		cidr          string
+		direction     NetworkDirection
+		protocol      string
+		portStart     uint16
+		portEnd       uint16
+		matchPortZero bool
+		priority      int
 	}
 	netConflicts := make(map[netConflictKey]RuleEffect, len(spec.NetworkRules))
 
@@ -654,6 +686,9 @@ func CompilePolicy(spec TracingPolicy) (*CompiledPolicy, error) {
 		if proto != "" && proto != "tcp" && proto != "udp" {
 			return nil, fmt.Errorf("%w: network rule %q invalid protocol %q", ErrInvalidPolicy, r.ID, proto)
 		}
+		if r.MatchPortZero && (r.PortStart != 0 || r.PortEnd != 0) {
+			return nil, fmt.Errorf("%w: network rule %q cannot combine matchPortZero with portStart/portEnd", ErrInvalidPolicy, r.ID)
+		}
 		pStart, pEnd := r.PortStart, r.PortEnd
 		if pStart > 0 && pEnd == 0 {
 			pEnd = pStart
@@ -666,7 +701,7 @@ func CompilePolicy(spec TracingPolicy) (*CompiledPolicy, error) {
 		}
 		ck := netConflictKey{
 			cidr: pfx.String(), direction: dir, protocol: proto,
-			portStart: pStart, portEnd: pEnd, priority: r.Priority,
+			portStart: pStart, portEnd: pEnd, matchPortZero: r.MatchPortZero, priority: r.Priority,
 		}
 		if prevEff, exists := netConflicts[ck]; exists && prevEff != r.Effect {
 			return nil, fmt.Errorf("%w: network CIDR %s priority %d", ErrPolicyConflict, pfx.String(), r.Priority)
@@ -678,13 +713,14 @@ func CompilePolicy(spec TracingPolicy) (*CompiledPolicy, error) {
 			return nil, fmt.Errorf("network rule %q: %w", r.ID, err)
 		}
 		cr := compiledNetworkRule{
-			rule:      r,
-			prefix:    pfx,
-			direction: dir,
-			protocol:  proto,
-			portStart: pStart,
-			portEnd:   pEnd,
-			action:    act,
+			rule:          r,
+			prefix:        pfx,
+			direction:     dir,
+			protocol:      proto,
+			portStart:     pStart,
+			portEnd:       pEnd,
+			matchPortZero: r.MatchPortZero,
+			action:        act,
 		}
 		cp.allNets = append(cp.allNets, cr)
 		bits := pfx.Bits()
@@ -773,7 +809,7 @@ func sortNetworkRules(rules []compiledNetworkRule) {
 
 func computePolicyDigest(cp *CompiledPolicy) string {
 	h := sha256.New()
-	h.Write([]byte("hanzo-sandboxpolicy-v1\x00"))
+	h.Write([]byte("hanzo-sandboxpolicy-v2\x00"))
 	writeStr := func(s string) {
 		var b [4]byte
 		binary.BigEndian.PutUint32(b[:], uint32(len(s)))
@@ -785,205 +821,549 @@ func computePolicyDigest(cp *CompiledPolicy) string {
 		binary.BigEndian.PutUint64(b[:], v)
 		h.Write(b[:])
 	}
+	writeBool := func(v bool) {
+		if v {
+			h.Write([]byte{1})
+		} else {
+			h.Write([]byte{0})
+		}
+	}
+
+	// Policy header and all global enforcement defaults.
 	writeStr(cp.Spec.ID)
 	writeStr(cp.Spec.Name)
 	writeU64(cp.Spec.Version)
 	writeStr(string(cp.Spec.Mode))
 	writeStr(cp.Spec.Arch)
+	writeBool(cp.Spec.DefaultSyscallAllow)
+	writeBool(cp.Spec.DefaultProcessAllow)
+	writeBool(cp.Spec.DefaultNetworkAllow)
+	writeBool(cp.Spec.DenyPrivEsc)
+	writeBool(cp.Spec.AuditAllowEvents)
 	writeStr(cp.BPFDigest)
+
+	// Complete syscall rule enforcement fields.
+	writeU64(uint64(len(cp.allSyscalls)))
 	for _, r := range cp.allSyscalls {
 		writeStr(r.rule.ID)
+		writeU64(uint64(r.rule.Priority))
 		writeU64(uint64(r.num))
 		writeStr(string(r.rule.Effect))
 		writeStr(string(r.action))
+		writeU64(uint64(r.errno))
+		writeBool(r.rule.AuditOnAllow)
+		writeU64(uint64(len(r.rule.ArgFilters)))
+		for _, af := range r.rule.ArgFilters {
+			writeU64(uint64(af.Index))
+			writeStr(string(af.Op))
+			writeU64(af.Value)
+		}
 	}
+
+	// Complete process rule enforcement fields.
+	writeU64(uint64(len(cp.allProcs)))
 	for _, r := range cp.allProcs {
 		writeStr(r.rule.ID)
+		writeU64(uint64(r.rule.Priority))
 		writeStr(r.exact)
 		writeStr(r.prefix)
+		writeStr(r.rule.ArgContains)
+		writeStr(r.rule.ArgRegex)
+		writeStr(r.rule.RequiredParent)
+		writeStr(r.rule.ForbiddenAncestor)
 		writeStr(string(r.rule.Effect))
 		writeStr(string(r.action))
 	}
+
+	// Complete network rule enforcement fields.
+	writeU64(uint64(len(cp.allNets)))
 	for _, r := range cp.allNets {
 		writeStr(r.rule.ID)
+		writeU64(uint64(r.rule.Priority))
 		writeStr(r.prefix.String())
+		writeStr(string(r.direction))
+		writeStr(r.protocol)
+		writeU64(uint64(r.portStart))
+		writeU64(uint64(r.portEnd))
+		writeBool(r.matchPortZero)
 		writeStr(string(r.rule.Effect))
 		writeStr(string(r.action))
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// Canonical Linux x86_64 syscall table for clean-room resolution and seccomp-BPF emission.
-var syscallNameToNum = map[string]uint32{
-	"read":              0,
-	"write":             1,
-	"open":              2,
-	"close":             3,
-	"stat":              4,
-	"fstat":             5,
-	"lstat":             6,
-	"poll":              7,
-	"lseek":             8,
-	"mmap":              9,
-	"mprotect":          10,
-	"munmap":            11,
-	"brk":               12,
-	"rt_sigaction":      13,
-	"rt_sigprocmask":    14,
-	"rt_sigreturn":      15,
-	"ioctl":             16,
-	"pread64":           17,
-	"pwrite64":          18,
-	"readv":             19,
-	"writev":            20,
-	"access":            21,
-	"pipe":              22,
-	"select":            23,
-	"sched_yield":       24,
-	"mremap":            25,
-	"madvise":           28,
-	"dup":               32,
-	"dup2":              33,
-	"nanosleep":         35,
-	"getpid":            39,
-	"socket":            41,
-	"connect":           42,
-	"accept":            43,
-	"sendto":            44,
-	"recvfrom":          45,
-	"sendmsg":           46,
-	"recvmsg":           47,
-	"shutdown":          48,
-	"bind":              49,
-	"listen":            50,
-	"getsockname":       51,
-	"getpeername":       52,
-	"socketpair":        53,
-	"setsockopt":        54,
-	"getsockopt":        55,
-	"clone":             56,
-	"fork":              57,
-	"vfork":             58,
-	"execve":            59,
-	"exit":              60,
-	"wait4":             61,
-	"kill":              62,
-	"uname":             63,
-	"fcntl":             72,
-	"flock":             73,
-	"fsync":             74,
-	"fdatasync":         75,
-	"truncate":          76,
-	"ftruncate":         77,
-	"getcwd":            79,
-	"chdir":             80,
-	"fchdir":            81,
-	"rename":            82,
-	"mkdir":             83,
-	"rmdir":             84,
-	"link":              86,
-	"unlink":            87,
-	"symlink":           88,
-	"readlink":          89,
-	"chmod":             90,
-	"fchmod":            91,
-	"umask":             95,
-	"gettimeofday":      96,
-	"getrlimit":         97,
-	"getrusage":         98,
-	"sysinfo":           99,
-	"times":             100,
-	"ptrace":            101,
-	"getuid":            102,
-	"getgid":            104,
-	"setuid":            105,
-	"setgid":            106,
-	"geteuid":           107,
-	"getegid":           108,
-	"getppid":           110,
-	"sigaltstack":       131,
-	"statfs":            137,
-	"fstatfs":           138,
-	"pivot_root":        155,
-	"prctl":             157,
-	"arch_prctl":        158,
-	"chroot":            161,
-	"mount":             165,
-	"umount2":           166,
-	"init_module":       175,
-	"delete_module":     176,
-	"gettid":            186,
-	"futex":             202,
-	"getdents64":        217,
-	"set_tid_address":   218,
-	"clock_gettime":     228,
-	"clock_nanosleep":   230,
-	"exit_group":        231,
-	"epoll_ctl":         233,
-	"tgkill":            234,
-	"kexec_load":        246,
-	"waitid":            247,
-	"add_key":           248,
-	"keyctl":            250,
-	"openat":            257,
-	"mkdirat":           258,
-	"newfstatat":        262,
-	"unlinkat":          263,
-	"renameat":          264,
-	"linkat":            265,
-	"symlinkat":         266,
-	"readlinkat":        267,
-	"fchmodat":          268,
-	"faccessat":         269,
-	"unshare":           272,
-	"set_robust_list":   273,
-	"epoll_pwait":       281,
-	"accept4":           288,
-	"eventfd2":          290,
-	"epoll_create1":     291,
-	"dup3":              292,
-	"pipe2":             293,
-	"perf_event_open":   298,
-	"prlimit64":         302,
-	"open_by_handle_at": 304,
-	"setns":             308,
-	"process_vm_readv":  310,
-	"process_vm_writev": 311,
-	"finit_module":      313,
-	"renameat2":         316,
-	"getrandom":         318,
-	"memfd_create":      319,
-	"kexec_file_load":   320,
-	"bpf":               321,
-	"userfaultfd":       323,
-	"statx":             332,
-	"io_uring_setup":    425,
-	"clone3":            435,
+// Canonical Linux x86_64 (amd64) syscall table verified against asm/unistd_64.h.
+var amd64SyscallNameToNum = map[string]uint32{
+	"read":               0,
+	"write":              1,
+	"open":               2,
+	"close":              3,
+	"stat":               4,
+	"fstat":              5,
+	"lstat":              6,
+	"poll":               7,
+	"lseek":              8,
+	"mmap":               9,
+	"mprotect":           10,
+	"munmap":             11,
+	"brk":                12,
+	"rt_sigaction":       13,
+	"rt_sigprocmask":     14,
+	"rt_sigreturn":       15,
+	"ioctl":              16,
+	"pread64":            17,
+	"pwrite64":           18,
+	"readv":              19,
+	"writev":             20,
+	"access":             21,
+	"pipe":               22,
+	"select":             23,
+	"sched_yield":        24,
+	"mremap":             25,
+	"msync":              26,
+	"mincore":            27,
+	"madvise":            28,
+	"dup":                32,
+	"dup2":               33,
+	"pause":              34,
+	"nanosleep":          35,
+	"getitimer":          36,
+	"alarm":              37,
+	"setitimer":          38,
+	"getpid":             39,
+	"sendfile":           40,
+	"socket":             41,
+	"connect":            42,
+	"accept":             43,
+	"sendto":             44,
+	"recvfrom":           45,
+	"sendmsg":            46,
+	"recvmsg":            47,
+	"shutdown":           48,
+	"bind":               49,
+	"listen":             50,
+	"getsockname":        51,
+	"getpeername":        52,
+	"socketpair":         53,
+	"setsockopt":         54,
+	"getsockopt":         55,
+	"clone":              56,
+	"fork":               57,
+	"vfork":              58,
+	"execve":             59,
+	"exit":               60,
+	"wait4":              61,
+	"kill":               62,
+	"uname":              63,
+	"fcntl":              72,
+	"flock":              73,
+	"fsync":              74,
+	"fdatasync":          75,
+	"truncate":           76,
+	"ftruncate":          77,
+	"getcwd":             79,
+	"chdir":              80,
+	"fchdir":             81,
+	"rename":             82,
+	"mkdir":              83,
+	"rmdir":              84,
+	"link":               86,
+	"unlink":             87,
+	"symlink":            88,
+	"readlink":           89,
+	"chmod":              90,
+	"fchmod":             91,
+	"chown":              92,
+	"fchown":             93,
+	"lchown":             94,
+	"umask":              95,
+	"gettimeofday":       96,
+	"getrlimit":          97,
+	"getrusage":          98,
+	"sysinfo":            99,
+	"times":              100,
+	"ptrace":             101,
+	"getuid":             102,
+	"getgid":             104,
+	"setuid":             105,
+	"setgid":             106,
+	"geteuid":            107,
+	"getegid":            108,
+	"setpgid":            109,
+	"getppid":            110,
+	"getpgrp":            111,
+	"setsid":             112,
+	"setreuid":           113,
+	"setregid":           114,
+	"getgroups":          115,
+	"setresuid":          117,
+	"getresuid":          118,
+	"setresgid":          119,
+	"getresgid":          120,
+	"getpgid":            121,
+	"getsid":             124,
+	"capget":             125,
+	"capset":             126,
+	"rt_sigpending":      127,
+	"rt_sigtimedwait":    128,
+	"rt_sigsuspend":      130,
+	"sigaltstack":        131,
+	"statfs":             137,
+	"fstatfs":            138,
+	"sched_getparam":     143,
+	"sched_getscheduler": 145,
+	"mlock":              149,
+	"munlock":            150,
+	"pivot_root":         155,
+	"prctl":              157,
+	"arch_prctl":         158,
+	"chroot":             161,
+	"mount":              165,
+	"umount2":            166,
+	"init_module":        175,
+	"delete_module":      176,
+	"gettid":             186,
+	"getxattr":           191,
+	"lgetxattr":          192,
+	"fgetxattr":          193,
+	"listxattr":          194,
+	"llistxattr":         195,
+	"flistxattr":         196,
+	"tkill":              200,
+	"futex":              202,
+	"sched_getaffinity":  204,
+	"getdents64":         217,
+	"set_tid_address":    218,
+	"restart_syscall":    219,
+	"fadvise64":          221,
+	"clock_gettime":      228,
+	"clock_getres":       229,
+	"clock_nanosleep":    230,
+	"exit_group":         231,
+	"epoll_ctl":          233,
+	"tgkill":             234,
+	"kexec_load":         246,
+	"waitid":             247,
+	"add_key":            248,
+	"request_key":        249,
+	"keyctl":             250,
+	"inotify_add_watch":  254,
+	"inotify_rm_watch":   255,
+	"openat":             257,
+	"mkdirat":            258,
+	"fchownat":           260,
+	"newfstatat":         262,
+	"unlinkat":           263,
+	"renameat":           264,
+	"linkat":             265,
+	"symlinkat":          266,
+	"readlinkat":         267,
+	"fchmodat":           268,
+	"faccessat":          269,
+	"pselect6":           270,
+	"ppoll":              271,
+	"unshare":            272,
+	"set_robust_list":    273,
+	"splice":             275,
+	"tee":                276,
+	"sync_file_range":    277,
+	"utimensat":          280,
+	"epoll_pwait":        281,
+	"timerfd_create":     283,
+	"fallocate":          285,
+	"timerfd_settime":    286,
+	"timerfd_gettime":    287,
+	"accept4":            288,
+	"signalfd4":          289,
+	"eventfd2":           290,
+	"epoll_create1":      291,
+	"dup3":               292,
+	"pipe2":              293,
+	"inotify_init1":      294,
+	"perf_event_open":    298,
+	"prlimit64":          302,
+	"open_by_handle_at":  304,
+	"setns":              308,
+	"getcpu":             309,
+	"process_vm_readv":   310,
+	"process_vm_writev":  311,
+	"finit_module":       313,
+	"renameat2":          316,
+	"seccomp":            317,
+	"getrandom":          318,
+	"memfd_create":       319,
+	"kexec_file_load":    320,
+	"bpf":                321,
+	"execveat":           322,
+	"userfaultfd":        323,
+	"membarrier":         324,
+	"copy_file_range":    326,
+	"statx":              332,
+	"rseq":               334,
+	"io_uring_setup":     425,
+	"io_uring_enter":     426,
+	"io_uring_register":  427,
+	"clone3":             435,
+	"faccessat2":         439,
+	"epoll_pwait2":       441,
 }
 
-var syscallNumToName = func() map[uint32]string {
-	m := make(map[uint32]string, len(syscallNameToNum))
-	for name, num := range syscallNameToNum {
+// Canonical Linux aarch64 (arm64) syscall table verified against asm-generic/unistd.h.
+var arm64SyscallNameToNum = map[string]uint32{
+	"getxattr":           8,
+	"lgetxattr":          9,
+	"fgetxattr":          10,
+	"listxattr":          11,
+	"llistxattr":         12,
+	"flistxattr":         13,
+	"getcwd":             17,
+	"eventfd2":           19,
+	"epoll_create1":      20,
+	"epoll_ctl":          21,
+	"epoll_pwait":        22,
+	"dup":                23,
+	"dup3":               24,
+	"fcntl":              25,
+	"inotify_init1":      26,
+	"inotify_add_watch":  27,
+	"inotify_rm_watch":   28,
+	"ioctl":              29,
+	"flock":              32,
+	"mkdirat":            34,
+	"unlinkat":           35,
+	"symlinkat":          36,
+	"linkat":             37,
+	"renameat":           38,
+	"umount2":            39,
+	"mount":              40,
+	"pivot_root":         41,
+	"statfs":             43,
+	"fstatfs":            44,
+	"truncate":           45,
+	"ftruncate":          46,
+	"fallocate":          47,
+	"faccessat":          48,
+	"chdir":              49,
+	"fchdir":             50,
+	"chroot":             51,
+	"fchmod":             52,
+	"fchmodat":           53,
+	"fchownat":           54,
+	"fchown":             55,
+	"openat":             56,
+	"close":              57,
+	"pipe2":              59,
+	"getdents64":         61,
+	"lseek":              62,
+	"read":               63,
+	"write":              64,
+	"readv":              65,
+	"writev":             66,
+	"pread64":            67,
+	"pwrite64":           68,
+	"sendfile":           71,
+	"pselect6":           72,
+	"ppoll":              73,
+	"signalfd4":          74,
+	"splice":             76,
+	"tee":                77,
+	"readlinkat":         78,
+	"newfstatat":         79,
+	"fstat":              80,
+	"fsync":              82,
+	"fdatasync":          83,
+	"sync_file_range":    84,
+	"timerfd_create":     85,
+	"timerfd_settime":    86,
+	"timerfd_gettime":    87,
+	"utimensat":          88,
+	"capget":             90,
+	"capset":             91,
+	"exit":               93,
+	"exit_group":         94,
+	"waitid":             95,
+	"set_tid_address":    96,
+	"unshare":            97,
+	"futex":              98,
+	"set_robust_list":    99,
+	"nanosleep":          101,
+	"getitimer":          102,
+	"setitimer":          103,
+	"kexec_load":         104,
+	"init_module":        105,
+	"delete_module":      106,
+	"clock_gettime":      113,
+	"clock_getres":       114,
+	"clock_nanosleep":    115,
+	"ptrace":             117,
+	"sched_getscheduler": 120,
+	"sched_getparam":     121,
+	"sched_getaffinity":  123,
+	"sched_yield":        124,
+	"restart_syscall":    128,
+	"kill":               129,
+	"tkill":              130,
+	"tgkill":             131,
+	"sigaltstack":        132,
+	"rt_sigsuspend":      133,
+	"rt_sigaction":       134,
+	"rt_sigprocmask":     135,
+	"rt_sigpending":      136,
+	"rt_sigtimedwait":    137,
+	"rt_sigreturn":       139,
+	"setregid":           143,
+	"setgid":             144,
+	"setreuid":           145,
+	"setuid":             146,
+	"setresuid":          147,
+	"getresuid":          148,
+	"setresgid":          149,
+	"getresgid":          150,
+	"times":              153,
+	"setpgid":            154,
+	"getpgid":            155,
+	"getsid":             156,
+	"setsid":             157,
+	"getgroups":          158,
+	"uname":              160,
+	"getrlimit":          163,
+	"getrusage":          165,
+	"umask":              166,
+	"prctl":              167,
+	"getcpu":             168,
+	"gettimeofday":       169,
+	"getpid":             172,
+	"getppid":            173,
+	"getuid":             174,
+	"geteuid":            175,
+	"getgid":             176,
+	"getegid":            177,
+	"gettid":             178,
+	"sysinfo":            179,
+	"socket":             198,
+	"socketpair":         199,
+	"bind":               200,
+	"listen":             201,
+	"accept":             202,
+	"connect":            203,
+	"getsockname":        204,
+	"getpeername":        205,
+	"sendto":             206,
+	"recvfrom":           207,
+	"setsockopt":         208,
+	"getsockopt":         209,
+	"shutdown":           210,
+	"sendmsg":            211,
+	"recvmsg":            212,
+	"brk":                214,
+	"munmap":             215,
+	"mremap":             216,
+	"add_key":            217,
+	"request_key":        218,
+	"keyctl":             219,
+	"clone":              220,
+	"execve":             221,
+	"mmap":               222,
+	"fadvise64":          223,
+	"mprotect":           226,
+	"msync":              227,
+	"mlock":              228,
+	"munlock":            229,
+	"mincore":            232,
+	"madvise":            233,
+	"perf_event_open":    241,
+	"accept4":            242,
+	"wait4":              260,
+	"prlimit64":          261,
+	"open_by_handle_at":  265,
+	"setns":              268,
+	"process_vm_readv":   270,
+	"process_vm_writev":  271,
+	"finit_module":       273,
+	"renameat2":          276,
+	"seccomp":            277,
+	"getrandom":          278,
+	"memfd_create":       279,
+	"bpf":                280,
+	"execveat":           281,
+	"userfaultfd":        282,
+	"membarrier":         283,
+	"copy_file_range":    285,
+	"statx":              291,
+	"rseq":               293,
+	"kexec_file_load":    294,
+	"io_uring_setup":     425,
+	"io_uring_enter":     426,
+	"io_uring_register":  427,
+	"clone3":             435,
+	"faccessat2":         439,
+	"epoll_pwait2":       441,
+}
+
+func invertSyscallTable(nameToNum map[string]uint32) map[uint32]string {
+	m := make(map[uint32]string, len(nameToNum))
+	for name, num := range nameToNum {
 		m[num] = name
 	}
 	return m
-}()
+}
 
-// LookupSyscallNumber resolves a canonical Linux x86_64 syscall name to its number.
+var (
+	amd64SyscallNumToName = invertSyscallTable(amd64SyscallNameToNum)
+	arm64SyscallNumToName = invertSyscallTable(arm64SyscallNameToNum)
+)
+
+func syscallTablesForArch(arch string) (map[string]uint32, map[uint32]string, error) {
+	switch arch {
+	case "", "amd64":
+		return amd64SyscallNameToNum, amd64SyscallNumToName, nil
+	case "arm64":
+		return arm64SyscallNameToNum, arm64SyscallNumToName, nil
+	default:
+		return nil, nil, fmt.Errorf("%w: unsupported arch %q", ErrInvalidPolicy, arch)
+	}
+}
+
+// LookupSyscallNumber resolves a canonical Linux x86_64 (amd64) syscall name to its number.
 func LookupSyscallNumber(name string) (uint32, bool) {
-	num, ok := syscallNameToNum[strings.ToLower(strings.TrimSpace(name))]
+	return LookupSyscallNumberForArch("amd64", name)
+}
+
+// LookupSyscallName resolves a Linux x86_64 (amd64) syscall number to its canonical name.
+func LookupSyscallName(num uint32) string {
+	return LookupSyscallNameForArch("amd64", num)
+}
+
+// LookupSyscallNumberForArch resolves a canonical Linux syscall name for arch ("amd64" or "arm64").
+func LookupSyscallNumberForArch(arch, name string) (uint32, bool) {
+	nameToNum, _, err := syscallTablesForArch(arch)
+	if err != nil {
+		return 0, false
+	}
+	num, ok := nameToNum[strings.ToLower(strings.TrimSpace(name))]
 	return num, ok
 }
 
-// LookupSyscallName resolves a Linux x86_64 syscall number to its canonical name.
-func LookupSyscallName(num uint32) string {
-	if name, ok := syscallNumToName[num]; ok {
-		return name
+// LookupSyscallNameForArch resolves a Linux syscall number to its canonical name for arch ("amd64" or "arm64").
+func LookupSyscallNameForArch(arch string, num uint32) string {
+	_, numToName, err := syscallTablesForArch(arch)
+	if err == nil {
+		if name, ok := numToName[num]; ok {
+			return name
+		}
 	}
 	return fmt.Sprintf("syscall_%d", num)
 }
 
 func resolveSyscallIdentity(name string, numPtr *int) (uint32, string, error) {
+	return resolveSyscallIdentityForArch("amd64", name, numPtr)
+}
+
+func resolveSyscallIdentityForArch(arch, name string, numPtr *int) (uint32, string, error) {
+	nameToNum, numToName, err := syscallTablesForArch(arch)
+	if err != nil {
+		return 0, "", err
+	}
 	cleanName := strings.ToLower(strings.TrimSpace(name))
 	if numPtr != nil {
 		if *numPtr < 0 || *numPtr > MaxSyscallNumber {
@@ -991,19 +1371,26 @@ func resolveSyscallIdentity(name string, numPtr *int) (uint32, string, error) {
 		}
 		num := uint32(*numPtr)
 		if cleanName != "" {
-			if expected, ok := syscallNameToNum[cleanName]; ok && expected != num {
-				return 0, "", fmt.Errorf("%w: syscall %q maps to %d, not %d", ErrInvalidPolicy, cleanName, expected, num)
+			expected, ok := nameToNum[cleanName]
+			if !ok {
+				return 0, "", fmt.Errorf("%w: unknown syscall name %q for arch %q", ErrInvalidPolicy, cleanName, arch)
+			}
+			if expected != num {
+				return 0, "", fmt.Errorf("%w: syscall %q on %s maps to %d, not %d", ErrInvalidPolicy, cleanName, arch, expected, num)
 			}
 			return num, cleanName, nil
 		}
-		return num, LookupSyscallName(num), nil
+		if resolved, ok := numToName[num]; ok {
+			return num, resolved, nil
+		}
+		return num, fmt.Sprintf("syscall_%d", num), nil
 	}
 	if cleanName == "" {
 		return 0, "", fmt.Errorf("%w: syscall rule requires syscallName or syscallNumber", ErrInvalidPolicy)
 	}
-	num, ok := syscallNameToNum[cleanName]
+	num, ok := nameToNum[cleanName]
 	if !ok {
-		return 0, "", fmt.Errorf("%w: unknown syscall name %q", ErrInvalidPolicy, cleanName)
+		return 0, "", fmt.Errorf("%w: unknown syscall name %q for arch %q", ErrInvalidPolicy, cleanName, arch)
 	}
 	return num, cleanName, nil
 }
@@ -1020,35 +1407,50 @@ const (
 )
 
 // DefaultVisorSandboxPolicy returns a hardened, fail-closed Tetragon-inspired
-// TracingPolicy tailored for Visor coding-agent sandboxes (Go, Git, Node/npm,
-// shell utilities) while blocking container escapes, kernel attacks, privilege
-// escalations, metadata-endpoint SSRF, and lateral private-network access.
+// TracingPolicy targeting linux/amd64 tailored for Visor coding-agent sandboxes
+// (Go, Git, Node/npm, shell utilities) while blocking container escapes, kernel
+// attacks, privilege escalations, metadata-endpoint SSRF, and lateral private-network access.
 func DefaultVisorSandboxPolicy(mode EnforcementMode) TracingPolicy {
+	return DefaultVisorSandboxPolicyForArch(mode, "amd64")
+}
+
+// DefaultVisorSandboxPolicyForArch returns the hardened Visor sandbox TracingPolicy
+// resolved for the requested target architecture ("amd64" or "arm64").
+func DefaultVisorSandboxPolicyForArch(mode EnforcementMode, arch string) TracingPolicy {
 	if mode == "" {
 		mode = ModeEnforceSigkill
+	}
+	if arch == "" {
+		arch = "amd64"
 	}
 
 	benignSyscalls := []string{
 		"read", "write", "open", "openat", "close", "stat", "fstat", "lstat",
-		"newfstatat", "statx", "poll", "lseek", "mmap", "mprotect", "munmap",
-		"brk", "rt_sigaction", "rt_sigprocmask", "rt_sigreturn", "ioctl",
-		"pread64", "pwrite64", "readv", "writev", "access", "faccessat",
-		"pipe", "pipe2", "select", "sched_yield", "mremap", "madvise",
-		"dup", "dup2", "dup3", "nanosleep", "clock_gettime", "clock_nanosleep",
+		"newfstatat", "statx", "poll", "ppoll", "lseek", "mmap", "mprotect", "munmap",
+		"brk", "rt_sigaction", "rt_sigprocmask", "rt_sigreturn", "rt_sigpending",
+		"rt_sigsuspend", "rt_sigtimedwait", "ioctl",
+		"pread64", "pwrite64", "readv", "writev", "access", "faccessat", "faccessat2",
+		"pipe", "pipe2", "select", "pselect6", "sched_yield", "sched_getaffinity",
+		"sched_getparam", "sched_getscheduler", "mremap", "madvise",
+		"dup", "dup2", "dup3", "nanosleep", "clock_gettime", "clock_getres", "clock_nanosleep",
 		"getpid", "gettid", "getppid", "getuid", "geteuid", "getgid", "getegid",
+		"getresuid", "getresgid", "getgroups", "getpgrp", "getpgid", "setpgid", "setsid", "getsid",
 		"socket", "connect", "accept", "accept4", "sendto", "recvfrom",
 		"sendmsg", "recvmsg", "shutdown", "bind", "listen", "getsockname",
 		"getpeername", "socketpair", "setsockopt", "getsockopt",
-		"clone", "clone3", "fork", "vfork", "execve", "exit", "exit_group",
-		"wait4", "waitid", "kill", "tgkill", "uname", "fcntl", "flock",
-		"fsync", "fdatasync", "truncate", "ftruncate", "getdents64",
+		"clone", "fork", "vfork", "execve", "exit", "exit_group",
+		"wait4", "waitid", "kill", "tkill", "tgkill", "uname", "fcntl", "flock",
+		"fsync", "fdatasync", "truncate", "ftruncate", "fallocate", "fadvise64", "getdents64",
 		"getcwd", "chdir", "fchdir", "rename", "renameat", "renameat2",
 		"mkdir", "mkdirat", "rmdir", "link", "linkat", "unlink", "unlinkat",
 		"symlink", "symlinkat", "readlink", "readlinkat", "chmod", "fchmod",
-		"fchmodat", "umask", "gettimeofday", "getrlimit", "prlimit64",
+		"fchmodat", "umask", "utimensat", "gettimeofday", "getrlimit", "prlimit64",
 		"getrusage", "sysinfo", "times", "sigaltstack", "statfs", "fstatfs",
 		"prctl", "arch_prctl", "futex", "set_tid_address", "set_robust_list",
-		"epoll_create1", "epoll_ctl", "epoll_pwait", "eventfd2", "getrandom",
+		"epoll_create1", "epoll_ctl", "epoll_pwait", "epoll_pwait2", "eventfd2",
+		"timerfd_create", "timerfd_settime", "timerfd_gettime", "signalfd4",
+		"sendfile", "copy_file_range", "getrandom", "rseq", "capget",
+		"membarrier", "restart_syscall", "getcpu",
 	}
 
 	sysRules := []SyscallRule{
@@ -1076,6 +1478,14 @@ func DefaultVisorSandboxPolicy(mode EnforcementMode) TracingPolicy {
 		{ID: "sys-deny-keyctl", Priority: 900, Effect: EffectDeny, Action: ModeEnforceDeny, SyscallName: "keyctl", Reason: "prevent kernel keyring tampering"},
 		{ID: "sys-deny-setuid", Priority: 950, Effect: EffectDeny, Action: ModeEnforceSigkill, SyscallName: "setuid", Reason: "prevent UID privilege escalation"},
 		{ID: "sys-deny-setgid", Priority: 950, Effect: EffectDeny, Action: ModeEnforceSigkill, SyscallName: "setgid", Reason: "prevent GID privilege escalation"},
+		// clone3 passes namespace flags inside a pointer-referenced struct clone_args that
+		// classic seccomp-BPF cannot inspect; return ENOSYS so glibc/Go safely fall back
+		// to legacy clone(2) where sys-deny-clone-ns enforces register-level flag checks.
+		{
+			ID: "sys-deny-clone3-enosys", Priority: 950, Effect: EffectDeny, Action: ModeEnforceDeny, Errno: ErrnoENOSYS,
+			SyscallName: "clone3",
+			Reason:      "return ENOSYS for clone3 so runtimes fall back to register-inspectable legacy clone",
+		},
 		// Argument-filtered syscall rules (e.g., clone with namespace flags, raw/netlink sockets).
 		{
 			ID: "sys-deny-clone-ns", Priority: 950, Effect: EffectDeny, Action: ModeEnforceSigkill,
@@ -1083,21 +1493,30 @@ func DefaultVisorSandboxPolicy(mode EnforcementMode) TracingPolicy {
 			ArgFilters:  []SyscallArgFilter{{Index: 0, Op: ArgOpMaskAny, Value: CloneNewUser | CloneNewNS | CloneNewPID | CloneNewNet}},
 			Reason:      "prevent user/mount/pid/net namespace creation via clone",
 		},
+		// Linux socket(int domain, ...) consumes domain as a 32-bit C int; compare with eq32
+		// so upper-bit register spoofing such as (1<<32) | AF_NETLINK cannot bypass the deny.
 		{
 			ID: "sys-deny-socket-packet", Priority: 900, Effect: EffectDeny, Action: ModeEnforceDeny,
 			SyscallName: "socket",
-			ArgFilters:  []SyscallArgFilter{{Index: 0, Op: ArgOpEqual, Value: AFPacket}},
+			ArgFilters:  []SyscallArgFilter{{Index: 0, Op: ArgOpEqual32, Value: AFPacket}},
 			Reason:      "prevent AF_PACKET raw packet capture",
 		},
 		{
 			ID: "sys-deny-socket-netlink", Priority: 900, Effect: EffectDeny, Action: ModeEnforceDeny,
 			SyscallName: "socket",
-			ArgFilters:  []SyscallArgFilter{{Index: 0, Op: ArgOpEqual, Value: AFNetlink}},
+			ArgFilters:  []SyscallArgFilter{{Index: 0, Op: ArgOpEqual32, Value: AFNetlink}},
 			Reason:      "prevent AF_NETLINK kernel netlink socket manipulation",
 		},
 	}
 
+	nameTable, _, tableErr := syscallTablesForArch(arch)
 	for _, name := range benignSyscalls {
+		if tableErr == nil {
+			if _, exists := nameTable[name]; !exists {
+				// Skip legacy x86_64-only syscalls (e.g., open, stat, fork) when emitting an arm64 policy.
+				continue
+			}
+		}
 		sysRules = append(sysRules, SyscallRule{
 			ID:          "sys-allow-" + name,
 			Priority:    100,
@@ -1130,8 +1549,7 @@ func DefaultVisorSandboxPolicy(mode EnforcementMode) TracingPolicy {
 		{ID: "proc-deny-arg-dev-tcp", Priority: 900, Effect: EffectDeny, Action: ModeEnforceSigkill, ArgContains: "/dev/tcp/", Reason: "block bash /dev/tcp reverse shell"},
 		{ID: "proc-deny-arg-imds", Priority: 900, Effect: EffectDeny, Action: ModeEnforceDeny, ArgContains: "169.254.169.254", Reason: "block cloud metadata SSRF via CLI"},
 
-		// Lineage restriction: disallow curl/wget spawned directly by untrusted python/node eval chains if desired,
-		// and forbid any descendant of an already-flagged untrusted helper.
+		// Lineage restriction: forbid netcat binary.
 		{ID: "proc-deny-lineage-nc", Priority: 900, Effect: EffectDeny, Action: ModeEnforceSigkill, BinaryExact: "/usr/bin/nc", Reason: "netcat binary forbidden"},
 
 		// Allowlisted Visor agent toolchain prefixes.
@@ -1161,6 +1579,10 @@ func DefaultVisorSandboxPolicy(mode EnforcementMode) TracingPolicy {
 		{ID: "net-deny-loopback-docker", Priority: 950, Effect: EffectDeny, Action: ModeEnforceSigkill, Direction: NetDirEgress, CIDR: "127.0.0.0/8", PortStart: 2375, PortEnd: 2379, Reason: "block loopback Docker/etcd daemon access"},
 		{ID: "net-deny-loopback-kube", Priority: 950, Effect: EffectDeny, Action: ModeEnforceSigkill, Direction: NetDirEgress, CIDR: "127.0.0.0/8", PortStart: 6443, PortEnd: 6443, Reason: "block loopback Kubernetes API access"},
 		{ID: "net-deny-loopback-v6-docker", Priority: 950, Effect: EffectDeny, Action: ModeEnforceSigkill, Direction: NetDirEgress, CIDR: "::1/128", PortStart: 2375, PortEnd: 2379, Reason: "block IPv6 loopback Docker/etcd daemon access"},
+		// Allow pre-bind port-0 loopback listeners (httptest.NewServer / net.Listen requesting
+		// kernel-assigned ephemeral ports) strictly on bind without relaxing egress restrictions.
+		{ID: "net-allow-loopback-bind-zero-v4", Priority: 200, Effect: EffectAllow, Direction: NetDirBind, Protocol: "tcp", CIDR: "127.0.0.0/8", MatchPortZero: true, Reason: "allow pre-bind port-0 IPv4 loopback ephemeral listener requests"},
+		{ID: "net-allow-loopback-bind-zero-v6", Priority: 200, Effect: EffectAllow, Direction: NetDirBind, Protocol: "tcp", CIDR: "::1/128", MatchPortZero: true, Reason: "allow pre-bind port-0 IPv6 loopback ephemeral listener requests"},
 		// Allow ephemeral local dev/test loopback binds & connections (e.g., httptest in go test).
 		{ID: "net-allow-loopback-ephemeral-v4", Priority: 200, Effect: EffectAllow, Direction: NetDirAny, Protocol: "tcp", CIDR: "127.0.0.0/8", PortStart: 32768, PortEnd: 65535, Reason: "allow ephemeral loopback ports for local unit tests"},
 		{ID: "net-allow-loopback-ephemeral-v6", Priority: 200, Effect: EffectAllow, Direction: NetDirAny, Protocol: "tcp", CIDR: "::1/128", PortStart: 32768, PortEnd: 65535, Reason: "allow ephemeral IPv6 loopback ports for local unit tests"},
@@ -1177,7 +1599,7 @@ func DefaultVisorSandboxPolicy(mode EnforcementMode) TracingPolicy {
 		Name:                "Visor Agent Sandbox Default Policy (HIP-1349)",
 		Version:             1,
 		Mode:                mode,
-		Arch:                "amd64",
+		Arch:                arch,
 		DefaultSyscallAllow: false,
 		DefaultProcessAllow: false,
 		DefaultNetworkAllow: false,

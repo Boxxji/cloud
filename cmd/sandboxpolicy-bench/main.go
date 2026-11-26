@@ -160,11 +160,12 @@ type RingBackpressureRun struct {
 }
 
 type NegativeRegime2Report struct {
-	Description       string              `json:"description"`
-	UserspaceAuditAll RingBackpressureRun `json:"userspaceAuditAll"`
-	InKernelBPFFilter RingBackpressureRun `json:"inKernelBpfFilter"`
-	P50SpeedupFactor  float64             `json:"p50SpeedupFactor"`
-	ThroughputGain    float64             `json:"throughputGain"`
+	Description          string              `json:"description"`
+	MeasurementMethod    string              `json:"measurementMethod"`
+	UserspaceAuditAll    RingBackpressureRun `json:"userspaceAuditAll"`
+	SimulatedBPFVMFilter RingBackpressureRun `json:"simulatedBpfVmFilter"`
+	P50SpeedupFactor     float64             `json:"p50SpeedupFactor"`
+	ThroughputGain       float64             `json:"throughputGain"`
 }
 
 func main() {
@@ -219,13 +220,13 @@ func main() {
 		report.NegativeRegime1.OverbroadPolicy.TotalBenignOps,
 		report.NegativeRegime1.OverbroadPolicy.FalsePositiveRatePct,
 	)
-	fmt.Printf("NegRegime2 (50k/s tight syscall loop): audit-all drops=%d (%.2f%%) p50=%.0fns | in-kernel BPF drops=%d (%.2f%%) p50=%.0fns (%.2fx faster)\n",
+	fmt.Printf("NegRegime2 (50k/s tight syscall loop, userspace Go cBPF VM simulation): audit-all drops=%d (%.2f%%) p50=%.0fns | simulated EvalBPF fast-path drops=%d (%.2f%%) p50=%.0fns (%.2fx faster)\n",
 		report.NegativeRegime2.UserspaceAuditAll.AuditDropped,
 		report.NegativeRegime2.UserspaceAuditAll.DropRatePct,
 		report.NegativeRegime2.UserspaceAuditAll.Latency.P50Ns,
-		report.NegativeRegime2.InKernelBPFFilter.AuditDropped,
-		report.NegativeRegime2.InKernelBPFFilter.DropRatePct,
-		report.NegativeRegime2.InKernelBPFFilter.Latency.P50Ns,
+		report.NegativeRegime2.SimulatedBPFVMFilter.AuditDropped,
+		report.NegativeRegime2.SimulatedBPFVMFilter.DropRatePct,
+		report.NegativeRegime2.SimulatedBPFVMFilter.Latency.P50Ns,
 		report.NegativeRegime2.P50SpeedupFactor,
 	)
 }
@@ -629,7 +630,8 @@ func buildBenignAgentWorkload(repoFiles []string) []sandboxpolicy.EvaluationRequ
 	ops := make([]sandboxpolicy.EvaluationRequest, 0, 240)
 	noNewPrivs := true
 
-	// 120 benign syscalls from real Go build/test, git, npm, and file I/O traces.
+	// 120 benign syscalls from real Go build/test, git, npm, and file I/O traces
+	// (including runtime initialization calls sched_getaffinity, rseq, and faccessat2).
 	benignSyscalls := []sandboxpolicy.SyscallEvent{
 		{SyscallName: "read", ProcessLineage: []string{"visor-init", "go"}},
 		{SyscallName: "write", ProcessLineage: []string{"visor-init", "go"}},
@@ -651,6 +653,10 @@ func buildBenignAgentWorkload(repoFiles []string) []sandboxpolicy.EvaluationRequ
 		{SyscallName: "getrandom", ProcessLineage: []string{"visor-init", "go"}},
 		{SyscallName: "clock_gettime", ProcessLineage: []string{"visor-init", "go"}},
 		{SyscallName: "pipe2", ProcessLineage: []string{"visor-init", "git"}},
+		{SyscallName: "sched_getaffinity", ProcessLineage: []string{"visor-init", "go"}},
+		{SyscallName: "rseq", ProcessLineage: []string{"visor-init", "git"}},
+		{SyscallName: "faccessat2", ProcessLineage: []string{"visor-init", "go"}},
+		{SyscallName: "capget", ProcessLineage: []string{"visor-init", "node"}},
 	}
 	for i := 0; i < 120; i++ {
 		ev := benignSyscalls[i%len(benignSyscalls)]
@@ -715,15 +721,16 @@ func buildBenignAgentWorkload(repoFiles []string) []sandboxpolicy.EvaluationRequ
 		})
 	}
 
-	// 48 benign network operations: public HTTPS (443), DNS (53), and ephemeral loopback httptest binds.
+	// 48 benign network operations: public HTTPS (443), DNS (53), pre-bind port-0
+	// loopback httptest listeners (127.0.0.1:0 / [::1]:0), and ephemeral loopback egress.
 	benignNets := []sandboxpolicy.NetworkEvent{
 		{Direction: sandboxpolicy.NetDirEgress, Protocol: "tcp", DestIP: "140.82.112.4", DestPort: 443, ProcessLineage: []string{"visor-init", "git"}},
 		{Direction: sandboxpolicy.NetDirEgress, Protocol: "tcp", DestIP: "142.250.190.46", DestPort: 443, ProcessLineage: []string{"visor-init", "go"}},
-		{Direction: sandboxpolicy.NetDirEgress, Protocol: "tcp", DestIP: "104.16.25.34", DestPort: 443, ProcessLineage: []string{"visor-init", "npm"}},
 		{Direction: sandboxpolicy.NetDirEgress, Protocol: "tcp", DestIP: "2606:4700:4700::1111", DestPort: 443, ProcessLineage: []string{"visor-init", "go"}},
 		{Direction: sandboxpolicy.NetDirEgress, Protocol: "udp", DestIP: "1.1.1.1", DestPort: 53, ProcessLineage: []string{"visor-init", "go"}},
 		{Direction: sandboxpolicy.NetDirEgress, Protocol: "tcp", DestIP: "8.8.8.8", DestPort: 53, ProcessLineage: []string{"visor-init", "npm"}},
-		{Direction: sandboxpolicy.NetDirBind, Protocol: "tcp", DestIP: "127.0.0.1", DestPort: 41234, ProcessLineage: []string{"visor-init", "pkg.test"}},
+		{Direction: sandboxpolicy.NetDirBind, Protocol: "tcp", DestIP: "127.0.0.1", DestPort: 0, ProcessLineage: []string{"visor-init", "pkg.test"}},
+		{Direction: sandboxpolicy.NetDirBind, Protocol: "tcp", DestIP: "::1", DestPort: 0, ProcessLineage: []string{"visor-init", "pkg.test"}},
 		{Direction: sandboxpolicy.NetDirEgress, Protocol: "tcp", DestIP: "::1", DestPort: 41234, ProcessLineage: []string{"visor-init", "pkg.test"}},
 	}
 	for i := 0; i < 48; i++ {
@@ -988,10 +995,10 @@ func runOverheadAndNegativeRegime1(benignOps []sandboxpolicy.EvaluationRequest) 
 			Reason:   "over-broad unanchored regex accidentally matching benign agent CLI args",
 		},
 	)
-	// Remove ephemeral loopback & IPv6 HTTPS allow rules to model naive IPv4-only egress policy.
+	// Remove ephemeral/port-0 loopback & IPv6 HTTPS allow rules to model naive IPv4-only egress policy.
 	filteredNet := make([]sandboxpolicy.NetworkRule, 0, len(overbroad.NetworkRules))
 	for _, nr := range overbroad.NetworkRules {
-		if strings.Contains(nr.ID, "loopback-ephemeral") || strings.Contains(nr.ID, "https-v6") {
+		if strings.Contains(nr.ID, "loopback-ephemeral") || strings.Contains(nr.ID, "loopback-bind-zero") || strings.Contains(nr.ID, "https-v6") {
 			continue
 		}
 		filteredNet = append(filteredNet, nr)
@@ -1080,19 +1087,21 @@ func runNegativeRegime2() (NegativeRegime2Report, error) {
 		Latency:              computeLatencyStats(dursAll, totAll),
 	}
 
-	// 2B: In-kernel seccomp-BPF allowlist fast-path (benign allowlisted syscalls never hit userspace audit ring).
-	polKern := sandboxpolicy.DefaultVisorSandboxPolicy(sandboxpolicy.ModeEnforceSigkill)
-	polKern.ID = "in-kernel-bpf-loop"
-	polKern.AuditAllowEvents = false
-	engKern := sandboxpolicy.NewEngine(sandboxpolicy.EngineConfig{
+	// 2B: Userspace Go cBPF VM simulation (EvalBPF) modeling the seccomp-BPF allowlist
+	// fast-path (benign allowlisted syscalls resolve without emitting to the audit ring).
+	// Note: EvalBPF runs in userspace Go without attaching a kernel filter or issuing raw syscalls.
+	polSim := sandboxpolicy.DefaultVisorSandboxPolicy(sandboxpolicy.ModeEnforceSigkill)
+	polSim.ID = "simulated-bpf-vm-loop"
+	polSim.AuditAllowEvents = false
+	engSim := sandboxpolicy.NewEngine(sandboxpolicy.EngineConfig{
 		AuditRingCapacity: ringCap,
 		RingOverflow:      sandboxpolicy.RingDropNewest,
 	})
-	cpKern, err := engKern.UpsertPolicy("org-kern", polKern)
+	cpSim, err := engSim.UpsertPolicy("org-sim", polSim)
 	if err != nil {
 		return NegativeRegime2Report{}, err
 	}
-	if _, err := engKern.BindSandbox("org-kern", "sb-loop", polKern.ID); err != nil {
+	if _, err := engSim.BindSandbox("org-sim", "sb-loop", polSim.ID); err != nil {
 		return NegativeRegime2Report{}, err
 	}
 
@@ -1100,37 +1109,38 @@ func runNegativeRegime2() (NegativeRegime2Report, error) {
 		{NR: 0, Arch: sandboxpolicy.AuditArchX86_64},   // read
 		{NR: 262, Arch: sandboxpolicy.AuditArchX86_64}, // newfstatat
 	}
-	dursKern := make([]int64, totalEvents)
-	t0Kern := time.Now()
+	dursSim := make([]int64, totalEvents)
+	t0Sim := time.Now()
 	for i := 0; i < totalEvents; i++ {
 		s := time.Now()
-		ret, _ := sandboxpolicy.EvalBPF(cpKern.BPF, bpfPkts[i&1])
+		ret, _ := sandboxpolicy.EvalBPF(cpSim.BPF, bpfPkts[i&1])
 		if ret != sandboxpolicy.SeccompRetAllow {
 			// Only non-ALLOW events escalate to userspace audit ring.
-			_ = engKern.Evaluate(loopEvs[i&1])
+			_ = engSim.Evaluate(loopEvs[i&1])
 		}
-		dursKern[i] = time.Since(s).Nanoseconds()
+		dursSim[i] = time.Since(s).Nanoseconds()
 	}
-	totKern := time.Since(t0Kern)
-	statsKern := engKern.TenantStats("org-kern").AuditRing
-	runKern := RingBackpressureRun{
+	totSim := time.Since(t0Sim)
+	statsSim := engSim.TenantStats("org-sim").AuditRing
+	runSim := RingBackpressureRun{
 		TotalEvents:          totalEvents,
 		SimulatedRateEPS:     simulatedRateEPS,
 		ConsumerDrainRateEPS: consumerDrainRateEPS,
 		RingCapacity:         ringCap,
-		AuditEmitted:         statsKern.TotalEmitted,
-		AuditDropped:         statsKern.Dropped,
+		AuditEmitted:         statsSim.TotalEmitted,
+		AuditDropped:         statsSim.Dropped,
 		DropRatePct:          0,
-		RetainedEvents:       statsKern.Retained,
-		Latency:              computeLatencyStats(dursKern, totKern),
+		RetainedEvents:       statsSim.Retained,
+		Latency:              computeLatencyStats(dursSim, totSim),
 	}
 
 	return NegativeRegime2Report{
-		Description:       "Simulates a 50,000 events/sec tight benign read/newfstatat loop against a 4,096-entry RingDropNewest buffer drained at 12,000 events/sec, comparing userspace audit-all emission vs in-kernel seccomp-BPF allowlist filtering.",
-		UserspaceAuditAll: runAll,
-		InKernelBPFFilter: runKern,
-		P50SpeedupFactor:  safeRatio(runAll.Latency.P50Ns, runKern.Latency.P50Ns),
-		ThroughputGain:    safeRatio(runKern.Latency.ThroughputEPS, runAll.Latency.ThroughputEPS),
+		Description:          "Userspace simulation of a 50,000 events/sec tight benign read/newfstatat loop against a 4,096-entry RingDropNewest buffer drained at 12,000 events/sec, comparing userspace audit-all emission (Engine.Evaluate + ring append) against the userspace Go cBPF VM interpreter (EvalBPF, AuditAllowEvents=false) simulating ring-bypassing allowlist filtering. Does not install a kernel filter or issue raw kernel syscalls.",
+		MeasurementMethod:    "userspace_go_cbpf_vm_simulation",
+		UserspaceAuditAll:    runAll,
+		SimulatedBPFVMFilter: runSim,
+		P50SpeedupFactor:     safeRatio(runAll.Latency.P50Ns, runSim.Latency.P50Ns),
+		ThroughputGain:       safeRatio(runSim.Latency.ThroughputEPS, runAll.Latency.ThroughputEPS),
 	}, nil
 }
 

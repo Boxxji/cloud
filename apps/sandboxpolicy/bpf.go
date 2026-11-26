@@ -51,6 +51,10 @@ const (
 	AuditArchX86_64  uint32 = 0xC000003E
 	AuditArchAArch64 uint32 = 0xC00000B7
 
+	// X32SyscallBit is Linux x86_64 __X32_SYSCALL_BIT (0x40000000).
+	// x32 ABI syscalls share AUDIT_ARCH_X86_64 and set bit 30 in seccomp_data.nr.
+	X32SyscallBit uint32 = 0x40000000
+
 	// Byte offsets inside Linux struct seccomp_data (64 bytes):
 	//   int   nr;                 // offset 0  (4 bytes)
 	//   __u32 arch;               // offset 4  (4 bytes)
@@ -132,20 +136,23 @@ func auditArchFor(arch string) (uint32, error) {
 	}
 }
 
-func seccompRetFor(effect RuleEffect, action EnforcementMode) uint32 {
+func seccompRetFor(effect RuleEffect, action EnforcementMode, denyErrno int) uint32 {
 	if effect == EffectAllow {
 		return SeccompRetAllow
+	}
+	if denyErrno <= 0 {
+		denyErrno = ErrnoEPERM
 	}
 	switch action {
 	case ModeAuditOnly:
 		return SeccompRetLog
 	case ModeEnforceDeny:
-		return SeccompRetErrnoBase | (uint32(ErrnoEPERM) & SeccompRetDataMask)
+		return SeccompRetErrnoBase | (uint32(denyErrno) & SeccompRetDataMask)
 	case ModeEnforceSigkill:
 		return SeccompRetKillProcess
 	default:
 		// Fail closed if action is somehow unspecified.
-		return SeccompRetErrnoBase | (uint32(ErrnoEPERM) & SeccompRetDataMask)
+		return SeccompRetErrnoBase | (uint32(denyErrno) & SeccompRetDataMask)
 	}
 }
 
@@ -178,7 +185,7 @@ func CompileSeccompBPF(cp *CompiledPolicy) (BPFProgram, error) {
 		return BPFProgram{}, err
 	}
 
-	insns := make([]BPFInsn, 0, 16+len(cp.allSyscalls)*3)
+	insns := make([]BPFInsn, 0, 18+len(cp.allSyscalls)*3)
 
 	// Prologue: enforce exact ABI architecture to prevent compat-32bit/x32
 	// syscall number confusion attacks (fail-closed with KILL_PROCESS).
@@ -188,9 +195,18 @@ func CompileSeccompBPF(cp *CompiledPolicy) (BPFProgram, error) {
 		BPFInsn{Code: OpRETK, K: SeccompRetKillProcess},
 		BPFInsn{Code: OpLDWABS, K: SeccompOffNR},
 	)
+	if archID == AuditArchX86_64 {
+		// Reject x32 ABI syscalls (nr >= __X32_SYSCALL_BIT = 0x40000000): x32 shares
+		// AUDIT_ARCH_X86_64 and would otherwise bypass native x86_64 deny rules when
+		// DefaultSyscallAllow=true.
+		insns = append(insns,
+			BPFInsn{Code: OpJGEK, JT: 0, JF: 1, K: X32SyscallBit},
+			BPFInsn{Code: OpRETK, K: SeccompRetKillProcess},
+		)
+	}
 
 	for _, cr := range cp.allSyscalls {
-		retCode := seccompRetFor(cr.rule.Effect, cr.action)
+		retCode := seccompRetFor(cr.rule.Effect, cr.action, cr.errno)
 		if len(cr.rule.ArgFilters) == 0 {
 			// Fast 2-instruction check; A remains equal to seccomp_data.nr on miss.
 			insns = append(insns,
@@ -210,7 +226,7 @@ func CompileSeccompBPF(cp *CompiledPolicy) (BPFProgram, error) {
 	// Default epilogue verdict.
 	defaultRet := SeccompRetAllow
 	if !cp.Spec.DefaultSyscallAllow {
-		defaultRet = seccompRetFor(EffectDeny, cp.Spec.Mode)
+		defaultRet = seccompRetFor(EffectDeny, cp.Spec.Mode, ErrnoEPERM)
 	}
 	insns = append(insns, BPFInsn{Code: OpRETK, K: defaultRet})
 
@@ -274,6 +290,18 @@ func compileArgFilteredSyscallBlock(nr uint32, filters []SyscallArgFilter, retCo
 			markPass(len(body)-1, false)
 			body = append(body, BPFInsn{Code: OpLDWABS, K: offHi})
 			body = append(body, BPFInsn{Code: OpJEQK, K: valHi})
+			markFail(len(body)-1, true)
+
+		case ArgOpEqual32:
+			// Compare only the kernel's low 32-bit int width (prevents upper-32-bit bypasses
+			// such as (1<<32) | AF_NETLINK on 32-bit C int syscall arguments).
+			body = append(body, BPFInsn{Code: OpLDWABS, K: offLo})
+			body = append(body, BPFInsn{Code: OpJEQK, K: valLo})
+			markFail(len(body)-1, false)
+
+		case ArgOpNotEqual32:
+			body = append(body, BPFInsn{Code: OpLDWABS, K: offLo})
+			body = append(body, BPFInsn{Code: OpJEQK, K: valLo})
 			markFail(len(body)-1, true)
 
 		case ArgOpMaskAny:

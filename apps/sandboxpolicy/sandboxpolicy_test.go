@@ -703,4 +703,380 @@ func TestHTTPWireSecurityIsolationAndQueryHijackImmunity(t *testing.T) {
 	}
 }
 
+// Regression test for Codex Finding #1: arm64 policies must resolve syscall identities
+// using the arm64 (asm-generic) syscall table throughout compilation and evaluation.
+func TestArm64SyscallResolutionAndBPFParity(t *testing.T) {
+	eng := NewEngine(EngineConfig{})
+	spec := DefaultVisorSandboxPolicyForArch(ModeEnforceSigkill, "arm64")
+	cp, err := eng.UpsertPolicy("org-arm64", spec)
+	if err != nil {
+		t.Fatalf("UpsertPolicy(arm64): %v", err)
+	}
+	if cp.BPF.AuditArch != AuditArchAArch64 {
+		t.Fatalf("arm64 AuditArch = 0x%x, want 0x%x", cp.BPF.AuditArch, AuditArchAArch64)
+	}
+	if _, err := eng.BindSandbox("org-arm64", "sb-arm64", cp.Spec.ID); err != nil {
+		t.Fatalf("BindSandbox: %v", err)
+	}
+
+	// Native arm64 setns(268) MUST be killed (not allowed via x86_64 fchmodat=268),
+	// while native arm64 write(64), read(63), fchmodat(53), sched_getaffinity(123),
+	// and rseq(293) MUST be allowed, and clone3(435) MUST return ENOSYS.
+	cases := []struct {
+		name      string
+		num       uint32
+		sysName   string
+		wantDec   Decision
+		wantErrno int
+	}{
+		{name: "arm64_setns_268", num: 268, sysName: "setns", wantDec: DecisionSigkill, wantErrno: SignalSIGKILL},
+		{name: "arm64_write_64", num: 64, sysName: "write", wantDec: DecisionAllow, wantErrno: 0},
+		{name: "arm64_read_63", num: 63, sysName: "read", wantDec: DecisionAllow, wantErrno: 0},
+		{name: "arm64_fchmodat_53", num: 53, sysName: "fchmodat", wantDec: DecisionAllow, wantErrno: 0},
+		{name: "arm64_sched_getaffinity_123", num: 123, sysName: "sched_getaffinity", wantDec: DecisionAllow, wantErrno: 0},
+		{name: "arm64_rseq_293", num: 293, sysName: "rseq", wantDec: DecisionAllow, wantErrno: 0},
+		{name: "arm64_clone3_435", num: 435, sysName: "clone3", wantDec: DecisionDeny, wantErrno: ErrnoENOSYS},
+	}
+
+	for _, tc := range cases {
+		// Check EvalBPF directly with native arm64 syscall number and AUDIT_ARCH_AARCH64.
+		ret, err := EvalBPF(cp.BPF, SeccompData{NR: tc.num, Arch: AuditArchAArch64})
+		if err != nil {
+			t.Fatalf("EvalBPF(%s): %v", tc.name, err)
+		}
+		bDec, bErr := DecisionFromSeccompRet(ret)
+		if bDec != tc.wantDec || bErr != tc.wantErrno {
+			t.Errorf("%s EvalBPF = (%s, errno=%d), want (%s, errno=%d)", tc.name, bDec, bErr, tc.wantDec, tc.wantErrno)
+		}
+
+		// Check Engine.Evaluate by name AND by numeric ID.
+		resByName := eng.Evaluate(EvaluationRequest{
+			TenantID: "org-arm64", SandboxID: "sb-arm64", Domain: DomainSyscall,
+			Syscall: &SyscallEvent{SyscallName: tc.sysName},
+		})
+		if resByName.Decision != tc.wantDec || resByName.Errno != tc.wantErrno {
+			t.Errorf("%s Engine(name=%s) = (%s, errno=%d), want (%s, errno=%d)", tc.name, tc.sysName, resByName.Decision, resByName.Errno, tc.wantDec, tc.wantErrno)
+		}
+
+		n := int(tc.num)
+		resByNum := eng.Evaluate(EvaluationRequest{
+			TenantID: "org-arm64", SandboxID: "sb-arm64", Domain: DomainSyscall,
+			Syscall: &SyscallEvent{SyscallNumber: &n},
+		})
+		if resByNum.Decision != tc.wantDec || resByNum.Errno != tc.wantErrno {
+			t.Errorf("%s Engine(num=%d) = (%s, errno=%d), want (%s, errno=%d)", tc.name, tc.num, resByNum.Decision, resByNum.Errno, tc.wantDec, tc.wantErrno)
+		}
+	}
+
+	// Retargeting an x86_64 policy with x86_64-only syscall ("open") to arm64 MUST fail closed.
+	x86Spec := DefaultVisorSandboxPolicy(ModeEnforceSigkill)
+	x86Spec.Arch = "arm64"
+	if _, err := CompilePolicy(x86Spec); !errors.Is(err, ErrInvalidPolicy) {
+		t.Fatalf("expected ErrInvalidPolicy when compiling x86_64-only syscalls for arm64, got %v", err)
+	}
+
+	// Mismatched (name, number) pair on arm64 (e.g., write=1 from x86_64) MUST fail closed.
+	badPair := TracingPolicy{
+		ID: "bad-arm64-pair", Mode: ModeEnforceSigkill, Arch: "arm64",
+		SyscallRules: []SyscallRule{
+			{ID: "r1", Priority: 100, Effect: EffectAllow, SyscallName: "write", SyscallNumber: intPtr(1)},
+		},
+	}
+	if _, err := CompilePolicy(badPair); !errors.Is(err, ErrInvalidPolicy) {
+		t.Fatalf("expected ErrInvalidPolicy for arm64 write=1 mismatch, got %v", err)
+	}
+}
+
+// Regression test for Codex Finding #2: socket family checks must compare at the kernel's
+// 32-bit int width so setting upper 32-bit register bits (e.g., (1<<32)|AF_NETLINK) cannot bypass.
+func TestSocketFamily32BitWidthRejectsUpperBitBypass(t *testing.T) {
+	eng := NewEngine(EngineConfig{})
+	cp, err := eng.UpsertPolicy("org-sock", DefaultVisorSandboxPolicy(ModeEnforceSigkill))
+	if err != nil {
+		t.Fatalf("UpsertPolicy: %v", err)
+	}
+	if _, err := eng.BindSandbox("org-sock", "sb-sock", cp.Spec.ID); err != nil {
+		t.Fatalf("BindSandbox: %v", err)
+	}
+
+	sockNum, _ := LookupSyscallNumber("socket")
+	cases := []struct {
+		name    string
+		family  uint64
+		wantDec Decision
+	}{
+		{name: "af_inet_allowed", family: 2, wantDec: DecisionAllow},
+		{name: "af_inet6_allowed", family: 10, wantDec: DecisionAllow},
+		{name: "af_netlink_denied", family: AFNetlink, wantDec: DecisionDeny},
+		{name: "af_netlink_upper_bit_denied", family: (1 << 32) | AFNetlink, wantDec: DecisionDeny},
+		{name: "af_netlink_high_garbage_denied", family: 0xdeadbeef00000000 | AFNetlink, wantDec: DecisionDeny},
+		{name: "af_packet_denied", family: AFPacket, wantDec: DecisionDeny},
+		{name: "af_packet_upper_bit_denied", family: (1 << 32) | AFPacket, wantDec: DecisionDeny},
+	}
+
+	for _, tc := range cases {
+		res := eng.Evaluate(EvaluationRequest{
+			TenantID: "org-sock", SandboxID: "sb-sock", Domain: DomainSyscall,
+			Syscall: &SyscallEvent{SyscallName: "socket", Args: [6]uint64{tc.family, 1, 0}},
+		})
+		if res.Decision != tc.wantDec {
+			t.Errorf("%s Engine = %s (rule=%s), want %s", tc.name, res.Decision, res.RuleID, tc.wantDec)
+		}
+		ret, err := EvalBPF(cp.BPF, SeccompData{
+			NR:   sockNum,
+			Arch: AuditArchX86_64,
+			Args: [6]uint64{tc.family, 1, 0},
+		})
+		if err != nil {
+			t.Fatalf("EvalBPF(%s): %v", tc.name, err)
+		}
+		bDec, _ := DecisionFromSeccompRet(ret)
+		if bDec != tc.wantDec {
+			t.Errorf("%s EvalBPF = %s (ret=0x%x), want %s", tc.name, bDec, ret, tc.wantDec)
+		}
+	}
+}
+
+// Regression test for Codex Finding #3: clone3 must not be unconditionally allowed; it returns
+// ENOSYS so runtimes fall back to legacy clone(2) where sys-deny-clone-ns inspects flags.
+func TestClone3ReturnsENOSYSForSafeFallback(t *testing.T) {
+	clone3Num, ok := LookupSyscallNumber("clone3")
+	if !ok {
+		t.Fatal("clone3 missing from amd64 table")
+	}
+	for _, mode := range []EnforcementMode{ModeAuditOnly, ModeEnforceDeny, ModeEnforceSigkill} {
+		eng := NewEngine(EngineConfig{})
+		cp, err := eng.UpsertPolicy("org-c3", DefaultVisorSandboxPolicy(mode))
+		if err != nil {
+			t.Fatalf("UpsertPolicy(%s): %v", mode, err)
+		}
+		if _, err := eng.BindSandbox("org-c3", "sb-c3", cp.Spec.ID); err != nil {
+			t.Fatalf("BindSandbox: %v", err)
+		}
+
+		res := eng.Evaluate(EvaluationRequest{
+			TenantID: "org-c3", SandboxID: "sb-c3", Domain: DomainSyscall,
+			Syscall: &SyscallEvent{SyscallName: "clone3"},
+		})
+		ret, err := EvalBPF(cp.BPF, SeccompData{NR: clone3Num, Arch: AuditArchX86_64})
+		if err != nil {
+			t.Fatalf("EvalBPF(%s): %v", mode, err)
+		}
+		bDec, bErr := DecisionFromSeccompRet(ret)
+
+		if mode == ModeAuditOnly {
+			if res.Decision != DecisionAuditAlert || bDec != DecisionAuditAlert {
+				t.Errorf("mode=%s: Engine=%s BPF=%s, want AUDIT_ALERT", mode, res.Decision, bDec)
+			}
+		} else {
+			if res.Decision != DecisionDeny || res.Errno != ErrnoENOSYS {
+				t.Errorf("mode=%s: Engine=(%s, errno=%d), want (DENY, ENOSYS=38)", mode, res.Decision, res.Errno)
+			}
+			if bDec != DecisionDeny || bErr != ErrnoENOSYS {
+				t.Errorf("mode=%s: BPF=(%s, errno=%d), want (DENY, ENOSYS=38)", mode, bDec, bErr)
+			}
+		}
+	}
+}
+
+// Regression test for Codex Finding #4: amd64 seccomp-BPF prologue must explicitly reject
+// x32 syscall numbers (nr >= __X32_SYSCALL_BIT = 0x40000000) even when DefaultSyscallAllow=true.
+func TestX32SyscallBitRejectedInAmd64Prologue(t *testing.T) {
+	spec := TracingPolicy{
+		ID:                  "allow-default-deny-mount",
+		Mode:                ModeEnforceSigkill,
+		Arch:                "amd64",
+		DefaultSyscallAllow: true,
+		SyscallRules: []SyscallRule{
+			{ID: "deny-mount", Priority: 1000, Effect: EffectDeny, Action: ModeEnforceSigkill, SyscallName: "mount"},
+		},
+	}
+	cp, err := CompilePolicy(spec)
+	if err != nil {
+		t.Fatalf("CompilePolicy: %v", err)
+	}
+
+	// Native read(0) -> ALLOW.
+	if ret, err := EvalBPF(cp.BPF, SeccompData{NR: 0, Arch: AuditArchX86_64}); err != nil || ret != SeccompRetAllow {
+		t.Fatalf("native read(0): ret=0x%x err=%v, want ALLOW", ret, err)
+	}
+	// Native mount(165) -> KILL_PROCESS.
+	if ret, err := EvalBPF(cp.BPF, SeccompData{NR: 165, Arch: AuditArchX86_64}); err != nil || ret != SeccompRetKillProcess {
+		t.Fatalf("native mount(165): ret=0x%x err=%v, want KILL_PROCESS", ret, err)
+	}
+	// x32 mount (0x400000a5) -> MUST be rejected with KILL_PROCESS (never reach DefaultSyscallAllow).
+	if ret, err := EvalBPF(cp.BPF, SeccompData{NR: X32SyscallBit | 165, Arch: AuditArchX86_64}); err != nil || ret != SeccompRetKillProcess {
+		t.Fatalf("x32 mount(0x%x): ret=0x%x err=%v, want KILL_PROCESS", X32SyscallBit|165, ret, err)
+	}
+	// x32 read (0x40000000) -> MUST also be rejected with KILL_PROCESS.
+	if ret, err := EvalBPF(cp.BPF, SeccompData{NR: X32SyscallBit, Arch: AuditArchX86_64}); err != nil || ret != SeccompRetKillProcess {
+		t.Fatalf("x32 read(0x%x): ret=0x%x err=%v, want KILL_PROCESS", X32SyscallBit, ret, err)
+	}
+}
+
+// Regression test for Codex Finding #5: legitimate runtime init syscalls (sched_getaffinity,
+// rseq, faccessat2, capget) must be resolved and allowed in the default profile.
+func TestRuntimeInitSyscallsAllowlisted(t *testing.T) {
+	eng := NewEngine(EngineConfig{})
+	cp, err := eng.UpsertPolicy("org-init", DefaultVisorSandboxPolicy(ModeEnforceSigkill))
+	if err != nil {
+		t.Fatalf("UpsertPolicy: %v", err)
+	}
+	if _, err := eng.BindSandbox("org-init", "sb-init", cp.Spec.ID); err != nil {
+		t.Fatalf("BindSandbox: %v", err)
+	}
+
+	initSyscalls := []struct {
+		name string
+		num  uint32
+	}{
+		{"sched_getaffinity", 204},
+		{"rseq", 334},
+		{"faccessat2", 439},
+		{"capget", 125},
+		{"ppoll", 271},
+		{"pselect6", 270},
+	}
+	for _, sc := range initSyscalls {
+		res := eng.Evaluate(EvaluationRequest{
+			TenantID: "org-init", SandboxID: "sb-init", Domain: DomainSyscall,
+			Syscall: &SyscallEvent{SyscallName: sc.name},
+		})
+		if res.Decision != DecisionAllow {
+			t.Errorf("runtime init syscall %s(%d) Engine = %s, want ALLOW", sc.name, sc.num, res.Decision)
+		}
+		ret, err := EvalBPF(cp.BPF, SeccompData{NR: sc.num, Arch: AuditArchX86_64})
+		if err != nil || ret != SeccompRetAllow {
+			t.Errorf("runtime init syscall %s(%d) EvalBPF = 0x%x (err=%v), want ALLOW", sc.name, sc.num, ret, err)
+		}
+	}
+}
+
+// Regression test for Codex Finding #6: bind-only port-0 loopback requests (127.0.0.1:0, [::1]:0)
+// must be allowed for ephemeral httptest/net.Listen listeners without relaxing egress restrictions.
+func TestLoopbackBindPortZeroAllowedWithoutRelaxingEgress(t *testing.T) {
+	eng := NewEngine(EngineConfig{})
+	cp, err := eng.UpsertPolicy("org-bind0", DefaultVisorSandboxPolicy(ModeEnforceSigkill))
+	if err != nil {
+		t.Fatalf("UpsertPolicy: %v", err)
+	}
+	if _, err := eng.BindSandbox("org-bind0", "sb-bind0", cp.Spec.ID); err != nil {
+		t.Fatalf("BindSandbox: %v", err)
+	}
+
+	cases := []struct {
+		name    string
+		ev      NetworkEvent
+		wantDec Decision
+	}{
+		{name: "bind_loopback_v4_port0", ev: NetworkEvent{Direction: NetDirBind, Protocol: "tcp", DestIP: "127.0.0.1", DestPort: 0}, wantDec: DecisionAllow},
+		{name: "bind_loopback_v6_port0", ev: NetworkEvent{Direction: NetDirBind, Protocol: "tcp", DestIP: "::1", DestPort: 0}, wantDec: DecisionAllow},
+		{name: "egress_loopback_v4_port0_denied", ev: NetworkEvent{Direction: NetDirEgress, Protocol: "tcp", DestIP: "127.0.0.1", DestPort: 0}, wantDec: DecisionSigkill},
+		{name: "egress_loopback_v6_port0_denied", ev: NetworkEvent{Direction: NetDirEgress, Protocol: "tcp", DestIP: "::1", DestPort: 0}, wantDec: DecisionSigkill},
+		{name: "bind_loopback_v4_docker_port_denied", ev: NetworkEvent{Direction: NetDirBind, Protocol: "tcp", DestIP: "127.0.0.1", DestPort: 2375}, wantDec: DecisionSigkill},
+		{name: "bind_wildcard_v4_port0_denied", ev: NetworkEvent{Direction: NetDirBind, Protocol: "tcp", DestIP: "0.0.0.0", DestPort: 0}, wantDec: DecisionSigkill},
+	}
+	for _, tc := range cases {
+		res := eng.Evaluate(EvaluationRequest{
+			TenantID: "org-bind0", SandboxID: "sb-bind0", Domain: DomainNetwork,
+			Network: &tc.ev,
+		})
+		if res.Decision != tc.wantDec {
+			t.Errorf("%s: got %s (rule=%s), want %s", tc.name, res.Decision, res.RuleID, tc.wantDec)
+		}
+	}
+
+	// Combining MatchPortZero with PortStart/PortEnd must fail validation.
+	badNet := TracingPolicy{
+		ID: "bad-port-zero", Mode: ModeEnforceDeny,
+		NetworkRules: []NetworkRule{
+			{ID: "n1", Priority: 100, Effect: EffectAllow, Direction: NetDirBind, Protocol: "tcp", CIDR: "127.0.0.0/8", PortStart: 80, MatchPortZero: true},
+		},
+	}
+	if _, err := CompilePolicy(badNet); !errors.Is(err, ErrInvalidPolicy) {
+		t.Fatalf("expected ErrInvalidPolicy for matchPortZero + portStart, got %v", err)
+	}
+}
+
+// Regression test for Codex Finding #7: PolicySummary.Digest must cover every enforcement-relevant
+// field across global defaults and all three domains (ports, direction, protocol, arg/lineage
+// predicates, priorities, errnos, etc.).
+func TestPolicyDigestCoversAllEnforcementFields(t *testing.T) {
+	baseSpec := func() TracingPolicy {
+		return TracingPolicy{
+			ID:                  "digest-test",
+			Name:                "Digest Test",
+			Mode:                ModeEnforceDeny,
+			DefaultSyscallAllow: false,
+			DefaultProcessAllow: false,
+			DefaultNetworkAllow: false,
+			DenyPrivEsc:         true,
+			AuditAllowEvents:    false,
+			SyscallRules: []SyscallRule{
+				{ID: "s1", Priority: 100, Effect: EffectDeny, Action: ModeEnforceDeny, Errno: ErrnoEPERM, SyscallName: "socket", ArgFilters: []SyscallArgFilter{{Index: 0, Op: ArgOpEqual32, Value: AFNetlink}}},
+			},
+			ProcessRules: []ProcessRule{
+				{ID: "p1", Priority: 100, Effect: EffectAllow, BinaryPrefix: "/usr/bin", ArgContains: "status", ArgRegex: "^git", RequiredParent: "bash", ForbiddenAncestor: "sudo"},
+			},
+			NetworkRules: []NetworkRule{
+				{ID: "n1", Priority: 100, Effect: EffectAllow, Direction: NetDirEgress, Protocol: "tcp", CIDR: "0.0.0.0/0", PortStart: 443, PortEnd: 443},
+			},
+		}
+	}
+
+	baseCP, err := CompilePolicy(baseSpec())
+	if err != nil {
+		t.Fatalf("CompilePolicy base: %v", err)
+	}
+	// Identical spec MUST yield identical digest.
+	sameCP, err := CompilePolicy(baseSpec())
+	if err != nil {
+		t.Fatalf("CompilePolicy same: %v", err)
+	}
+	if baseCP.Digest != sameCP.Digest {
+		t.Fatalf("non-deterministic digest: %s != %s", baseCP.Digest, sameCP.Digest)
+	}
+
+	mutations := []struct {
+		name   string
+		mutate func(*TracingPolicy)
+	}{
+		{"net_port_443_to_4444", func(p *TracingPolicy) { p.NetworkRules[0].PortStart = 4444; p.NetworkRules[0].PortEnd = 4444 }},
+		{"net_direction_egress_to_bind", func(p *TracingPolicy) { p.NetworkRules[0].Direction = NetDirBind }},
+		{"net_protocol_tcp_to_udp", func(p *TracingPolicy) { p.NetworkRules[0].Protocol = "udp" }},
+		{"net_match_port_zero", func(p *TracingPolicy) {
+			p.NetworkRules[0].PortStart = 0
+			p.NetworkRules[0].PortEnd = 0
+			p.NetworkRules[0].MatchPortZero = true
+		}},
+		{"net_priority", func(p *TracingPolicy) { p.NetworkRules[0].Priority = 200 }},
+		{"proc_arg_contains", func(p *TracingPolicy) { p.ProcessRules[0].ArgContains = "diff" }},
+		{"proc_arg_regex", func(p *TracingPolicy) { p.ProcessRules[0].ArgRegex = "^go" }},
+		{"proc_required_parent", func(p *TracingPolicy) { p.ProcessRules[0].RequiredParent = "sh" }},
+		{"proc_forbidden_ancestor", func(p *TracingPolicy) { p.ProcessRules[0].ForbiddenAncestor = "su" }},
+		{"proc_priority", func(p *TracingPolicy) { p.ProcessRules[0].Priority = 250 }},
+		{"default_process_allow", func(p *TracingPolicy) { p.DefaultProcessAllow = true }},
+		{"default_network_allow", func(p *TracingPolicy) { p.DefaultNetworkAllow = true }},
+		{"deny_priv_esc", func(p *TracingPolicy) { p.DenyPrivEsc = false }},
+		{"audit_allow_events", func(p *TracingPolicy) { p.AuditAllowEvents = true }},
+		{"syscall_errno", func(p *TracingPolicy) { p.SyscallRules[0].Errno = ErrnoENOSYS }},
+		{"syscall_audit_on_allow", func(p *TracingPolicy) { p.SyscallRules[0].AuditOnAllow = true }},
+		{"syscall_priority", func(p *TracingPolicy) { p.SyscallRules[0].Priority = 500 }},
+	}
+
+	seen := map[string]string{baseCP.Digest: "base"}
+	for _, m := range mutations {
+		spec := baseSpec()
+		m.mutate(&spec)
+		cp, err := CompilePolicy(spec)
+		if err != nil {
+			t.Fatalf("CompilePolicy(%s): %v", m.name, err)
+		}
+		if prev, dup := seen[cp.Digest]; dup {
+			t.Errorf("digest collision between %q and %q (%s)", prev, m.name, cp.Digest)
+		}
+		seen[cp.Digest] = m.name
+	}
+}
+
 func intPtr(v int) *int { return &v }

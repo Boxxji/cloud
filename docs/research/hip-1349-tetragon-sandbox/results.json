@@ -1,18 +1,18 @@
 {
   "schemaVersion": "hip-1349-sandboxpolicy-v1",
-  "generatedAt": "2026-11-26T18:03:38Z",
+  "generatedAt": "2026-11-26T21:01:38Z",
   "host": {
     "goos": "linux",
     "goarch": "amd64",
     "goVersion": "go1.27.1",
     "numCpu": 2,
-    "gitCommit": "0f3125493818da9f324b83c6ae62dea2297be530",
+    "gitCommit": "efb15e233bf21ebb9dc6b898cda61d825bc27016",
     "seed": 1349
   },
   "corpus": {
     "repoRoot": "cloud",
     "filesSampled": 48,
-    "corpusSha256": "27ca30e4cec806561d39f44997773441cd9f2f9cc709ce9fb323ae0f5b68f46c"
+    "corpusSha256": "6845fa7d089690fcba2db6dfe09287f7637395991737f7ed4f303ac8ebc4425e"
   },
   "boundaryMatrix": {
     "totalCases": 20,
@@ -264,71 +264,71 @@
   "overheadMatrix": {
     "unmonitoredBaseline": {
       "samples": 4000,
-      "p50Ns": 31,
-      "p95Ns": 33,
-      "p99Ns": 50,
-      "meanNs": 31.73,
-      "throughputEventsPerSec": 10364493.32
+      "p50Ns": 27,
+      "p95Ns": 28,
+      "p99Ns": 44,
+      "meanNs": 27.48,
+      "throughputEventsPerSec": 11967770.79
     },
     "ruleScales": [
       {
         "activeRules": 10,
-        "bpfInsnCount": 13,
+        "bpfInsnCount": 15,
         "indexed": {
           "samples": 4000,
-          "p50Ns": 785,
-          "p95Ns": 3104,
-          "p99Ns": 9161,
-          "meanNs": 1696.96,
-          "throughputEventsPerSec": 562398.07
+          "p50Ns": 686,
+          "p95Ns": 2841,
+          "p99Ns": 10611,
+          "meanNs": 4056.2,
+          "throughputEventsPerSec": 242903.47
         },
         "bpfVm": {
           "samples": 4000,
           "p50Ns": 57,
           "p95Ns": 58,
-          "p99Ns": 77,
-          "meanNs": 58.16,
-          "throughputEventsPerSec": 8913192.19
+          "p99Ns": 75,
+          "meanNs": 57.13,
+          "throughputEventsPerSec": 9416993.91
         }
       },
       {
         "activeRules": 100,
-        "bpfInsnCount": 73,
+        "bpfInsnCount": 75,
         "indexed": {
           "samples": 4000,
-          "p50Ns": 738,
-          "p95Ns": 2955,
-          "p99Ns": 20282,
-          "meanNs": 1626.53,
-          "throughputEventsPerSec": 583733.93
+          "p50Ns": 749,
+          "p95Ns": 3028,
+          "p99Ns": 8658,
+          "meanNs": 2633.32,
+          "throughputEventsPerSec": 370982.11
         },
         "bpfVm": {
           "samples": 4000,
-          "p50Ns": 172,
-          "p95Ns": 180,
-          "p99Ns": 236,
-          "meanNs": 262.09,
-          "throughputEventsPerSec": 3166057.33
+          "p50Ns": 177,
+          "p95Ns": 189,
+          "p99Ns": 190,
+          "meanNs": 185.94,
+          "throughputEventsPerSec": 4097504.21
         }
       },
       {
         "activeRules": 1000,
-        "bpfInsnCount": 673,
+        "bpfInsnCount": 675,
         "indexed": {
           "samples": 4000,
-          "p50Ns": 764,
-          "p95Ns": 3331,
-          "p99Ns": 6416,
-          "meanNs": 1896.33,
-          "throughputEventsPerSec": 504396.51
+          "p50Ns": 881,
+          "p95Ns": 3778,
+          "p99Ns": 6276,
+          "meanNs": 2644.75,
+          "throughputEventsPerSec": 364464.79
         },
         "bpfVm": {
           "samples": 4000,
-          "p50Ns": 1244,
-          "p95Ns": 1343,
-          "p99Ns": 1408,
-          "meanNs": 1328.61,
-          "throughputEventsPerSec": 724895.47
+          "p50Ns": 1253,
+          "p95Ns": 1391,
+          "p99Ns": 1402,
+          "meanNs": 1747.06,
+          "throughputEventsPerSec": 549419.38
         }
       }
     ]
@@ -340,75 +340,76 @@
         "activeRules": 10,
         "indexed": {
           "samples": 4000,
-          "p50Ns": 785,
-          "p95Ns": 3104,
-          "p99Ns": 9161,
-          "meanNs": 1696.96,
-          "throughputEventsPerSec": 562398.07
+          "p50Ns": 686,
+          "p95Ns": 2841,
+          "p99Ns": 10611,
+          "meanNs": 4056.2,
+          "throughputEventsPerSec": 242903.47
         },
         "unindexed": {
           "samples": 4000,
-          "p50Ns": 693,
-          "p95Ns": 2599,
-          "p99Ns": 5470,
-          "meanNs": 1178.54,
-          "throughputEventsPerSec": 801591.96
+          "p50Ns": 606,
+          "p95Ns": 2488,
+          "p99Ns": 6988,
+          "meanNs": 1985.08,
+          "throughputEventsPerSec": 490051.47
         },
         "p50SlowdownRatio": 0.88,
-        "p99SlowdownRatio": 0.6
+        "p99SlowdownRatio": 0.66
       },
       {
         "activeRules": 100,
         "indexed": {
           "samples": 4000,
-          "p50Ns": 738,
-          "p95Ns": 2955,
-          "p99Ns": 20282,
-          "meanNs": 1626.53,
-          "throughputEventsPerSec": 583733.93
+          "p50Ns": 749,
+          "p95Ns": 3028,
+          "p99Ns": 8658,
+          "meanNs": 2633.32,
+          "throughputEventsPerSec": 370982.11
         },
         "unindexed": {
           "samples": 4000,
-          "p50Ns": 1471,
-          "p95Ns": 3054,
-          "p99Ns": 7755,
-          "meanNs": 1746.76,
-          "throughputEventsPerSec": 550477.02
+          "p50Ns": 1474,
+          "p95Ns": 2986,
+          "p99Ns": 6520,
+          "meanNs": 2511.81,
+          "throughputEventsPerSec": 388696.44
         },
-        "p50SlowdownRatio": 1.99,
-        "p99SlowdownRatio": 0.38
+        "p50SlowdownRatio": 1.97,
+        "p99SlowdownRatio": 0.75
       },
       {
         "activeRules": 1000,
         "indexed": {
           "samples": 4000,
-          "p50Ns": 764,
-          "p95Ns": 3331,
-          "p99Ns": 6416,
-          "meanNs": 1896.33,
-          "throughputEventsPerSec": 504396.51
+          "p50Ns": 881,
+          "p95Ns": 3778,
+          "p99Ns": 6276,
+          "meanNs": 2644.75,
+          "throughputEventsPerSec": 364464.79
         },
         "unindexed": {
           "samples": 4000,
-          "p50Ns": 5833,
-          "p95Ns": 12875,
-          "p99Ns": 29171,
-          "meanNs": 6935.78,
-          "throughputEventsPerSec": 142616.51
+          "p50Ns": 5996,
+          "p95Ns": 12996,
+          "p99Ns": 52731,
+          "meanNs": 12602.05,
+          "throughputEventsPerSec": 78895.93
         },
-        "p50SlowdownRatio": 7.63,
-        "p99SlowdownRatio": 4.55
+        "p50SlowdownRatio": 6.81,
+        "p99SlowdownRatio": 8.4
       }
     ],
     "overbroadPolicy": {
       "totalBenignOps": 240,
-      "falsePositiveBlocks": 81,
-      "falsePositiveRatePct": 33.75,
+      "falsePositiveBlocks": 91,
+      "falsePositiveRatePct": 37.92,
       "notes": "Over-broad unanchored arg regex + IPv4-only egress allowlist breaks benign go test, git status, npm test, IPv6 HTTPS, and httptest loopback binds."
     }
   },
   "negativeRegime2AuditRingBackpressure": {
-    "description": "Simulates a 50,000 events/sec tight benign read/newfstatat loop against a 4,096-entry RingDropNewest buffer drained at 12,000 events/sec, comparing userspace audit-all emission vs in-kernel seccomp-BPF allowlist filtering.",
+    "description": "Userspace simulation of a 50,000 events/sec tight benign read/newfstatat loop against a 4,096-entry RingDropNewest buffer drained at 12,000 events/sec, comparing userspace audit-all emission (Engine.Evaluate + ring append) against the userspace Go cBPF VM interpreter (EvalBPF, AuditAllowEvents=false) simulating ring-bypassing allowlist filtering. Does not install a kernel filter or issue raw kernel syscalls.",
+    "measurementMethod": "userspace_go_cbpf_vm_simulation",
     "userspaceAuditAll": {
       "totalEvents": 50000,
       "simulatedRateEps": 50000,
@@ -420,14 +421,14 @@
       "retainedEvents": 4096,
       "latency": {
         "samples": 50000,
-        "p50Ns": 590,
-        "p95Ns": 2678,
-        "p99Ns": 7016,
-        "meanNs": 1573.04,
-        "throughputEventsPerSec": 605370.77
+        "p50Ns": 595,
+        "p95Ns": 2735,
+        "p99Ns": 6743,
+        "meanNs": 2715.29,
+        "throughputEventsPerSec": 358266.25
       }
     },
-    "inKernelBpfFilter": {
+    "simulatedBpfVmFilter": {
       "totalEvents": 50000,
       "simulatedRateEps": 50000,
       "consumerDrainRateEps": 12000,
@@ -438,14 +439,14 @@
       "retainedEvents": 0,
       "latency": {
         "samples": 50000,
-        "p50Ns": 430,
-        "p95Ns": 481,
-        "p99Ns": 486,
-        "meanNs": 460.09,
-        "throughputEventsPerSec": 1908348.73
+        "p50Ns": 470,
+        "p95Ns": 557,
+        "p99Ns": 563,
+        "meanNs": 689.46,
+        "throughputEventsPerSec": 1324135.36
       }
     },
-    "p50SpeedupFactor": 1.37,
-    "throughputGain": 3.15
+    "p50SpeedupFactor": 1.27,
+    "throughputGain": 3.7
   }
 }

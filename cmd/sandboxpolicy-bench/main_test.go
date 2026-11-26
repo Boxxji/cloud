@@ -59,11 +59,14 @@ func TestRunBenchmarksRegressionAndNegativeRegimes(t *testing.T) {
 		t.Fatal("expected overbroad policy negative regime to exhibit false positives")
 	}
 
-	// Negative Regime 2: userspace audit-all under 50k/s loop drops heavily; in-kernel BPF drops 0.
+	// Negative Regime 2: userspace audit-all under 50k/s loop drops heavily; simulated EvalBPF allowlist fast-path drops 0.
+	if rep.NegativeRegime2.MeasurementMethod != "userspace_go_cbpf_vm_simulation" {
+		t.Fatalf("unexpected measurementMethod = %q", rep.NegativeRegime2.MeasurementMethod)
+	}
 	if rep.NegativeRegime2.UserspaceAuditAll.AuditDropped == 0 {
 		t.Fatal("expected non-zero audit ring drops under 50k/s userspace audit-all backpressure")
 	}
-	if rep.NegativeRegime2.InKernelBPFFilter.AuditDropped != 0 {
-		t.Fatalf("expected 0 drops with in-kernel BPF allowlist filter, got %d", rep.NegativeRegime2.InKernelBPFFilter.AuditDropped)
+	if rep.NegativeRegime2.SimulatedBPFVMFilter.AuditDropped != 0 {
+		t.Fatalf("expected 0 drops with simulated EvalBPF allowlist filter, got %d", rep.NegativeRegime2.SimulatedBPFVMFilter.AuditDropped)
 	}
 }

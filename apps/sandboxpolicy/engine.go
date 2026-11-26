@@ -594,18 +594,25 @@ func (e *Engine) finalizeDecision(ts *tenantState, req EvaluationRequest, lineag
 }
 
 func decisionForAction(effect RuleEffect, action EnforcementMode) (Decision, int) {
+	return decisionForActionWithErrno(effect, action, ErrnoEPERM)
+}
+
+func decisionForActionWithErrno(effect RuleEffect, action EnforcementMode, denyErrno int) (Decision, int) {
 	if effect == EffectAllow {
 		return DecisionAllow, 0
+	}
+	if denyErrno <= 0 {
+		denyErrno = ErrnoEPERM
 	}
 	switch action {
 	case ModeAuditOnly:
 		return DecisionAuditAlert, 0
 	case ModeEnforceDeny:
-		return DecisionDeny, ErrnoEPERM
+		return DecisionDeny, denyErrno
 	case ModeEnforceSigkill:
 		return DecisionSigkill, SignalSIGKILL
 	default:
-		return DecisionDeny, ErrnoEPERM
+		return DecisionDeny, denyErrno
 	}
 }
 
@@ -625,7 +632,7 @@ func evaluateSyscall(cp *CompiledPolicy, ev *SyscallEvent, unindexed bool) (Deci
 		return base, true
 	}
 
-	num, name, err := resolveSyscallIdentity(ev.SyscallName, ev.SyscallNumber)
+	num, name, err := resolveSyscallIdentityForArch(cp.Spec.Arch, ev.SyscallName, ev.SyscallNumber)
 	if err != nil {
 		dec, errno := decisionForAction(EffectDeny, cp.Spec.Mode)
 		base.Decision = dec
@@ -652,7 +659,7 @@ func evaluateSyscall(cp *CompiledPolicy, ev *SyscallEvent, unindexed bool) (Deci
 		if !matchSyscallArgs(cr.rule.ArgFilters, ev.Args) {
 			continue
 		}
-		dec, errno := decisionForAction(cr.rule.Effect, cr.action)
+		dec, errno := decisionForActionWithErrno(cr.rule.Effect, cr.action, cr.errno)
 		base.Decision = dec
 		base.Blocked = dec.Blocked()
 		base.Errno = errno
@@ -934,6 +941,9 @@ func matchNetworkRuleMeta(cr compiledNetworkRule, dir NetworkDirection, proto st
 	}
 	if cr.protocol != "" && cr.protocol != proto {
 		return false
+	}
+	if cr.matchPortZero {
+		return port == 0
 	}
 	if cr.portStart > 0 && (port < cr.portStart || port > cr.portEnd) {
 		return false
