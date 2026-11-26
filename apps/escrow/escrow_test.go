@@ -471,11 +471,24 @@ func TestMaliciousChallengerPenalized(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveChallenge: %v", err)
 	}
-	if payout.TerminalState != StateSettled || payout.ChallengeOutcome != ChallengeOutcomeRejectedMalicious {
-		t.Fatalf("expected StateSettled/RejectedMalicious, got %+v", payout)
+	if payout.TerminalState != StateClaimed || payout.ChallengeOutcome != ChallengeOutcomeRejectedMalicious {
+		t.Fatalf("expected StateClaimed/RejectedMalicious while dispute window remains open, got %+v", payout)
 	}
-	if payout.ProviderPayoutAtomic != price+provBond+chalBond || payout.ChallengerSlashedAtomic != chalBond || payout.ChallengerPayoutAtomic != 0 {
-		t.Fatalf("expected malicious challenger bond forfeited to provider, got %+v", payout)
+	if payout.ProviderPayoutAtomic != chalBond || payout.ChallengerSlashedAtomic != chalBond || payout.ChallengerPayoutAtomic != 0 {
+		t.Fatalf("expected malicious challenger bond forfeited to provider without premature escrow release, got %+v", payout)
+	}
+
+	// Finalize must still wait until ChallengeDeadline elapses.
+	if _, err := eng.Finalize(funded.JobID); !errors.Is(err, ErrChallengeWindowActive) {
+		t.Fatalf("expected ErrChallengeWindowActive before challenge deadline, got %v", err)
+	}
+	clk.Advance(60 * time.Second)
+	finPayout, err := eng.Finalize(funded.JobID)
+	if err != nil {
+		t.Fatalf("Finalize after challenge window: %v", err)
+	}
+	if finPayout.TerminalState != StateSettled || finPayout.ProviderPayoutAtomic != price+provBond {
+		t.Fatalf("expected StateSettled with price+provBond, got %+v", finPayout)
 	}
 
 	if got := eng.BalanceOf(actors.provider.Address()); got != provInit+price+chalBond {
@@ -1116,3 +1129,325 @@ func TestZIPHTTPServiceAndSovereignLedgerAudit(t *testing.T) {
 		t.Fatalf("expected ErrLedgerTampered on tampered snapshot, got %v", err)
 	}
 }
+
+func TestBackdatedClaimCannotShortenChallengeWindow(t *testing.T) {
+	clk := newFakeClock(1_700_000_000)
+	eng := NewEscrowEngine(DefaultDomain(), clk, nil)
+	actors := newTestActors(t)
+	_ = eng.Mint(actors.buyer.Address(), 1_000_000)
+	_ = eng.Mint(actors.provider.Address(), 1_000_000)
+
+	funded, _, _ := mustSignQuoteAndFund(
+		t, eng, clk, actors, "job-backdated-1", "input-backdate", SpecKeccak256Eval, ClassDeterministicHash,
+		200_000, 100_000, 50_000, 20_000, 60,
+	)
+
+	// Provider backdates CompletedAt by 120s so ChallengeDeadline == CompletedAt + 60 is ALREADY expired at receipt time.
+	now := clk.Now().Unix()
+	backdated := CompletionClaim{
+		JobID:             funded.JobID,
+		QuoteHash:         funded.Quote.QuoteHash,
+		Provider:          actors.provider.Address(),
+		OutputDigest:      Keccak256Hex([]byte("fraudulent-backdated")),
+		ExecutionProof:    Keccak256Hex([]byte("fraudulent-proof")),
+		CompletedAt:       now - 120,
+		ChallengeDeadline: (now - 120) + 60,
+	}
+	if err := SignCompletionClaim(eng.Domain(), actors.provider, &backdated); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SubmitClaim(backdated); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("expected ErrInvalidRequest for backdated claim with challengeDeadline < receipt+window, got %v", err)
+	}
+
+	// Claim anchored to receipt time (ChallengeDeadline >= now + 60) succeeds cleanly.
+	valid := backdated
+	valid.ChallengeDeadline = now + 60
+	if err := SignCompletionClaim(eng.Domain(), actors.provider, &valid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SubmitClaim(valid); err != nil {
+		t.Fatalf("expected claim with ChallengeDeadline >= receipt+window to succeed, got %v", err)
+	}
+	if _, err := eng.Finalize(funded.JobID); !errors.Is(err, ErrChallengeWindowActive) {
+		t.Fatalf("expected ErrChallengeWindowActive immediately after claim, got %v", err)
+	}
+}
+
+func TestProviderSelfChallengeCannotBypassDisputeWindow(t *testing.T) {
+	clk := newFakeClock(1_700_000_000)
+	eng := NewEscrowEngine(DefaultDomain(), clk, nil)
+	actors := newTestActors(t)
+	_ = eng.Mint(actors.buyer.Address(), 1_000_000)
+	_ = eng.Mint(actors.provider.Address(), 1_000_000)
+	_ = eng.Mint(actors.challenger.Address(), 1_000_000)
+
+	input := "prompt:critical-deterministic-job"
+	funded, _, _ := mustSignQuoteAndFund(
+		t, eng, clk, actors, "job-self-chal-1", input, SpecHashChain64, ClassDeterministicHash,
+		200_000, 100_000, 50_000, 20_000, 60,
+	)
+
+	// Dishonest provider submits a fraudulent OutputDigest on time.
+	now := clk.Now().Unix()
+	fraudClaim := CompletionClaim{
+		JobID:             funded.JobID,
+		QuoteHash:         funded.Quote.QuoteHash,
+		Provider:          actors.provider.Address(),
+		OutputDigest:      Keccak256Hex([]byte("bogus-output")),
+		ExecutionProof:    Keccak256Hex([]byte("bogus-proof")),
+		CompletedAt:       now,
+		ChallengeDeadline: now + 60,
+	}
+	if err := SignCompletionClaim(eng.Domain(), actors.provider, &fraudClaim); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SubmitClaim(fraudClaim); err != nil {
+		t.Fatalf("SubmitClaim: %v", err)
+	}
+
+	// Provider attempts to bypass the dispute window by filing and resolving its own bogus missed_deadline challenge.
+	clk.Advance(2 * time.Second)
+	selfSub := ChallengeSubmission{
+		JobID:               funded.JobID,
+		Challenger:          actors.provider.Address(),
+		ChallengeBondAtomic: 50_000,
+		SubmittedAt:         clk.Now().Unix(),
+		Evidence: ChallengeEvidence{
+			ViolationType: ViolationMissedDeadline,
+		},
+	}
+	if err := SignChallengeSubmission(eng.Domain(), actors.provider, &selfSub); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.OpenChallenge(selfSub); err != nil {
+		t.Fatalf("OpenChallenge self missed_deadline: %v", err)
+	}
+	selfRes, err := eng.ResolveChallenge(funded.JobID)
+	if err != nil {
+		t.Fatalf("ResolveChallenge self missed_deadline: %v", err)
+	}
+	if selfRes.TerminalState != StateClaimed {
+		t.Fatalf("rejected SLA challenge must preserve dispute window in StateClaimed, got %s", selfRes.TerminalState)
+	}
+	if _, err := eng.Finalize(funded.JobID); !errors.Is(err, ErrChallengeWindowActive) {
+		t.Fatalf("expected ErrChallengeWindowActive after rejected self-challenge, got %v", err)
+	}
+
+	// Honest watcher still files ViolationFalseCompletionClaim within remaining dispute window and slashes the provider!
+	clk.Advance(5 * time.Second)
+	honestSub := ChallengeSubmission{
+		JobID:               funded.JobID,
+		Challenger:          actors.challenger.Address(),
+		ChallengeBondAtomic: 50_000,
+		SubmittedAt:         clk.Now().Unix(),
+		Evidence: ChallengeEvidence{
+			ViolationType:  ViolationFalseCompletionClaim,
+			CanonicalInput: input,
+		},
+	}
+	if err := SignChallengeSubmission(eng.Domain(), actors.challenger, &honestSub); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.OpenChallenge(honestSub); err != nil {
+		t.Fatalf("honest OpenChallenge after rejected self-challenge failed: %v", err)
+	}
+	slashPayout, err := eng.ResolveChallenge(funded.JobID)
+	if err != nil {
+		t.Fatalf("honest ResolveChallenge: %v", err)
+	}
+	if slashPayout.TerminalState != StateSlashed || slashPayout.ProviderSlashedAtomic != 100_000 {
+		t.Fatalf("expected fraudulent provider to be slashed, got %+v", slashPayout)
+	}
+	assertConserved(t, eng)
+}
+
+func TestMalformedChallengeEvidenceNeverFreezesFunds(t *testing.T) {
+	clk := newFakeClock(1_700_000_000)
+	eng := NewEscrowEngine(DefaultDomain(), clk, nil)
+	actors := newTestActors(t)
+	_ = eng.Mint(actors.buyer.Address(), 1_000_000)
+	_ = eng.Mint(actors.provider.Address(), 1_000_000)
+	_ = eng.Mint(actors.challenger.Address(), 1_000_000)
+
+	input := "prompt:recoverable-funds"
+	funded, outDigest, execProof := mustSignQuoteAndFund(
+		t, eng, clk, actors, "job-malformed-ev-1", input, SpecKeccak256Eval, ClassDeterministicHash,
+		200_000, 100_000, 50_000, 20_000, 30,
+	)
+
+	now := clk.Now().Unix()
+	claim := CompletionClaim{
+		JobID:             funded.JobID,
+		QuoteHash:         funded.Quote.QuoteHash,
+		Provider:          actors.provider.Address(),
+		OutputDigest:      outDigest,
+		ExecutionProof:    execProof,
+		CompletedAt:       now,
+		ChallengeDeadline: now + 30,
+	}
+	if err := SignCompletionClaim(eng.Domain(), actors.provider, &claim); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SubmitClaim(claim); err != nil {
+		t.Fatal(err)
+	}
+
+	// Empty CanonicalInput and mismatched CanonicalInput must be rejected by OpenChallenge
+	// without transitioning to StateChallenged or freezing buyer/provider funds.
+	for _, badInput := range []string{"", "wrong-canonical-input"} {
+		badSub := ChallengeSubmission{
+			JobID:               funded.JobID,
+			Challenger:          actors.challenger.Address(),
+			ChallengeBondAtomic: 50_000,
+			SubmittedAt:         now + 1,
+			Evidence: ChallengeEvidence{
+				ViolationType:  ViolationFalseCompletionClaim,
+				CanonicalInput: badInput,
+			},
+		}
+		if err := SignChallengeSubmission(eng.Domain(), actors.challenger, &badSub); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := eng.OpenChallenge(badSub); !errors.Is(err, ErrInvalidRequest) {
+			t.Fatalf("expected ErrInvalidRequest for bad CanonicalInput %q, got %v", badInput, err)
+		}
+	}
+
+	rec, err := eng.GetEscrow(funded.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != StateClaimed || rec.LockedChallengeBond != 0 {
+		t.Fatalf("escrow mutated by invalid evidence: state=%s lockedChal=%d", rec.State, rec.LockedChallengeBond)
+	}
+
+	// Honest funds remain completely recoverable via Finalize once challenge window elapses.
+	clk.Advance(35 * time.Second)
+	payout, err := eng.Finalize(funded.JobID)
+	if err != nil {
+		t.Fatalf("Finalize after rejected malformed challenge: %v", err)
+	}
+	if payout.TerminalState != StateSettled || payout.ProviderPayoutAtomic != 300_000 {
+		t.Fatalf("unexpected finalize payout: %+v", payout)
+	}
+	assertConserved(t, eng)
+}
+
+func TestZeroCompletedAtClaimRejectedWithoutMutation(t *testing.T) {
+	clk := newFakeClock(1_700_000_000)
+	eng := NewEscrowEngine(DefaultDomain(), clk, nil)
+	actors := newTestActors(t)
+	_ = eng.Mint(actors.buyer.Address(), 1_000_000)
+	_ = eng.Mint(actors.provider.Address(), 1_000_000)
+
+	funded, outDigest, execProof := mustSignQuoteAndFund(
+		t, eng, clk, actors, "job-zero-ts-1", "input-zero-ts", SpecKeccak256Eval, ClassDeterministicHash,
+		200_000, 100_000, 50_000, 20_000, 60,
+	)
+
+	now := clk.Now().Unix()
+	zeroTS := CompletionClaim{
+		JobID:             funded.JobID,
+		QuoteHash:         funded.Quote.QuoteHash,
+		Provider:          actors.provider.Address(),
+		OutputDigest:      outDigest,
+		ExecutionProof:    execProof,
+		CompletedAt:       0,
+		ChallengeDeadline: now + 60,
+	}
+	if err := SignCompletionClaim(eng.Domain(), actors.provider, &zeroTS); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SubmitClaim(zeroTS); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("expected ErrInvalidRequest for CompletedAt==0 claim, got %v", err)
+	}
+
+	// Properly timestamped claim persists with valid signature and survives snapshot export/import.
+	good := zeroTS
+	good.CompletedAt = now
+	if err := SignCompletionClaim(eng.Domain(), actors.provider, &good); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := eng.SubmitClaim(good)
+	if err != nil {
+		t.Fatalf("SubmitClaim good: %v", err)
+	}
+	if err := VerifyCompletionClaim(eng.Domain(), *rec.Claim); err != nil {
+		t.Fatalf("persisted claim signature invalid: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := eng.ExportSnapshotJSONL(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ImportSnapshotJSONL(bytes.NewReader(buf.Bytes()), clk); err != nil {
+		t.Fatalf("ImportSnapshotJSONL failed: %v", err)
+	}
+}
+
+func TestLargeBondRewardNoUint64Overflow(t *testing.T) {
+	clk := newFakeClock(1_700_000_000)
+	eng := NewEscrowEngine(DefaultDomain(), clk, nil)
+	actors := newTestActors(t)
+
+	const (
+		price    = uint64(100_000_000_000_000_000)     // 10^17
+		provBond = uint64(1_000_000_000_000_000_000)   // 10^18 (10^18 * 5000 overflows uint64!)
+		chalBond = uint64(50_000_000_000_000_000)      // 5 * 10^16
+		wantRew  = uint64(500_000_000_000_000_000)     // exact 50% of 10^18
+	)
+	_ = eng.Mint(actors.buyer.Address(), price)
+	_ = eng.Mint(actors.provider.Address(), provBond)
+	_ = eng.Mint(actors.challenger.Address(), chalBond)
+
+	input := "prompt:large-bond-overflow"
+	funded, _, _ := mustSignQuoteAndFund(
+		t, eng, clk, actors, "job-overflow-reward-1", input, SpecKeccak256Eval, ClassDeterministicHash,
+		price, provBond, chalBond, 100_000, 60,
+	)
+
+	now := clk.Now().Unix()
+	fraud := CompletionClaim{
+		JobID:             funded.JobID,
+		QuoteHash:         funded.Quote.QuoteHash,
+		Provider:          actors.provider.Address(),
+		OutputDigest:      Keccak256Hex([]byte("wrong-large-bond")),
+		ExecutionProof:    Keccak256Hex([]byte("wrong-proof")),
+		CompletedAt:       now,
+		ChallengeDeadline: now + 60,
+	}
+	if err := SignCompletionClaim(eng.Domain(), actors.provider, &fraud); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SubmitClaim(fraud); err != nil {
+		t.Fatal(err)
+	}
+	sub := ChallengeSubmission{
+		JobID:               funded.JobID,
+		Challenger:          actors.challenger.Address(),
+		ChallengeBondAtomic: chalBond,
+		SubmittedAt:         now + 1,
+		Evidence: ChallengeEvidence{
+			ViolationType:  ViolationFalseCompletionClaim,
+			CanonicalInput: input,
+		},
+	}
+	if err := SignChallengeSubmission(eng.Domain(), actors.challenger, &sub); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.OpenChallenge(sub); err != nil {
+		t.Fatal(err)
+	}
+	payout, err := eng.ResolveChallenge(funded.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payout.ChallengerPayoutAtomic != chalBond+wantRew {
+		t.Fatalf("challenger payout = %d, want %d (overflow detected!)", payout.ChallengerPayoutAtomic, chalBond+wantRew)
+	}
+	if payout.BuyerPayoutAtomic != price+(provBond-wantRew) {
+		t.Fatalf("buyer payout = %d, want %d", payout.BuyerPayoutAtomic, price+(provBond-wantRew))
+	}
+	assertConserved(t, eng)
+}
+

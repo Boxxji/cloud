@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/bits"
 	"sort"
 	"strings"
 	"sync"
@@ -325,22 +326,30 @@ func (e *EscrowEngine) SubmitClaim(claim CompletionClaim) (*EscrowRecord, error)
 	if !strings.EqualFold(claim.QuoteHash, rec.Quote.QuoteHash) {
 		return nil, fmt.Errorf("%w: claim quoteHash mismatch", ErrInvalidRequest)
 	}
+	if claim.CompletedAt <= 0 {
+		return nil, fmt.Errorf("%w: claim completedAt must be > 0", ErrInvalidRequest)
+	}
 	if err := VerifyCompletionClaim(e.domain, claim); err != nil {
 		return nil, err
 	}
 
 	now := e.clock.Now().Unix()
-	if claim.CompletedAt == 0 {
-		claim.CompletedAt = now
-	}
 	// Objective Service Quality (SLA) deadline check.
 	slaProof, missed, _ := e.slaVerifier.VerifySLA(rec.Quote, &claim, now)
 	if missed || now > rec.Quote.Deadline {
 		return nil, ErrDeadlineExceeded
 	}
-	expectedChallengeDeadline := claim.CompletedAt + rec.Quote.ChallengeWindowSec
-	if claim.ChallengeDeadline < expectedChallengeDeadline {
-		return nil, fmt.Errorf("%w: challengeDeadline %d < completedAt+window %d", ErrInvalidRequest, claim.ChallengeDeadline, expectedChallengeDeadline)
+	if rec.Quote.ChallengeWindowSec > 0 &&
+		(claim.CompletedAt > math.MaxInt64-rec.Quote.ChallengeWindowSec || now > math.MaxInt64-rec.Quote.ChallengeWindowSec) {
+		return nil, fmt.Errorf("%w: challengeDeadline overflow", ErrInvalidRequest)
+	}
+	minChallengeDeadline := claim.CompletedAt + rec.Quote.ChallengeWindowSec
+	if fromReceipt := now + rec.Quote.ChallengeWindowSec; fromReceipt > minChallengeDeadline {
+		minChallengeDeadline = fromReceipt
+	}
+	if claim.ChallengeDeadline < minChallengeDeadline {
+		return nil, fmt.Errorf("%w: challengeDeadline %d < required minimum %d (receipt=%d, completedAt=%d, window=%d)",
+			ErrInvalidRequest, claim.ChallengeDeadline, minChallengeDeadline, now, claim.CompletedAt, rec.Quote.ChallengeWindowSec)
 	}
 
 	claimCopy := claim
@@ -391,9 +400,20 @@ func (e *EscrowEngine) OpenChallenge(sub ChallengeSubmission) (*EscrowRecord, er
 	if rec.Finalized || rec.State.IsTerminal() {
 		return nil, ErrAlreadyFinalized
 	}
-	if sub.Evidence.ViolationType == ViolationFalseCompletionClaim &&
-		(rec.Quote.VerificationClass == ClassNonDeterministicSampling || rec.Quote.VerificationSpec == SpecNonDeterministicLLM) {
-		return nil, ErrNonDeterministicVerificationNeeded
+	if sub.Evidence.ViolationType == ViolationFalseCompletionClaim {
+		if rec.Quote.VerificationClass == ClassNonDeterministicSampling || rec.Quote.VerificationSpec == SpecNonDeterministicLLM {
+			return nil, ErrNonDeterministicVerificationNeeded
+		}
+		if sub.Evidence.CanonicalInput == "" {
+			return nil, fmt.Errorf("%w: canonicalInput is required for independent recomputation", ErrInvalidRequest)
+		}
+		recomputedInputDigest := ComputeInputDigest(sub.Evidence.CanonicalInput)
+		if !strings.EqualFold(recomputedInputDigest, rec.Quote.InputDigest) {
+			return nil, fmt.Errorf("%w: canonicalInput digest %s does not match quote inputDigest %s", ErrInvalidRequest, recomputedInputDigest, rec.Quote.InputDigest)
+		}
+		if _, _, err := ExecuteDeterministicKernel(rec.Quote.VerificationSpec, sub.Evidence.CanonicalInput); err != nil {
+			return nil, err
+		}
 	}
 
 	now := e.clock.Now().Unix()
@@ -437,10 +457,21 @@ func (e *EscrowEngine) OpenChallenge(sub ChallengeSubmission) (*EscrowRecord, er
 	return cloneEscrowRecord(rec), nil
 }
 
-// ResolveChallenge independently verifies objective challenge evidence and executes
-// a single atomic terminal settlement:
+// mulDivUint64 computes floor((a * b) / denom) using exact 128-bit arithmetic
+// without overflowing uint64 when the quotient fits in uint64.
+func mulDivUint64(a, b, denom uint64) uint64 {
+	hi, lo := bits.Mul64(a, b)
+	q, _ := bits.Div64(hi, lo, denom)
+	return q
+}
+
+// ResolveChallenge independently verifies objective challenge evidence and
+// adjudicates the open challenge:
 //   - Objective violation confirmed -> StateSlashed (provider slashed, buyer refunded, challenger rewarded)
-//   - Honest fulfillment confirmed  -> StateSettled (malicious challenger's bond forfeited to honest provider)
+//   - Allegation rejected while dispute window remains open -> challenger bond forfeited to provider
+//     and escrow returns to StateClaimed (or StateFunded if unclaimed) so legitimate challenges remain possible
+//   - Allegation rejected after dispute window elapsed -> StateSettled (payment, provider bond, and
+//     forfeited challenger bond released atomically to provider)
 func (e *EscrowEngine) ResolveChallenge(jobID string) (*PayoutRecord, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -474,7 +505,10 @@ func (e *EscrowEngine) ResolveChallenge(jobID string) (*PayoutRecord, error) {
 	case ProofDomainComputationIntegrity:
 		violationConfirmed, reason, err = e.computationVerifier.VerifyChallenge(e.domain, rec.Quote, rec.Claim, ev)
 		if err != nil {
-			return nil, err
+			// Invalid or unverifiable challenger evidence must never permanently
+			// wedge funds in StateChallenged; reject the allegation cleanly.
+			violationConfirmed = false
+			reason = fmt.Sprintf("challenge evidence invalid; allegation rejected: %v", err)
 		}
 	default:
 		return nil, ErrSubjectiveSlashingForbidden
@@ -487,7 +521,7 @@ func (e *EscrowEngine) ResolveChallenge(jobID string) (*PayoutRecord, error) {
 	var payout PayoutRecord
 	if violationConfirmed {
 		// Provider objectively violated protocol: slash 100% of ProviderBond.
-		challengerReward := (lockedProv * uint64(rec.Quote.ChallengerRewardBps)) / 10000
+		challengerReward := mulDivUint64(lockedProv, uint64(rec.Quote.ChallengerRewardBps), 10000)
 		buyerBondCompensation := lockedProv - challengerReward
 
 		buyerTotal := lockedBuyer + buyerBondCompensation
@@ -515,45 +549,90 @@ func (e *EscrowEngine) ResolveChallenge(jobID string) (*PayoutRecord, error) {
 			ProviderSlashedAtomic:  lockedProv,
 			Reason:                 reason,
 		}
-	} else {
-		// Provider output & SLA confirmed honest: forfeit malicious challenger's bond to provider!
-		providerTotal := lockedBuyer + lockedProv + lockedChal
-		e.balances[rec.Quote.Provider] += providerTotal
+		payout.ReceiptHash = computePayoutHash(payout)
+		payoutCopy := payout
+		rec.Payout = &payoutCopy
+		e.appendLedgerLocked("EscrowSlashed", rec.JobID, rec.Quote.Buyer, payout.BuyerPayoutAtomic+payout.ChallengerPayoutAtomic, StateSlashed, payout.Reason)
+		return &payoutCopy, nil
+	}
 
-		rec.LockedBuyerAtomic = 0
-		rec.LockedProviderBond = 0
+	// Challenge allegation rejected: forfeit challenger bond to provider.
+	if rec.Claim == nil {
+		// Unclaimed funded escrow: forfeit challenger bond and return to StateFunded.
+		e.balances[rec.Quote.Provider] += lockedChal
 		rec.LockedChallengeBond = 0
-		rec.State = StateSettled
-		rec.Finalized = true
-		rec.PayoutCount++
+		rec.Challenge = nil
+		rec.State = StateFunded
 
 		payout = PayoutRecord{
 			JobID:                   rec.JobID,
-			TerminalState:           StateSettled,
+			TerminalState:           StateFunded,
 			ChallengeOutcome:        ChallengeOutcomeRejectedMalicious,
 			ProofDomain:             proofDomain,
 			SettledAt:               now,
-			BuyerPayoutAtomic:       0,
-			ProviderPayoutAtomic:    providerTotal,
-			ChallengerPayoutAtomic:  0,
+			ProviderPayoutAtomic:    lockedChal,
 			ChallengerSlashedAtomic: lockedChal,
 			Reason:                  reason,
 		}
+		payout.ReceiptHash = computePayoutHash(payout)
+		payoutCopy := payout
+		e.appendLedgerLocked("ChallengeRejected", rec.JobID, rec.Quote.Provider, lockedChal, StateFunded, payout.Reason)
+		return &payoutCopy, nil
 	}
 
+	if now < rec.Claim.ChallengeDeadline {
+		// Dispute window is still open: forfeit the unfounded challenger's bond
+		// to the provider, but keep buyer payment and provider bond locked in
+		// StateClaimed so other objective challenges remain possible until
+		// ChallengeDeadline elapses.
+		e.balances[rec.Quote.Provider] += lockedChal
+		rec.LockedChallengeBond = 0
+		rec.Challenge = nil
+		rec.State = StateClaimed
+
+		payout = PayoutRecord{
+			JobID:                   rec.JobID,
+			TerminalState:           StateClaimed,
+			ChallengeOutcome:        ChallengeOutcomeRejectedMalicious,
+			ProofDomain:             proofDomain,
+			SettledAt:               now,
+			ProviderPayoutAtomic:    lockedChal,
+			ChallengerSlashedAtomic: lockedChal,
+			Reason:                  reason,
+		}
+		payout.ReceiptHash = computePayoutHash(payout)
+		payoutCopy := payout
+		e.appendLedgerLocked("ChallengeRejected", rec.JobID, rec.Quote.Provider, lockedChal, StateClaimed, payout.Reason)
+		return &payoutCopy, nil
+	}
+
+	// Dispute window has elapsed and the challenge was rejected: settle atomically.
+	providerTotal := lockedBuyer + lockedProv + lockedChal
+	e.balances[rec.Quote.Provider] += providerTotal
+
+	rec.LockedBuyerAtomic = 0
+	rec.LockedProviderBond = 0
+	rec.LockedChallengeBond = 0
+	rec.State = StateSettled
+	rec.Finalized = true
+	rec.PayoutCount++
+
+	payout = PayoutRecord{
+		JobID:                   rec.JobID,
+		TerminalState:           StateSettled,
+		ChallengeOutcome:        ChallengeOutcomeRejectedMalicious,
+		ProofDomain:             proofDomain,
+		SettledAt:               now,
+		BuyerPayoutAtomic:       0,
+		ProviderPayoutAtomic:    providerTotal,
+		ChallengerPayoutAtomic:  0,
+		ChallengerSlashedAtomic: lockedChal,
+		Reason:                  reason,
+	}
 	payout.ReceiptHash = computePayoutHash(payout)
 	payoutCopy := payout
 	rec.Payout = &payoutCopy
-
-	eventType := "EscrowSettled"
-	eventRecipient := rec.Quote.Provider
-	eventAmount := payout.ProviderPayoutAtomic
-	if payout.TerminalState == StateSlashed {
-		eventType = "EscrowSlashed"
-		eventRecipient = rec.Quote.Buyer
-		eventAmount = payout.BuyerPayoutAtomic + payout.ChallengerPayoutAtomic
-	}
-	e.appendLedgerLocked(eventType, rec.JobID, eventRecipient, eventAmount, payout.TerminalState, payout.Reason)
+	e.appendLedgerLocked("EscrowSettled", rec.JobID, rec.Quote.Provider, payout.ProviderPayoutAtomic, StateSettled, payout.Reason)
 	return &payoutCopy, nil
 }
 

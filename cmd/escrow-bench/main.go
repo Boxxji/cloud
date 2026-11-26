@@ -823,7 +823,9 @@ func runTrustDimension() (TrustDimension, error) {
 		_ = escrow.SignChallengeSubmission(eng.Domain(), challenger, &sub)
 		_, _ = eng.OpenChallenge(sub)
 		p, err := eng.ResolveChallenge(f.JobID)
-		add("malicious_challenger_bond_forfeited", err == nil && p.TerminalState == escrow.StateSettled && p.ChallengerSlashedAtomic == 50_000 && p.ProviderPayoutAtomic == 350_000, "false challenger bond forfeited to honest provider")
+		clk.Advance(35)
+		fin, finErr := eng.Finalize(f.JobID)
+		add("malicious_challenger_bond_forfeited", err == nil && finErr == nil && p.TerminalState == escrow.StateClaimed && p.ChallengerSlashedAtomic == 50_000 && fin.TerminalState == escrow.StateSettled && p.ProviderPayoutAtomic+fin.ProviderPayoutAtomic == 350_000, "false challenger bond forfeited to honest provider while preserving dispute window until finalize")
 	}
 
 	// 6. Subjective quality claim rejected
